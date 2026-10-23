@@ -242,7 +242,9 @@ Code: `src/robocar/exploration.py`; the planner is `plan_explore_step` in
 - **Coverage grid.** A 5 cm log-odds grid built from every sweep (from the
   joined sessions too, at their optimized poses). Each reading clears space
   along three rays inside the beam's core, up to 250 cm. Only the centre ray
-  marks the echo as occupied, and at its real distance. The car's footprint
+  marks the echo as occupied, and at its real distance. Readings past 250 cm
+  (the sensor reports 300 cm when nothing echoes) are open space: they clear
+  out to 250 cm and mark no wall, in the grid and in the surface map. The car's footprint
   is free.
 - **Frontiers.** Free cells next to unknown ones, excluding those within
   35 cm of anywhere the car has stood. The forward sonar never sees beside or

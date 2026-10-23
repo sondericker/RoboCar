@@ -124,11 +124,11 @@ class SimulatedHouse:
 
         class Camera:
             def capture_snapshot(self) -> bytes:
-                return house.scene.view(house.truth, house.pan.pan - 90)
+                return house.scene.view(house.truth, 90 - house.pan.pan)
 
         class Sensor:
             def get_distance(self) -> float | None:
-                return house.room.distance(house.truth, house.pan.pan - 90)
+                return house.room.distance(house.truth, 90 - house.pan.pan)
 
             def close(self) -> None:
                 pass

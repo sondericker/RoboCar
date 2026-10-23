@@ -25,8 +25,6 @@ OCCUPIED_LOG_ODDS = 0.9
 LOG_ODDS_LIMIT = 4.0
 FREE_BELOW = -0.3
 OCCUPIED_ABOVE = 0.5
-# Readings past this are too uncertain to clear space all the way out.
-FREE_RANGE_LIMIT_CM = 250.0
 ROBOT_RADIUS_CM = 16.0
 FRONTIER_MIN_CELLS = 4
 WAYPOINT_DISTANCE_CM = 40.0
@@ -112,7 +110,7 @@ class CoverageGrid:
                 continue
             distance = float(distance)
             echo = distance if distance <= SONAR_MAX_RANGE_CM else None
-            reach = min(distance, SONAR_MAX_RANGE_CM, FREE_RANGE_LIMIT_CM)
+            reach = min(distance, SONAR_MAX_RANGE_CM)
             # The beam's core clears space; only the centre line marks the echo.
             for offset in (-beam_width_deg / 4, 0.0, beam_width_deg / 4):
                 ray = direction(float(pose[2]) + float(item["angle_deg"]) + offset)

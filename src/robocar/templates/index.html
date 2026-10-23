@@ -53,9 +53,9 @@
       <h2>Drive override</h2>
       <p id="drive-status" class="status">Loading drive status…</p>
       <div class="controls" aria-label="Hold a direction to drive">
-        <button data-axis="steering" data-value="-1" aria-label="Rotate left">↶</button>
+        <button data-axis="steering" data-value="1" aria-label="Rotate left">↶</button>
         <button data-axis="throttle" data-value="1" aria-label="Forward">▲</button>
-        <button data-axis="steering" data-value="1" aria-label="Rotate right">↷</button>
+        <button data-axis="steering" data-value="-1" aria-label="Rotate right">↷</button>
         <button data-axis="strafe" data-value="-1" aria-label="Strafe left">◀</button>
         <button class="stop" id="stop">STOP</button>
         <button data-axis="strafe" data-value="1" aria-label="Strafe right">▶</button>
@@ -597,7 +597,7 @@
       ["s", {throttle: -1}], ["arrowdown", {throttle: -1}],
       ["a", {strafe: -1}], ["arrowleft", {strafe: -1}],
       ["d", {strafe: 1}], ["arrowright", {strafe: 1}],
-      ["q", {steering: -1}], ["e", {steering: 1}]
+      ["q", {steering: 1}], ["e", {steering: -1}]
     ]);
     const heldKeys = new Map();
     document.addEventListener("keydown", event => {

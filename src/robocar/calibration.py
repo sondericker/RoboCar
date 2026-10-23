@@ -25,16 +25,23 @@ from typing import Callable, Protocol, Sequence
 
 logger = logging.getLogger(__name__)
 
-TURN_SIZES_DEGREES = (15.0, 30.0, 45.0)
+TURN_SIZES_DEGREES = (10.0, 20.0, 30.0)
 TURN_TOLERANCE_DEGREES = 2.0
 TURN_ATTEMPTS = 4
 STRIP_STEP_DEGREES = 5
-STEP_SIZES_CM = (10.0, 20.0, 30.0)
+STEP_SIZES_CM = (5.0, 10.0, 20.0)
 # Steps must land within 7% (at least 1 cm) of the size asked for.
 STEP_TOLERANCE_FRACTION = 0.07
 STEP_TOLERANCE_MIN_CM = 1.0
 STEP_ATTEMPTS = 4
-STEP_DURATION_LIMITS_SECONDS = (0.05, 0.8)
+STEP_DURATION_LIMITS_SECONDS = (0.05, 0.5)
+# Each try changes the burst by at most this factor, so one tiny or freak
+# measurement cannot send the next try flying.
+STEP_MAX_CHANGE = 1.6
+# A step reading outside this is a sonar glitch or the car slewing, not a step.
+STEP_PLAUSIBLE_SLACK_CM = 10.0
+# After each forward-and-back pair, creep of more than this is driven back out.
+STEP_RETURN_TOLERANCE_CM = 2.0
 MINIMUM_WALL_GAP_CM = 45.0
 RANGE_SAMPLES = 7
 
@@ -78,6 +85,13 @@ class Calibration:
         if distance_cm <= sizes[0]:
             return self.step_durations[sizes[0]] * distance_cm / sizes[0]
         if distance_cm >= sizes[-1]:
+            if len(sizes) > 1:
+                # Beyond the largest step, carry on along the last two: bursts
+                # have a dead zone, so scaling from zero would overshoot.
+                low, high = sizes[-2], sizes[-1]
+                slope = (self.step_durations[high] - self.step_durations[low]) / (high - low)
+                if slope > 0:
+                    return self.step_durations[high] + slope * (distance_cm - high)
             return self.step_durations[sizes[-1]] * distance_cm / sizes[-1]
         for low, high in zip(sizes, sizes[1:]):
             if low <= distance_cm <= high:
@@ -281,9 +295,14 @@ def _calibrate_steps(
                 forward_ratios.append(moved / odometry_forward)
             if back is not None and odometry_back > 0.5 and back - after > 0.5:
                 reverse_ratios.append((back - after) / odometry_back)
+            if back is not None:
+                back = _return_to(rig, start, back, seconds, max(moved, 1.0))
+            if moved < -STEP_RETURN_TOLERANCE_CM or moved > 3 * size + STEP_PLAUSIBLE_SLACK_CM:
+                note(f"{size:.0f} cm step try {attempt}: sonar jumped ({moved:+.1f} cm); ignoring this try")
+                continue
             note(f"{size:.0f} cm step try {attempt}: {seconds:.3f} s moved {moved:.1f} cm")
             if moved <= 0.5:
-                seconds = min(STEP_DURATION_LIMITS_SECONDS[1], seconds * 2)
+                seconds = min(STEP_DURATION_LIMITS_SECONDS[1], seconds * STEP_MAX_CHANGE)
                 continue
             calibration.step_durations[size] = seconds
             if abs(moved - size) <= max(STEP_TOLERANCE_MIN_CM, STEP_TOLERANCE_FRACTION * size):
@@ -300,6 +319,7 @@ def _calibrate_steps(
                     slope = (last_moved - earlier_moved) / (last_seconds - earlier_seconds)
                     if slope > 0:
                         proposal = last_seconds + (size - last_moved) / slope
+            proposal = min(seconds * STEP_MAX_CHANGE, max(seconds / STEP_MAX_CHANGE, proposal))
             seconds = min(high, max(low, proposal))
             calibration.step_durations[size] = seconds
     if forward_ratios:
@@ -308,3 +328,21 @@ def _calibrate_steps(
         calibration.reverse_ratio = statistics.median(reverse_ratios)
     if calibration.forward_ratio is not None:
         note(f"forward travel is {calibration.forward_ratio:.2f}x what the wheels report")
+
+
+def _return_to(rig: Rig, start: float, back: float, seconds: float, moved: float) -> float:
+    """Drive out any creep left after a forward-and-back pair, so the tries do
+    not walk the car into the wall. Returns the final range."""
+    for _ in range(2):
+        gap = back - start  # negative: the car ended up nearer the wall
+        if abs(gap) <= STEP_RETURN_TOLERANCE_CM or rig.stopped():
+            break
+        low, high = STEP_DURATION_LIMITS_SECONDS
+        burst = min(high / 2, max(low, seconds * abs(gap) / moved))
+        if not rig.burst(1.0 if gap > 0 else -1.0, burst):
+            break
+        reading = _range(rig)
+        if reading is None:
+            break
+        back = reading
+    return back
