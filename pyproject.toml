@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robocar"
+version = "0.1.0"
+description = "Camera dashboard and safe control foundation for a Raspberry Pi robot car"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "Flask>=3.0,<4",
+    "numpy>=1.26,<3",
+    "opencv-python>=4.10,<5",
+    "python-dotenv>=1.0,<2",
+    "onnxruntime>=1.20,<2",
+]
+
+[project.scripts]
+robocar = "robocar.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+robocar = ["templates/*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

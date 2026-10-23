@@ -1,0 +1,7 @@
+# Install these on Raspberry Pi OS, not on a development workstation.
+# picamera2 and libcamera are provided by Raspberry Pi OS packages.
+gpiozero>=2.0,<3
+
+# OS packages required by the upstream Freenove motor driver:
+#   python3-smbus, i2c-tools
+# Enable I2C and install Picamera2 using Raspberry Pi OS documentation.

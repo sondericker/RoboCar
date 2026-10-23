@@ -1,0 +1,20 @@
+[Unit]
+Description=RoboCar remote camera and control dashboard
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@PROJECT_DIR@
+Environment=HOME=/home/@SERVICE_USER@
+EnvironmentFile=/etc/robocar/robocar.env
+ExecStart=@PYTHON@ -m robocar
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

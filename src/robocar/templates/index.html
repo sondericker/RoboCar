@@ -1,0 +1,511 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RoboCar Control</title>
+  <style>
+    :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #101820; color: #ecf3f7; }
+    body { max-width: 1050px; margin: 0 auto; padding: 1rem; }
+    h1 { margin-bottom: .2rem; }
+    .grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(230px, 1fr); gap: 1rem; }
+    section { background: #1b2933; border: 1px solid #334955; border-radius: 10px; padding: 1rem; }
+    img { display: block; width: 100%; min-height: 200px; background: #080d11; object-fit: contain; }
+    [hidden] { display: none !important; }
+    .status { margin: .5rem 0; color: #b8d0dc; }
+    .controls { display: grid; grid-template-columns: repeat(3, 1fr); gap: .5rem; max-width: 300px; margin: 1rem auto; }
+    button { min-height: 58px; border: 0; border-radius: 8px; background: #247f78; color: white; font-size: 1rem; touch-action: none; }
+    button:hover { background: #2a9a90; }
+    button:focus-visible { outline: 3px solid #fff; }
+    .stop { background: #b23b42; grid-column: 2; }
+    .empty { visibility: hidden; }
+    .axis-control { display: grid; grid-template-columns: 4rem 1fr 3rem; gap: .75rem; align-items: center; margin: 1rem 0; }
+    input[type="range"] { width: 100%; accent-color: #2a9a90; }
+    .center-button { min-height: 38px; width: 100%; }
+    .mapping-section { grid-column: 1 / -1; }
+    .mapping-layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1rem; margin-top: 1rem; }
+    .map-view { width: 100%; min-height: 540px; border: 1px solid #334955; border-radius: 8px; background: #101820; }
+    #explore-toggle { background: #526b31; }
+    #explore-toggle:hover { background: #68863d; }
+    #reset-mapping { background: #8f3a3e; min-height: 40px; margin-bottom: .75rem; }
+    #reset-mapping:hover { background: #b23b42; }
+    code { color: #a9e8d7; }
+    @media (max-width: 720px) { .grid, .mapping-layout { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <h1>RoboCar</h1>
+  <p class="status">Manual control is active only while a drive button is held.</p>
+  <div class="grid">
+    <section>
+      <h2>Camera and detections</h2>
+      <button id="camera-toggle" type="button" aria-pressed="false">Start camera processing</button>
+      <img id="camera-feed" alt="Live camera stream" hidden>
+      <p id="camera-paused" class="status">Camera processing is paused.</p>
+      <p id="camera-status" class="status">Connecting to camera…</p>
+      <p id="detection-status" class="status">Waiting for detection status…</p>
+    </section>
+    <section>
+      <h2>Drive override</h2>
+      <p id="drive-status" class="status">Loading drive status…</p>
+      <div class="controls" aria-label="Hold a direction to drive">
+        <button data-axis="steering" data-value="-1" aria-label="Rotate left">↶</button>
+        <button data-axis="throttle" data-value="1" aria-label="Forward">▲</button>
+        <button data-axis="steering" data-value="1" aria-label="Rotate right">↷</button>
+        <button data-axis="strafe" data-value="-1" aria-label="Strafe left">◀</button>
+        <button class="stop" id="stop">STOP</button>
+        <button data-axis="strafe" data-value="1" aria-label="Strafe right">▶</button>
+        <span class="empty"></span>
+        <button data-axis="throttle" data-value="-1" aria-label="Reverse">▼</button>
+        <span class="empty"></span>
+      </div>
+      <p class="status">Keyboard: W/S forward/reverse, A/D strafe, Q/E rotate, Space stops.</p>
+    </section>
+    <section>
+      <h2>Pan / tilt head</h2>
+      <p id="pan-tilt-status" class="status">Loading head position…</p>
+      <label class="axis-control">Pan
+        <input id="pan" type="range" min="30" max="150" value="90">
+        <output id="pan-value">90°</output>
+      </label>
+      <label class="axis-control">Tilt
+        <input id="tilt" type="range" min="30" max="150" value="90">
+        <output id="tilt-value">90°</output>
+      </label>
+      <button id="center-head" class="center-button" type="button">Center head</button>
+    </section>
+    <section class="mapping-section">
+      <h2>Mapping &amp; exploration</h2>
+      <button id="mapping-toggle" type="button" aria-pressed="false">Start mapping &amp; auto explore</button>
+      <button id="reset-mapping" type="button">Reset mapping database</button>
+      <p id="mapping-status" class="status" aria-live="polite">Mapping is off.</p>
+      <div class="mapping-layout">
+        <div>
+          <canvas id="map-view" class="map-view" aria-label="Surface map built from ultrasonic sweeps"></canvas>
+          <p id="map-caption" class="status">No range sweep saved yet.</p>
+        </div>
+      </div>
+    </section>
+    <section>
+      <h2>Ultrasonic range</h2>
+      <p id="range-status" class="status" aria-live="polite">Loading range finder status…</p>
+    </section>
+  </div>
+  <script>
+    const active = new Set();
+    let timer;
+    let controlError = "";
+    const driveStatus = document.getElementById("drive-status");
+    const cameraToggle = document.getElementById("camera-toggle");
+    const cameraImage = document.getElementById("camera-feed");
+    const cameraPaused = document.getElementById("camera-paused");
+    const mappingToggle = document.getElementById("mapping-toggle");
+    const resetMappingButton = document.getElementById("reset-mapping");
+    const mapCanvas = document.getElementById("map-view");
+    const mapContext = mapCanvas.getContext("2d");
+    let savedObservations = [];
+    async function setCameraProcessing(enabled) {
+      cameraToggle.disabled = true;
+      try {
+        const response = await fetch("/api/camera", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({enabled})
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+        updateCameraControls(result.enabled);
+      } catch (error) {
+        document.getElementById("camera-status").textContent = `Camera control error: ${error.message}`;
+      } finally {
+        cameraToggle.disabled = false;
+      }
+    }
+    function updateCameraControls(enabled) {
+      cameraToggle.textContent = enabled ? "Stop camera processing" : "Start camera processing";
+      cameraToggle.setAttribute("aria-pressed", String(enabled));
+      cameraImage.hidden = !enabled;
+      cameraPaused.hidden = enabled;
+      if (enabled && !cameraImage.hasAttribute("src")) cameraImage.src = "/video.mjpg";
+      if (!enabled) cameraImage.removeAttribute("src");
+    }
+    cameraToggle.addEventListener("click", () => {
+      setCameraProcessing(cameraToggle.getAttribute("aria-pressed") !== "true");
+    });
+    function sendControlRequest(path, payload) {
+      return fetch(path, {
+        method: "POST",
+        headers: payload ? {"Content-Type": "application/json"} : {},
+        body: payload ? JSON.stringify(payload) : undefined
+      }).then(response => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        controlError = "";
+      }).catch(error => {
+        controlError = error.message;
+        driveStatus.textContent = `Control error: ${controlError}`;
+        active.clear();
+        clearInterval(timer);
+      });
+    }
+    function sendDrive() {
+      let throttle = 0, strafe = 0, steering = 0;
+      for (const command of active) {
+        throttle += command.throttle || 0;
+        strafe += command.strafe || 0;
+        steering += command.steering || 0;
+      }
+      sendControlRequest("/api/drive", {
+        throttle: Math.max(-1, Math.min(1, throttle)),
+        strafe: Math.max(-1, Math.min(1, strafe)),
+        steering: Math.max(-1, Math.min(1, steering))
+      });
+    }
+    function start(command) {
+      active.add(command);
+      sendDrive();
+      clearInterval(timer);
+      timer = setInterval(sendDrive, 120);
+    }
+    function stop(command) {
+      if (command) active.delete(command);
+      else active.clear();
+      if (active.size) sendDrive();
+      else {
+        clearInterval(timer);
+        sendControlRequest("/api/stop");
+      }
+    }
+    document.querySelectorAll("button[data-axis]").forEach(button => {
+      const command = {[button.dataset.axis]: Number(button.dataset.value)};
+      button.addEventListener("pointerdown", event => { event.preventDefault(); button.setPointerCapture(event.pointerId); start(command); });
+      button.addEventListener("pointerup", () => stop(command));
+      button.addEventListener("pointercancel", () => stop(command));
+      button.addEventListener("lostpointercapture", () => stop(command));
+    });
+    document.getElementById("stop").addEventListener("click", () => stop());
+    const panInput = document.getElementById("pan");
+    const tiltInput = document.getElementById("tilt");
+    let headTimer;
+    async function setHeadPosition() {
+      document.getElementById("pan-value").value = `${panInput.value}°`;
+      document.getElementById("tilt-value").value = `${tiltInput.value}°`;
+      try {
+        const response = await fetch("/api/pan-tilt", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({pan: Number(panInput.value), tilt: Number(tiltInput.value)})
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        document.getElementById("pan-tilt-status").textContent = "Head position updated";
+      } catch (error) {
+        document.getElementById("pan-tilt-status").textContent = `Head control error: ${error.message}`;
+      }
+    }
+    for (const input of [panInput, tiltInput]) {
+      input.addEventListener("input", () => {
+        clearTimeout(headTimer);
+        headTimer = setTimeout(setHeadPosition, 100);
+      });
+    }
+    document.getElementById("center-head").addEventListener("click", () => {
+      panInput.value = tiltInput.value = "90";
+      setHeadPosition();
+    });
+    function prepareMapCanvas() {
+      const rect = mapCanvas.getBoundingClientRect();
+      const width = Math.max(320, Math.floor(rect.width));
+      const height = Math.max(260, Math.floor(rect.height));
+      mapCanvas.width = width;
+      mapCanvas.height = height;
+      mapContext.clearRect(0, 0, width, height);
+      mapContext.strokeStyle = "#263a46";
+      mapContext.lineWidth = 1;
+      for (let x = 0; x < width; x += 40) {
+        mapContext.beginPath(); mapContext.moveTo(x, 0); mapContext.lineTo(x, height); mapContext.stroke();
+      }
+      for (let y = 0; y < height; y += 40) {
+        mapContext.beginPath(); mapContext.moveTo(0, y); mapContext.lineTo(width, y); mapContext.stroke();
+      }
+      return {width, height};
+    }
+    // World frame: +x right, +y ahead of the run's first stop; headings and
+    // sweep angles are counterclockwise, so a direction is (-sin, cos).
+    function heading(angleDegrees) {
+      const radians = angleDegrees * Math.PI / 180;
+      return {x: -Math.sin(radians), y: Math.cos(radians)};
+    }
+    function drawSurfaceMap(map) {
+      const {width, height} = prepareMapCanvas();
+      const bounds = [{x: 0, y: 0}];
+      map.echoes.forEach(([x, y]) => bounds.push({x, y}));
+      map.path.forEach(([x, y]) => bounds.push({x, y}));
+      map.surfaces.forEach(surface => bounds.push(
+        {x: surface.start[0], y: surface.start[1]}, {x: surface.end[0], y: surface.end[1]}));
+      map.features.forEach(feature => bounds.push({x: feature.position[0], y: feature.position[1]}));
+      const minX = Math.min(...bounds.map(point => point.x));
+      const maxX = Math.max(...bounds.map(point => point.x));
+      const minY = Math.min(...bounds.map(point => point.y));
+      const maxY = Math.max(...bounds.map(point => point.y));
+      const padding = 28;
+      const scale = Math.min(
+        (width - padding * 2) / Math.max(60, maxX - minX),
+        (height - padding * 2) / Math.max(60, maxY - minY)
+      );
+      const offsetX = (width - (maxX - minX) * scale) / 2;
+      const offsetY = (height - (maxY - minY) * scale) / 2;
+      const toScreen = ([x, y]) => ({
+        x: offsetX + (x - minX) * scale,
+        y: height - offsetY - (y - minY) * scale
+      });
+
+      mapContext.fillStyle = "rgba(242, 179, 93, .35)";
+      for (const echo of map.echoes) {
+        const point = toScreen(echo);
+        mapContext.fillRect(point.x - 1, point.y - 1, 2, 2);
+      }
+
+      const surfaces = new Map(map.surfaces.map(surface => [surface.id, surface]));
+      mapContext.lineCap = "round";
+      mapContext.lineJoin = "round";
+      for (const contour of map.contours) {
+        const members = contour.surface_ids.map(id => surfaces.get(id));
+        const confirmed = members.every(surface => surface.confirmed);
+        const confidence = Math.min(...members.map(surface => surface.confidence));
+        mapContext.strokeStyle = `rgba(118, 224, 200, ${0.35 + 0.65 * confidence})`;
+        mapContext.lineWidth = confirmed ? 4 : 2;
+        mapContext.setLineDash(confirmed ? [] : [6, 5]);
+        mapContext.beginPath();
+        contour.points.forEach((vertex, index) => {
+          const point = toScreen(vertex);
+          if (index === 0) mapContext.moveTo(point.x, point.y);
+          else mapContext.lineTo(point.x, point.y);
+        });
+        if (contour.closed) mapContext.closePath();
+        mapContext.stroke();
+      }
+      mapContext.setLineDash([]);
+
+      for (const feature of map.features) {
+        const point = toScreen(feature.position);
+        mapContext.fillStyle = `rgba(242, 179, 93, ${0.35 + 0.65 * feature.confidence})`;
+        mapContext.beginPath();
+        mapContext.arc(point.x, point.y, feature.confirmed ? 5 : 3, 0, Math.PI * 2);
+        mapContext.fill();
+      }
+
+      if (map.path.length) {
+        mapContext.strokeStyle = "#a9e8d7";
+        mapContext.lineWidth = 1.5;
+        mapContext.beginPath();
+        map.path.forEach((pose, index) => {
+          const point = toScreen(pose);
+          if (index === 0) mapContext.moveTo(point.x, point.y);
+          else mapContext.lineTo(point.x, point.y);
+        });
+        mapContext.stroke();
+        const latest = map.path[map.path.length - 1];
+        const robot = toScreen(latest);
+        mapContext.strokeStyle = "rgba(236, 243, 247, .45)";
+        mapContext.lineWidth = 1;
+        mapContext.beginPath();
+        mapContext.arc(robot.x, robot.y, Math.max(6, map.pose_sigma_cm * 2 * scale), 0, Math.PI * 2);
+        mapContext.stroke();
+        mapContext.fillStyle = "#ecf3f7";
+        mapContext.beginPath();
+        mapContext.arc(robot.x, robot.y, 6, 0, Math.PI * 2);
+        mapContext.fill();
+        const facing = heading(latest[2]);
+        const tip = toScreen([latest[0] + facing.x * 18, latest[1] + facing.y * 18]);
+        mapContext.strokeStyle = "#ecf3f7";
+        mapContext.lineWidth = 3;
+        mapContext.beginPath();
+        mapContext.moveTo(robot.x, robot.y);
+        mapContext.lineTo(tip.x, tip.y);
+        mapContext.stroke();
+      }
+      const confirmedSurfaces = map.surfaces.filter(surface => surface.confirmed).length;
+      document.getElementById("map-caption").textContent =
+        `Run ${(map.run_id || "").slice(0, 8)} · ${map.surfaces.length} surfaces ` +
+        `(${confirmedSurfaces} confirmed) in ${map.contours.length} contours · ` +
+        `${map.features.length} point features · ${map.scan_count} sweeps · ` +
+        `pose ±${map.pose_sigma_cm.toFixed(1)} cm, ±${map.heading_sigma_deg.toFixed(1)}°. ` +
+        "Solid = confirmed, dashed = seen once, dots = raw echoes.";
+    }
+    function drawScan(observation) {
+      const {width, height} = prepareMapCanvas();
+      const scans = observation?.scan?.filter(item => Number.isFinite(item.distance_cm)) || [];
+      if (!scans.length) {
+        document.getElementById("map-caption").textContent = observation
+          ? "This stop has no valid range sweep." : "No range sweep saved yet.";
+        return;
+      }
+      const maxDistance = Math.max(100, ...scans.map(item => item.distance_cm));
+      const originX = width / 2;
+      const originY = height - 36;
+      const scale = Math.min((width * 0.46) / maxDistance, (height * 0.82) / maxDistance);
+      mapContext.strokeStyle = "#2a9a90";
+      mapContext.fillStyle = "#a9e8d7";
+      mapContext.lineWidth = 1;
+      for (const item of scans) {
+        const ray = heading(item.angle_deg);
+        const x = originX + ray.x * item.distance_cm * scale;
+        const y = originY - ray.y * item.distance_cm * scale;
+        mapContext.beginPath(); mapContext.moveTo(originX, originY); mapContext.lineTo(x, y); mapContext.stroke();
+        mapContext.beginPath(); mapContext.arc(x, y, 3, 0, Math.PI * 2); mapContext.fill();
+      }
+      mapContext.fillStyle = "#ecf3f7";
+      mapContext.beginPath(); mapContext.arc(originX, originY, 6, 0, Math.PI * 2); mapContext.fill();
+      document.getElementById("map-caption").textContent =
+        `Single local scan · ${scans.length} valid directions · scale fitted to ${maxDistance.toFixed(0)} cm`;
+    }
+    async function refreshMapping() {
+      try {
+        const [observationsResponse, surfacesResponse] = await Promise.all([
+          fetch("/api/mapping/observations", {cache: "no-store"}),
+          fetch("/api/mapping/surfaces", {cache: "no-store"})
+        ]);
+        if (!observationsResponse.ok) throw new Error(`HTTP ${observationsResponse.status}`);
+        if (!surfacesResponse.ok) throw new Error(`HTTP ${surfacesResponse.status}`);
+        const data = await observationsResponse.json();
+        const map = await surfacesResponse.json();
+        savedObservations = data.observations;
+        if (map.path.length || map.surfaces.length || map.features.length) {
+          drawSurfaceMap(map);
+        } else {
+          drawScan(data.observations[data.observations.length - 1] || null);
+        }
+      } catch (error) {
+        document.getElementById("mapping-status").textContent = `Survey history error: ${error.message}`;
+      }
+    }
+    function localizationSummary(mapping) {
+      const last = mapping.localization;
+      const sources = ["wheels"];
+      if (last?.visual_used) sources.push(last.side_views ? "camera + side views" : "camera");
+      if (last?.registration?.accepted) sources.push(`sonar fit (${last.registration.matches} echoes)`);
+      return `pose from ${sources.join(" + ")} · ±${mapping.pose_sigma_cm} cm · ` +
+        `${mapping.surface_count} surfaces, ${mapping.feature_count} features`;
+    }
+    function updateMappingControls(mapping) {
+      mappingToggle.textContent = mapping.enabled
+        ? "Stop mapping & auto explore" : "Start mapping & auto explore";
+      mappingToggle.setAttribute("aria-pressed", String(mapping.enabled));
+      resetMappingButton.disabled = mapping.enabled;
+      document.getElementById("mapping-status").textContent = mapping.error
+        ? `Mapping stopped: ${mapping.error}`
+        : mapping.enabled
+          ? (mapping.state === "capturing" || mapping.state === "scanning"
+            ? "Stopped; capturing camera and range sweep…"
+            : mapping.mode === "explore"
+              ? `Auto explore: ${mapping.state} · ${mapping.move_count} movement bursts · ${localizationSummary(mapping)}`
+              : "Survey active · drive manually, then stop to record a checkpoint.")
+          : mapping.state === "blocked" ? "Auto explore stopped: no safe path visible in the forward scan."
+            : mapping.state === "time_limit" ? "Auto explore stopped at its 2-minute limit."
+              : mapping.state === "move_limit" ? "Auto explore stopped after 30 movement bursts."
+                : "Mapping is off.";
+    }
+    mappingToggle.addEventListener("click", async () => {
+      const enabled = mappingToggle.getAttribute("aria-pressed") !== "true";
+      mappingToggle.disabled = true;
+      try {
+        const response = await fetch("/api/mapping/explore", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({enabled, attended: true})
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+        updateMappingControls(result);
+      } catch (error) {
+        document.getElementById("mapping-status").textContent = `Mapping control error: ${error.message}`;
+      } finally {
+        mappingToggle.disabled = false;
+      }
+    });
+    resetMappingButton.addEventListener("click", async () => {
+      if (!window.confirm("Permanently delete all saved mapping observations?")) return;
+      resetMappingButton.disabled = true;
+      try {
+        const response = await fetch("/api/mapping/reset", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({confirm: true})
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+        updateMappingControls(result);
+        await refreshMapping();
+      } catch (error) {
+        document.getElementById("mapping-status").textContent =
+          `Mapping database reset failed: ${error.message}`;
+      } finally {
+        resetMappingButton.disabled =
+          mappingToggle.getAttribute("aria-pressed") === "true";
+      }
+    });
+    const keys = new Map([
+      ["w", {throttle: 1}], ["arrowup", {throttle: 1}],
+      ["s", {throttle: -1}], ["arrowdown", {throttle: -1}],
+      ["a", {strafe: -1}], ["arrowleft", {strafe: -1}],
+      ["d", {strafe: 1}], ["arrowright", {strafe: 1}],
+      ["q", {steering: -1}], ["e", {steering: 1}]
+    ]);
+    const heldKeys = new Map();
+    document.addEventListener("keydown", event => {
+      const key = event.key.toLowerCase();
+      if (key === " ") { event.preventDefault(); stop(); return; }
+      if (keys.has(key)) {
+        event.preventDefault();
+        if (!heldKeys.has(key)) { heldKeys.set(key, keys.get(key)); start(heldKeys.get(key)); }
+      }
+    });
+    document.addEventListener("keyup", event => {
+      const key = event.key.toLowerCase();
+      if (heldKeys.has(key)) { stop(heldKeys.get(key)); heldKeys.delete(key); }
+    });
+    window.addEventListener("blur", () => { heldKeys.clear(); stop(); });
+    async function refreshStatus() {
+      try {
+        const response = await fetch("/api/status", {cache: "no-store"});
+        const status = await response.json();
+        const camera = status.camera;
+        document.getElementById("camera-status").textContent =
+          !camera.enabled ? "Camera capture and detection paused" :
+            camera.error ? `Camera unavailable: ${camera.error}` :
+            `Camera: ${camera.connected ? "connected" : "starting"} (${camera.backend})`;
+        document.getElementById("detection-status").textContent =
+          camera.enabled ? `${camera.detector} · ${camera.detections.length} object(s)` : "Detection paused";
+        updateCameraControls(camera.enabled);
+        driveStatus.textContent = controlError
+          ? `Control error: ${controlError}`
+          : `Mode: ${status.drive.mode} · PWM cap ${status.drive.max_duty}/4095 · watchdog ${status.drive.watchdog_timeout_seconds.toFixed(1)} s · forward ${status.drive.throttle.toFixed(2)} · strafe ${status.drive.strafe.toFixed(2)} · rotate ${status.drive.steering.toFixed(2)}`;
+        const headResponse = await fetch("/api/pan-tilt", {cache: "no-store"});
+        const head = await headResponse.json();
+        document.getElementById("pan-tilt-status").textContent =
+          `Mode: ${head.mode} · pan ${head.pan}° · tilt ${head.tilt}°`;
+        if (document.activeElement !== panInput) {
+          panInput.value = head.pan;
+          document.getElementById("pan-value").value = `${head.pan}°`;
+        }
+        if (document.activeElement !== tiltInput) {
+          tiltInput.value = head.tilt;
+          document.getElementById("tilt-value").value = `${head.tilt}°`;
+        }
+        const range = status.range;
+        document.getElementById("range-status").textContent =
+          !range.enabled ? "Range finder disabled (hardware not enabled)" :
+            range.error ? `Range finder error: ${range.error}` :
+            range.distance_cm === null ? "Waiting for range reading…" :
+            `Distance: ${range.distance_cm.toFixed(1)} cm`;
+        updateMappingControls(status.mapping);
+      } catch (_) {
+        document.getElementById("camera-status").textContent = "Could not read application status";
+      }
+    }
+    refreshStatus();
+    setInterval(refreshStatus, 1000);
+    refreshMapping();
+    setInterval(refreshMapping, 2000);
+  </script>
+</body>
+</html>
