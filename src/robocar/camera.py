@@ -9,6 +9,14 @@ import cv2
 from robocar.detector import ObjectDetector
 
 logger = logging.getLogger(__name__)
+# Frames thrown away after opening the camera or changing its exposure, so
+# auto-exposure (or the new controls) has settled before a picture is kept.
+# Without this, a camera opened just for one snapshot returned its first,
+# badly underexposed frame.
+OPEN_SETTLE_FRAMES = 8
+EXPOSURE_SETTLE_FRAMES = 4
+# Let auto-exposure use frames up to 100 ms long in dim rooms.
+LONGEST_FRAME_US = 100_000
 
 
 class CameraService:
@@ -29,6 +37,9 @@ class CameraService:
         self._camera: Any = None
         self._lock = threading.Lock()
         self._enabled = enabled
+        self._held = False
+        self._exposure: dict[str, float] = {}
+        self._settle_frames = 0
         self.error: str | None = None
         self.last_detections: list[dict[str, object]] = []
 
@@ -49,6 +60,8 @@ class CameraService:
             )
             camera.start()
             self._camera = camera
+            self._apply_exposure()
+            self._settle_frames = OPEN_SETTLE_FRAMES
         else:
             camera = cv2.VideoCapture(self._camera_index)
             camera.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
@@ -57,7 +70,56 @@ class CameraService:
                 camera.release()
                 raise RuntimeError(f"Could not open camera index {self._camera_index}")
             self._camera = camera
+            self._apply_exposure()
+            self._settle_frames = OPEN_SETTLE_FRAMES
         self.error = None
+
+    def _apply_exposure(self) -> None:
+        """Send the requested exposure to an open camera (best effort for OpenCV)."""
+        settings = self._exposure
+        try:
+            if self._backend == "picamera2":
+                if "exposure_us" in settings:
+                    exposure = int(settings["exposure_us"])
+                    controls = {
+                        "AeEnable": False,
+                        "ExposureTime": exposure,
+                        "AnalogueGain": float(settings.get("gain", 1.0)),
+                        "FrameDurationLimits": (exposure + 1000, max(exposure + 1000, LONGEST_FRAME_US)),
+                    }
+                else:
+                    controls = {
+                        "AeEnable": True,
+                        "ExposureValue": float(settings.get("ev", 0.0)),
+                        "FrameDurationLimits": (33_333, LONGEST_FRAME_US),
+                    }
+                self._camera.set_controls(controls)
+            elif "exposure_us" in settings:
+                # V4L2 manual exposure, in units of 100 microseconds.
+                self._camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+                self._camera.set(cv2.CAP_PROP_EXPOSURE, float(settings["exposure_us"]) / 100)
+            else:
+                self._camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)
+        except Exception as exc:  # cameras differ in which controls they accept
+            logger.warning("Camera did not accept exposure settings %s: %s", settings, exc)
+
+    def set_exposure(self, settings: dict[str, float]) -> None:
+        """Use these exposure settings for the next snapshots: {"ev": ...} keeps
+        auto-exposure with compensation; {"exposure_us": ..., "gain": ...} is manual."""
+        with self._lock:
+            if dict(settings) == self._exposure:
+                return
+            self._exposure = dict(settings)
+            if self._camera is not None:
+                self._apply_exposure()
+                self._settle_frames = max(self._settle_frames, EXPOSURE_SETTLE_FRAMES)
+
+    def hold(self, held: bool) -> None:
+        """Keep the camera open between snapshots (during mapping) so exposure stays settled."""
+        with self._lock:
+            self._held = held
+            if not held and not self._enabled:
+                self._release()
 
     def get_jpeg(self) -> bytes | None:
         with self._lock:
@@ -82,6 +144,9 @@ class CameraService:
         with self._lock:
             try:
                 frame = self._capture_frame()
+                while self._settle_frames > 0:
+                    self._settle_frames -= 1
+                    frame = self._capture_frame()
                 encoded, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 if not encoded:
                     raise RuntimeError("OpenCV could not encode a mapping snapshot")
@@ -93,7 +158,7 @@ class CameraService:
                 self._release()
                 return None
             finally:
-                if not self._enabled:
+                if not self._enabled and not self._held:
                     self._release()
 
     def _capture_frame(self):

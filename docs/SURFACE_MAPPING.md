@@ -144,6 +144,17 @@ surfaces (or walls with ≥5 points) anchor registration.
 
 Code: `src/robocar/places.py`, wired into each stop by `mapping.py`.
 
+**Exposure.** Mapping snapshots used to open the camera, take its first frame
+and close it again. That frame was taken before auto-exposure had adjusted,
+which is why the real pictures were so dark. The camera now stays open for
+the session and discards frames after opening or changing settings. Each
+stop's picture runs through an exposure ladder (see the README) until its
+levels and detail are decent, keeping the best picture and remembering the
+setting for the next stop. Camera motion estimates also need real support
+now (25 matches, 20 inliers, 40% inlier fraction, turns under 55°). A turn
+measurement needs two agreeing strip pictures, and the camera can't overrule
+the wheels by more than 30° on one move.
+
 **Dim pictures.** Your first real run's pictures averaged 32–44 out of 255
 in brightness with very low contrast, and most yielded fewer than 40
 features. When a normal detection finds fewer than 300 corners, the picture
@@ -248,8 +259,8 @@ the dashboard draws it on the left.
 
 ## Known limits and next steps
 
-- A sweep takes about 11–12 s, so the two-minute explore limit fits fewer
-  bursts.
+- A sweep takes about 11–12 s, so even the four-minute explore limit fits
+  roughly 15–20 stops.
 - An opening narrower than the beam's footprint at that range (about 0.44 ×
   range for a 25° beam) can't be seen through from that spot. Every reading
   hits a jamb, and it looks like a wall until sweeps from elsewhere carve it

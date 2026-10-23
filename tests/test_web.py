@@ -89,7 +89,7 @@ class WebTests(unittest.TestCase):
             "enabled": False,
             "mode": "simulation",
             "pan": 90,
-            "tilt": 90,
+            "tilt": 100,
         })
         response = self.client.post("/api/pan-tilt", json={"pan": 45, "tilt": 125})
         self.assertEqual(response.status_code, 200)
@@ -116,6 +116,10 @@ class WebTests(unittest.TestCase):
             )
             self.assertEqual(image.data, b"jpeg-data")
             self.assertEqual(self.client.post("/api/mapping", json={"enabled": False}).status_code, 200)
+
+    def test_camera_matching_pictures_are_listed_and_served(self):
+        self.assertEqual(self.client.get("/api/mapping/vision").get_json(), {"panels": []})
+        self.assertEqual(self.client.get("/api/mapping/vision/stop.jpg").status_code, 404)
 
     def test_surface_map_endpoint_reports_contours_and_path(self):
         data = self.client.get("/api/mapping/surfaces").get_json()

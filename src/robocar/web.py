@@ -125,6 +125,17 @@ def create_app(config: Config | None = None) -> Flask:
     def mapping_observations():
         return jsonify({"observations": mapping.observations()})
 
+    @app.get("/api/mapping/vision")
+    def mapping_vision():
+        return jsonify({"panels": mapping.vision_panels()})
+
+    @app.get("/api/mapping/vision/<name>.jpg")
+    def mapping_vision_image(name: str):
+        image = mapping.vision_image(name)
+        if image is None:
+            return jsonify({"error": "No such picture yet"}), 404
+        return Response(image, mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
+
     @app.get("/api/mapping/surfaces")
     def mapping_surfaces():
         return jsonify(mapping.surface_map())

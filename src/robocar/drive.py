@@ -10,6 +10,10 @@ from typing import Protocol
 logger = logging.getLogger(__name__)
 MOTOR_RAMP_SECONDS = 0.25
 MOTOR_UPDATE_INTERVAL_SECONDS = 0.01
+# Head position at start-up and for "Center head": pan straight ahead, tilt
+# slightly raised.
+DEFAULT_PAN = 90
+DEFAULT_TILT = 100
 FULL_MOTOR_DUTY = 4095
 # Wheel odometry calibration. The forward speed is the earlier estimate of
 # 30.48 cm per 0.25 s at full duty; the deadband, strafe and turn rates are
@@ -84,8 +88,8 @@ class FreenoveDriver:
 
 class SimulatedPanTilt:
     def __init__(self) -> None:
-        self.pan = 90
-        self.tilt = 90
+        self.pan = DEFAULT_PAN
+        self.tilt = DEFAULT_TILT
 
     def set_angles(self, pan: int, tilt: int) -> None:
         self.pan, self.tilt = pan, tilt
@@ -140,7 +144,7 @@ class PanTiltController:
         self._physical = physical
         self._lock = threading.Lock()
         self._inhibited = False
-        self._pan, self._tilt = 90, 90
+        self._pan, self._tilt = DEFAULT_PAN, DEFAULT_TILT
         self._driver.set_angles(self._pan, self._tilt)
 
     def set_angles(

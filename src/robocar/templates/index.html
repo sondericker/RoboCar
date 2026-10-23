@@ -30,6 +30,10 @@
     #reset-mapping { background: #8f3a3e; min-height: 40px; margin-bottom: .75rem; }
     #reset-mapping:hover { background: #b23b42; }
     code { color: #a9e8d7; }
+    .vision-panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; margin-top: .5rem; }
+    .vision-panels figure { margin: 0; }
+    .vision-panels img { width: 100%; height: auto; display: block; border-radius: 6px; background: #111a20; }
+    .vision-panels figcaption { font-size: .85rem; color: #a9c7d3; margin-top: .3rem; }
     @media (max-width: 720px) { .grid, .mapping-layout { grid-template-columns: 1fr; } }
   </style>
 </head>
@@ -69,8 +73,8 @@
         <output id="pan-value">90°</output>
       </label>
       <label class="axis-control">Tilt
-        <input id="tilt" type="range" min="30" max="150" value="90">
-        <output id="tilt-value">90°</output>
+        <input id="tilt" type="range" min="30" max="150" value="100">
+        <output id="tilt-value">100°</output>
       </label>
       <button id="center-head" class="center-button" type="button">Center head</button>
     </section>
@@ -85,6 +89,9 @@
           <p id="map-caption" class="status">No range sweep saved yet.</p>
         </div>
       </div>
+      <h3>What the camera sees</h3>
+      <p id="vision-status" class="status">Pictures appear here once mapping takes them.</p>
+      <div id="vision-panels" class="vision-panels"></div>
     </section>
     <section>
       <h2>Ultrasonic range</h2>
@@ -208,7 +215,8 @@
       });
     }
     document.getElementById("center-head").addEventListener("click", () => {
-      panInput.value = tiltInput.value = "90";
+      panInput.value = "90";
+      tiltInput.value = "100";
       setHeadPosition();
     });
     function prepareMapCanvas() {
@@ -383,6 +391,37 @@
       document.getElementById("map-caption").textContent =
         `Single local scan · ${scans.length} valid directions · scale fitted to ${maxDistance.toFixed(0)} cm`;
     }
+    const visionOrder = ["stop", "motion", "turn", "place"];
+    const visionShown = {};
+    async function refreshVision() {
+      try {
+        const response = await fetch("/api/mapping/vision", {cache: "no-store"});
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const panels = (await response.json()).panels
+          .sort((a, b) => visionOrder.indexOf(a.name) - visionOrder.indexOf(b.name));
+        const container = document.getElementById("vision-panels");
+        document.getElementById("vision-status").hidden = panels.length > 0;
+        for (const panel of panels) {
+          let figure = document.getElementById(`vision-${panel.name}`);
+          if (!figure) {
+            figure = document.createElement("figure");
+            figure.id = `vision-${panel.name}`;
+            figure.innerHTML = "<img alt=''><figcaption></figcaption>";
+            container.appendChild(figure);
+          }
+          if (visionShown[panel.name] !== panel.updated_at) {
+            visionShown[panel.name] = panel.updated_at;
+            const image = figure.querySelector("img");
+            image.src = `/api/mapping/vision/${panel.name}.jpg?t=${encodeURIComponent(panel.updated_at)}`;
+            image.alt = panel.title;
+            figure.querySelector("figcaption").textContent =
+              `${panel.title} · ${new Date(panel.updated_at).toLocaleTimeString()} · ${panel.caption}`;
+          }
+        }
+      } catch (error) {
+        document.getElementById("vision-status").textContent = `Camera pictures unavailable: ${error.message}`;
+      }
+    }
     async function refreshMapping() {
       try {
         const [observationsResponse, surfacesResponse] = await Promise.all([
@@ -431,8 +470,8 @@
               ? `Auto explore: ${mapping.state}${mapping.plan ? ` (${mapping.plan})` : ""} · ${mapping.move_count} moves · ${localizationSummary(mapping)}`
               : "Survey active · drive manually, then stop to record a checkpoint.")
           : mapping.state === "blocked" ? "Auto explore stopped: no safe path visible in the forward scan."
-            : mapping.state === "time_limit" ? "Auto explore stopped at its 2-minute limit."
-              : mapping.state === "move_limit" ? "Auto explore stopped after 30 moves."
+            : mapping.state === "time_limit" ? "Auto explore stopped at its 4-minute limit."
+              : mapping.state === "move_limit" ? "Auto explore stopped after 60 moves."
                 : "Mapping is off.";
     }
     mappingToggle.addEventListener("click", async () => {
@@ -537,6 +576,8 @@
     setInterval(refreshStatus, 1000);
     refreshMapping();
     setInterval(refreshMapping, 2000);
+    refreshVision();
+    setInterval(refreshVision, 2000);
   </script>
 </body>
 </html>

@@ -19,10 +19,12 @@ from robocar.drive import (
     SimulatedPanTilt,
 )
 from robocar.mapping import (
-    AUTO_MAX_SEARCH_TURNS,
+    AUTO_LEG_BURSTS,
     AUTO_MAX_TURN_DEGREES,
+    AUTO_MAX_TURNS_WITHOUT_PROGRESS,
     SCAN_ANGLES,
     CameraMotionEstimate,
+    assess_picture,
     MappingController,
     MappingStore,
     direction_clearances,
@@ -31,6 +33,7 @@ from robocar.mapping import (
     forward_clearance,
 )
 from robocar.localization import relative
+from robocar.vision_debug import render_matches
 from robocar.range_sensor import RangeSensorController
 from camera_scene import PanoramaScene
 from sonar_room import SonarRoom
@@ -507,7 +510,7 @@ class MappingTests(unittest.TestCase):
                 pan_tilt.close()
                 range_sensor.close()
 
-    def test_autonomous_mode_periodically_turns_when_a_side_is_clear(self):
+    def test_autonomous_mode_drives_a_leg_then_turns_toward_a_new_zone(self):
         with tempfile.TemporaryDirectory() as directory:
             driver = RecordingDriver()
             drive = DriveController(driver, max_duty=1000, command_timeout=1, physical=True)
@@ -552,7 +555,7 @@ class MappingTests(unittest.TestCase):
                     patch.object(mapping, "_turn_by", side_effect=track_turn_by),
                 ):
                     mapping.start_autonomous(attended=True)
-                    deadline = time.monotonic() + 5
+                    deadline = time.monotonic() + 12
                     while not any(
                         command[0] != command[2] and command != (0, 0, 0, 0)
                         for command in driver.commands
@@ -575,11 +578,11 @@ class MappingTests(unittest.TestCase):
                             for command in movement_commands
                         )
                     )
-                    # Three bursts ahead, then a look-around turn toward the
-                    # open side, kept to one small step.
+                    # A full leg ahead, then the first small step of the turn
+                    # toward the most open new zone.
                     self.assertEqual(
-                        moves[:4],
-                        [("drive", 1.0), ("drive", 1.0), ("drive", 1.0), ("turn", -AUTO_MAX_TURN_DEGREES)],
+                        moves[: AUTO_LEG_BURSTS + 1],
+                        [("drive", 1.0)] * AUTO_LEG_BURSTS + [("turn", -AUTO_MAX_TURN_DEGREES)],
                     )
                     self.assertEqual(mapping.status()["mode"], "explore")
                     self.assertGreaterEqual(mapping.status()["move_count"], 3)
@@ -664,9 +667,9 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(clearances[48.0], 150.0)
         step = plan_explore_step(sides, (0.0, 0.0, 0.0), [], 0, 0, 0)
         # Toward the opening at 48 degrees, one small step at a time.
-        self.assertEqual((step.action, step.degrees), ("turn", AUTO_MAX_TURN_DEGREES))
+        self.assertEqual((step.action, step.degrees, step.goal_heading), ("turn", AUTO_MAX_TURN_DEGREES, 48.0))
 
-    def test_boxed_in_corner_turns_to_search_instead_of_shuttling(self):
+    def test_at_the_edge_of_open_space_it_turns_to_a_new_zone_instead_of_shuttling(self):
         # The first real sweep from the passage run: walls 48-66 cm all round.
         data = json.loads((Path(__file__).parent / "data" / "passage_run.json").read_text())
         corner = data["observations"][0]["scan"]
@@ -676,18 +679,41 @@ class MappingTests(unittest.TestCase):
             {**item, "distance_cm": item["distance_cm"] - 9.0 if item["distance_cm"] else None}
             for item in corner
         ]
-        first = plan_explore_step(closer, (0.0, 9.0, 0.0), [(0.0, 0.0, 0.0)], 1, 0, 0)
-        self.assertEqual(first.action, "search")
-        second = plan_explore_step(
-            closer, (0.0, 9.0, 45.0), [(0.0, 0.0, 0.0)], 0, 1, 0, search_sign=math.copysign(1, first.degrees)
-        )
-        self.assertEqual(second.degrees, first.degrees)  # keeps turning the same way
-        exhausted = plan_explore_step(closer, (0.0, 9.0, 0.0), [], 0, AUTO_MAX_SEARCH_TURNS, 0)
+        visited = [(0.0, 0.0, 0.0), (0.0, 9.0, 0.0)]
+        first = plan_explore_step(closer, (0.0, 9.0, 0.0), visited, 1, 0, 0)
+        self.assertEqual(first.action, "turn")
+        self.assertIsNotNone(first.goal_heading)
+        self.assertGreaterEqual(abs(first.goal_heading), 75.0)  # a genuinely new direction
+        # The goal is kept while it rotates, one step per stop.
+        second = plan_explore_step(closer, (0.0, 9.0, first.degrees), visited, 1, 1, 0, first.goal_heading)
+        self.assertEqual(second.goal_heading, first.goal_heading)
+        self.assertEqual(math.copysign(1, second.degrees), math.copysign(1, first.degrees))
+        exhausted = plan_explore_step(closer, (0.0, 9.0, 0.0), visited, 0, AUTO_MAX_TURNS_WITHOUT_PROGRESS, 0)
         self.assertEqual(exhausted.action, "reverse")
         self.assertEqual(
-            plan_explore_step(closer, (0.0, 9.0, 0.0), [], 0, AUTO_MAX_SEARCH_TURNS, 1).action,
+            plan_explore_step(closer, (0.0, 9.0, 0.0), visited, 0, AUTO_MAX_TURNS_WITHOUT_PROGRESS, 1).action,
             "blocked",
         )
+
+    def test_it_finishes_turning_toward_a_zone_before_driving(self):
+        open_scan = [
+            {"angle_deg": angle, "distance_cm": 200.0, "samples": 3, "error": None} for angle in range(-57, 61, 3)
+        ]
+        midway = plan_explore_step(open_scan, (0.0, 0.0, 30.0), [], 0, 2, 0, goal_heading=90.0)
+        self.assertEqual((midway.action, midway.degrees, midway.goal_heading), ("turn", 25.0, 90.0))
+        # Facing the zone, a fresh leg starts even if the last one was long.
+        arrived = plan_explore_step(open_scan, (0.0, 0.0, 85.0), [], AUTO_LEG_BURSTS, 4, 0, goal_heading=90.0)
+        self.assertEqual((arrived.action, arrived.goal_heading), ("forward", None))
+
+    def test_directions_already_swept_from_nearby_are_not_revisited(self):
+        blocked = [
+            {"angle_deg": angle, "distance_cm": 40.0, "samples": 3, "error": None} for angle in range(-57, 61, 3)
+        ]
+        # It has already looked left (heading 90) and right (heading -90) from here.
+        visited = [(0.0, 0.0, 0.0), (0.0, 0.0, 90.0), (0.0, 0.0, -90.0)]
+        step = plan_explore_step(blocked, (0.0, 0.0, 0.0), visited, 0, 0, 0)
+        self.assertEqual(step.action, "turn")
+        self.assertGreater(abs(step.goal_heading), 140.0)  # behind is all that is left
 
     def test_exploration_prefers_openings_away_from_where_it_has_been(self):
         scan = [
@@ -708,6 +734,12 @@ class MappingTests(unittest.TestCase):
             current = (scene.view(actual), scene.view(actual))
             self.assertAlmostEqual(MappingController._measure_turn(strip, current, 90), actual, delta=1.0)
 
+    def test_a_single_strip_reading_is_not_trusted(self):
+        scene = PanoramaScene()
+        strip = {90: (scene.view(0),), 150: (scene.view(60),)}
+        # Only the 60-degree picture overlaps a 70-degree turn: no consensus.
+        self.assertIsNone(MappingController._measure_turn(strip, (scene.view(70), scene.view(70)), 90))
+
     def test_camera_aligns_a_turn_when_odometry_under_reads_it(self):
         scene = PanoramaScene()
         drive = DriveController(SimulatedDriver(), max_duty=4095, command_timeout=1, physical=True)
@@ -715,9 +747,8 @@ class MappingTests(unittest.TestCase):
         pan_tilt = PanTiltController(pan_driver, physical=True)
 
         def true_heading() -> float:
-            # The real car turns 2.8 times as far as its odometry says,
-            # as when a planned 25-degree turn came out near 70 degrees.
-            return 2.8 * drive.odometry()[2]
+            # The real car turns 1.6 times as far as its odometry says.
+            return 1.6 * drive.odometry()[2]
 
         class SceneCamera:
             def capture_snapshot(self) -> bytes:
@@ -732,7 +763,7 @@ class MappingTests(unittest.TestCase):
             self.assertAlmostEqual(mapping._verified_turn, true_heading(), delta=1.5)
             self.assertEqual(pan_driver.pan, 90)
             # The turn taught odometry that turns run long.
-            self.assertGreater(mapping._odometry_scale[1], 1.2)
+            self.assertGreater(mapping._odometry_scale[1], 1.1)
         finally:
             mapping.close()
             drive.close()
@@ -863,3 +894,91 @@ class SlippingRoomTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExposureCamera:
+    """A camera whose pictures get brighter with exposure, over a fixed scene."""
+
+    def __init__(self, scene_brightness: float) -> None:
+        rng = np.random.default_rng(5)
+        pattern = cv2.GaussianBlur(rng.random((480, 640)).astype(np.float32), (0, 0), 3)
+        pattern = (pattern - pattern.min()) / (pattern.max() - pattern.min())
+        for _ in range(400):
+            centre = (int(rng.integers(0, 640)), int(rng.integers(0, 480)))
+            cv2.circle(pattern, centre, int(rng.integers(3, 12)), float(rng.random()), 2)
+        self.pattern = pattern
+        self.scene_brightness = scene_brightness
+        self.setting: dict[str, float] = {"ev": 0.0}
+        self.shots: list[dict[str, float]] = []
+
+    def set_exposure(self, setting: dict[str, float]) -> None:
+        self.setting = dict(setting)
+
+    def capture_snapshot(self) -> bytes:
+        if "exposure_us" in self.setting:
+            gain = self.setting["exposure_us"] / 33_000 * self.setting.get("gain", 1.0)
+        else:
+            gain = 2.0 ** self.setting.get("ev", 0.0)
+        self.shots.append(dict(self.setting))
+        image = np.clip(self.pattern * self.scene_brightness * gain * 2, 0, 255).astype(np.uint8)
+        return cv2.imencode(".jpg", image)[1].tobytes()
+
+
+class ExposureTests(unittest.TestCase):
+    def controller(self, camera):
+        drive = DriveController(SimulatedDriver(), max_duty=1000, command_timeout=1, physical=False)
+        pan_tilt = PanTiltController(SimulatedPanTilt(), physical=False)
+        range_sensor = RangeSensorController(None, physical=False)
+        mapping = MappingController(camera, drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")))
+        self.addCleanup(range_sensor.close)
+        self.addCleanup(pan_tilt.close)
+        self.addCleanup(drive.close)
+        self.addCleanup(mapping.close)
+        return mapping
+
+    def test_a_dark_scene_is_retaken_brighter_and_the_setting_remembered(self):
+        camera = ExposureCamera(scene_brightness=12.0)
+        mapping = self.controller(camera)
+        jpeg, info = mapping._capture_best_picture()
+        quality = assess_picture(jpeg)
+        self.assertTrue(quality.decent, info)
+        self.assertGreater(info["attempts"], 1)
+        self.assertGreater(camera.setting.get("ev", 99.0), 0.0)
+        # The next picture starts from what worked and needs a single shot.
+        camera.shots.clear()
+        _, again = mapping._capture_best_picture()
+        self.assertEqual(again["attempts"], 1)
+        self.assertEqual(camera.shots[0], info["setting"])
+
+    def test_a_bright_scene_is_retaken_darker(self):
+        camera = ExposureCamera(scene_brightness=250.0)
+        mapping = self.controller(camera)
+        _, info = mapping._capture_best_picture()
+        self.assertLess(info["setting"].get("ev", 0.0), 0.0)
+
+    def test_the_best_picture_is_kept_when_no_setting_is_decent(self):
+        camera = ExposureCamera(scene_brightness=0.5)  # far too dark for any setting
+        mapping = self.controller(camera)
+        jpeg, info = mapping._capture_best_picture()
+        self.assertIsNotNone(jpeg)
+        self.assertFalse(info["decent"])
+        self.assertLessEqual(info["attempts"], 5)
+        # Of the pictures tried, the brightest (least underexposed) is kept.
+        self.assertEqual(info["setting"], {"ev": 4.0})
+
+    def test_a_camera_without_exposure_control_takes_one_snapshot(self):
+        mapping = self.controller(FakeCamera())
+        jpeg, info = mapping._capture_best_picture()
+        self.assertEqual(jpeg, b"jpeg")
+        self.assertIsNone(info)
+
+    def test_matching_pictures_are_published_for_the_dashboard(self):
+        mapping = self.controller(FakeCamera())
+        scene = PanoramaScene()
+        first, second = scene.view(0), scene.view(10)
+        mapping._set_vision("motion", "Stop to stop", ["test"], lambda: render_matches(first, second, "Stop to stop", ["test"]))
+        panels = mapping.vision_panels()
+        self.assertEqual([panel["name"] for panel in panels], ["motion"])
+        picture = cv2.imdecode(np.frombuffer(mapping.vision_image("motion"), np.uint8), cv2.IMREAD_COLOR)
+        self.assertEqual(picture.shape[1], 640)
+        self.assertIsNone(mapping.vision_image("place"))

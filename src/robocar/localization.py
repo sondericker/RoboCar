@@ -34,6 +34,7 @@ REGISTRATION_GATE_CHI2 = 11.3
 VISUAL_YAW_SIGMA_DEGREES = 1.5
 VISUAL_SINGLE_YAW_SIGMA_DEGREES = 4.0
 VISUAL_BEARING_SIGMA_DEGREES = 8.0
+VISUAL_OVERRIDE_MAX_DEGREES = 30.0
 
 
 def wrap_degrees(angle: float) -> float:
@@ -101,9 +102,10 @@ def predict_motion(odometry_delta: Sequence[float], visual: VisualMotion | None)
             )
             yaw_sigma = (weight_odometry + weight_visual) ** -0.5
             visual_used = True
-        elif visual.estimates >= 2 and visual.spread_deg <= 3.0:
+        elif visual.estimates >= 2 and visual.spread_deg <= 3.0 and disagreement <= VISUAL_OVERRIDE_MAX_DEGREES:
             # Several camera estimates agree with each other but not with the
-            # wheels: the wheels slipped or the car was moved by hand.
+            # wheels: the wheels slipped or the car was moved by hand. Far
+            # larger disagreements are camera mistakes, not slip.
             yaw, yaw_sigma = visual.yaw_deg, visual_sigma
             visual_used = True
         else:

@@ -37,6 +37,7 @@ from robocar.places import (
 )
 from robocar.range_sensor import RangeSensorController
 from robocar.surfaces import IntegrationReport, SurfaceMap, direction, extract_echoes, pose_rotation
+from robocar.vision_debug import render_features, render_matches
 
 logger = logging.getLogger(__name__)
 # Pan positions for each sweep: 40 directions 3 degrees apart, overlapping the
@@ -57,13 +58,14 @@ FORWARD_CORRIDOR_DEGREES = 12
 SIDE_MIN_ANGLE_DEGREES = 30
 STOP_SETTLE_SECONDS = 0.75
 MINIMUM_FREE_BYTES = 256 * 1024 * 1024
-AUTO_MAX_SECONDS = 120
-AUTO_MAX_MOVES = 30
+AUTO_MAX_SECONDS = 240
+AUTO_MAX_MOVES = 60
 AUTO_MIN_CLEARANCE_CM = 60.0
 AUTO_FORWARD_COMMAND = 1.0
 AUTO_FORWARD_SECONDS = 0.25
 AUTO_TURN_COMMAND = 1.0
-AUTO_FORWARD_BURSTS_PER_TURN = 3
+# A leg drives forward until the open space ahead ends, but no further than this.
+AUTO_LEG_BURSTS = 6
 AUTO_MAX_BACKUP_BURSTS = 1
 # Turns are closed-loop on wheel odometry and kept small; a larger change of
 # direction happens over several stops, with a fresh sweep after each.
@@ -76,21 +78,53 @@ AUTO_MAX_TURN_SECONDS = 3.0
 AUTO_STRIP_STEP_DEGREES = 10
 # The full pan range on the turn side, so even a large overshoot is measured.
 AUTO_STRIP_REACH_DEGREES = 60
-AUTO_STRIP_MAX_YAW_DEGREES = 20.0
+AUTO_STRIP_MAX_YAW_DEGREES = 25.0
 AUTO_ALIGN_TOLERANCE_DEGREES = 3.0
 AUTO_ALIGN_MAX_CORRECTIONS = 2
+# A measured turn must be backed by two strip pictures that agree, must be
+# roughly what the wheels saw, and may only be corrected by so much at once;
+# otherwise the wheels are trusted.
+AUTO_STRIP_AGREEMENT_DEGREES = 4.0
+AUTO_ALIGN_PLAUSIBLE_RATIO = (0.5, 2.0)
+AUTO_ALIGN_MAX_CORRECTION_DEGREES = 20.0
 AUTO_ALIGN_FRAMES = 2
 AUTO_ALIGN_SETTLE_SECONDS = 0.15
 PAN_LIMITS = (30, 150)
-# When everything ahead and to the sides is close, rotate in place to look
-# for a way out (always the same way) before ever backing up blind.
-AUTO_SEARCH_TURN_DEGREES = 25.0
-AUTO_MAX_SEARCH_TURNS = 8
 AUTO_TURN_MIN_CLEARANCE_CM = 25.0
-# Prefer directions that lead away from where the car has already been.
+AUTO_GOAL_TOLERANCE_DEGREES = 10.0
+# About 300 degrees of turning without finding a way forward, then back up.
+AUTO_MAX_TURNS_WITHOUT_PROGRESS = 12
+# Choosing the next zone: unexplored ground scores higher, and directions
+# outside the sweep are worth a look unless a nearby sweep already covered them.
 AUTO_NOVELTY_LOOKAHEAD_CM = 80.0
-AUTO_NOVELTY_WEIGHT = 0.5
+AUTO_UNSWEPT_DIRECTIONS_DEGREES = (-150.0, -105.0, -75.0, 75.0, 105.0, 150.0, 180.0)
+AUTO_UNKNOWN_CLEARANCE_SCORE = 40.0
+AUTO_SWEPT_RADIUS_CM = 40.0
+AUTO_SWEEP_HALF_WIDTH_DEGREES = 55.0
 CAMERA_MOTION_FRAME_COUNT = 3
+# Exposure settings tried for each stop's picture, darkest to brightest:
+# auto-exposure with compensation, then long manual exposures with gain.
+EXPOSURE_LADDER = (
+    {"ev": -1.0},
+    {"ev": 0.0},
+    {"ev": 1.0},
+    {"ev": 2.0},
+    {"ev": 3.0},
+    {"ev": 4.0},
+    {"exposure_us": 50_000, "gain": 6.0},
+    {"exposure_us": 90_000, "gain": 8.0},
+)
+EXPOSURE_START_INDEX = 1
+EXPOSURE_MAX_ATTEMPTS = 5
+PICTURE_BRIGHTNESS_RANGE = (70.0, 170.0)
+PICTURE_MAX_CLIPPED = 0.05
+PICTURE_GOOD_FEATURES = 300
+# Dim real pictures produced confident-looking nonsense (136 degree "turns"
+# while driving straight) from a handful of matches; demand real support.
+CAMERA_MIN_MATCHES = 25
+CAMERA_MIN_INLIERS = 20
+CAMERA_MIN_INLIER_FRACTION = 0.4
+CAMERA_MAX_PLAUSIBLE_YAW_DEGREES = 55.0
 # Let the car stop rocking and the head stop moving before the first picture.
 CAMERA_SETTLE_SECONDS = 0.3
 CAMERA_MOTION_FRAME_INTERVAL_SECONDS = 0.05
@@ -147,7 +181,7 @@ def estimate_pair_camera_motion(
         for first, second in [pair]
         if first.distance < 0.75 * second.distance
     ]
-    if len(good_matches) < 12:
+    if len(good_matches) < CAMERA_MIN_MATCHES:
         return None
 
     previous_xy = np.float32(
@@ -179,7 +213,7 @@ def estimate_pair_camera_motion(
         return None
     inlier_mask = inliers.ravel().astype(bool)
     inlier_previous = previous_xy[inlier_mask]
-    if len(inlier_previous) < 8:
+    if len(inlier_previous) < CAMERA_MIN_INLIERS or len(inlier_previous) < CAMERA_MIN_INLIER_FRACTION * len(good_matches):
         return None
     if (
         np.ptp(inlier_previous[:, 0]) < image_width * 0.15
@@ -204,10 +238,12 @@ def estimate_pair_camera_motion(
             if math.hypot(centre[0], centre[2]) > 1e-6
             else None
         )
-        return CameraMotionEstimate(
-            math.degrees(math.atan2(rotation[0, 2], rotation[2, 2])),
-            bearing,
-        )
+        yaw = math.degrees(math.atan2(rotation[0, 2], rotation[2, 2]))
+        # Views turned further apart than this cannot share enough of the
+        # scene to have matched; such a result is a false fit.
+        if abs(yaw) > CAMERA_MAX_PLAUSIBLE_YAW_DEGREES:
+            return None
+        return CameraMotionEstimate(yaw, bearing)
 
     homography, homography_inliers = cv2.findHomography(
         previous_xy,
@@ -215,7 +251,7 @@ def estimate_pair_camera_motion(
         method=cv2.RANSAC,
         ransacReprojThreshold=3.0,
     )
-    if homography is None or homography_inliers is None or homography_inliers.sum() < 12:
+    if homography is None or homography_inliers is None or homography_inliers.sum() < CAMERA_MIN_INLIERS:
         return None
     _, rotations, translations, _ = cv2.decomposeHomographyMat(
         homography,
@@ -232,7 +268,10 @@ def estimate_pair_camera_motion(
         math.degrees(math.atan2(candidate[0, 2], candidate[2, 2]))
         for candidate in rotation_only
     ]
-    return CameraMotionEstimate(statistics.median(angles), None)
+    yaw = statistics.median(angles)
+    if abs(yaw) > CAMERA_MAX_PLAUSIBLE_YAW_DEGREES:
+        return None
+    return CameraMotionEstimate(yaw, None)
 
 
 ViewKey = tuple[int, int]
@@ -275,6 +314,65 @@ def combine_view_estimates(
         else None
     )
     return VisualMotion(statistics.median(yaws), bearing, len(yaws), max(yaws) - min(yaws))
+
+
+@dataclass(frozen=True)
+class PictureQuality:
+    brightness: float
+    contrast: float
+    clipped_dark: float
+    clipped_bright: float
+    features: int
+
+    @property
+    def too_dark(self) -> bool:
+        return self.brightness < PICTURE_BRIGHTNESS_RANGE[0] or self.clipped_dark > PICTURE_MAX_CLIPPED
+
+    @property
+    def too_bright(self) -> bool:
+        return self.brightness > PICTURE_BRIGHTNESS_RANGE[1] or self.clipped_bright > PICTURE_MAX_CLIPPED
+
+    @property
+    def decent(self) -> bool:
+        return not self.too_dark and not self.too_bright and self.features >= PICTURE_GOOD_FEATURES
+
+    @property
+    def score(self) -> float:
+        low, high = PICTURE_BRIGHTNESS_RANGE
+        outside = max(0.0, low - self.brightness, self.brightness - high)
+        exposure = math.exp(-((outside / 40.0) ** 2))
+        # Usable detail first; between pictures with equally little detail,
+        # the better-exposed one wins.
+        return self.features * (1.0 - self.clipped_dark - self.clipped_bright) * exposure + exposure
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "brightness": round(self.brightness, 1),
+            "contrast": round(self.contrast, 1),
+            "clipped": round(self.clipped_dark + self.clipped_bright, 3),
+            "features": self.features,
+            "decent": self.decent,
+        }
+
+
+def assess_picture(jpeg: bytes) -> PictureQuality | None:
+    """Levels and usable detail of a picture, before any enhancement."""
+    image = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        return None
+    return PictureQuality(
+        float(image.mean()),
+        float(image.std()),
+        float((image <= 4).mean()),
+        float((image >= 251).mean()),
+        len(cv2.ORB_create(nfeatures=500).detect(image, None)),
+    )
+
+
+def exposure_label(setting: dict[str, float]) -> str:
+    if "exposure_us" in setting:
+        return f"manual {setting['exposure_us'] / 1000:.0f} ms, gain {setting.get('gain', 1.0):.0f}"
+    return f"auto {setting.get('ev', 0.0):+.0f} EV"
 
 
 def image_texture_score(jpeg: bytes) -> float:
@@ -639,59 +737,104 @@ def direction_clearances(scan: Sequence[dict[str, object]]) -> dict[float, float
 
 @dataclass(frozen=True)
 class ExploreStep:
-    action: str  # "forward", "turn", "search", "reverse" or "blocked"
+    action: str  # "forward", "turn", "reverse" or "blocked"
     degrees: float = 0.0
     reason: str = ""
+    # World heading of the zone being turned toward, kept across stops.
+    goal_heading: float | None = None
+
+
+def _novelty(pose: Sequence[float], angle: float, visited: Sequence[Sequence[float]]) -> float:
+    """How far the spot ahead in this direction is from anywhere already visited."""
+    target = np.array(pose[:2], dtype=float) + AUTO_NOVELTY_LOOKAHEAD_CM * direction(float(pose[2]) + angle)
+    if not visited:
+        return AUTO_NOVELTY_LOOKAHEAD_CM
+    nearest = min(float(np.linalg.norm(target - np.array(point[:2], dtype=float))) for point in visited)
+    return min(AUTO_NOVELTY_LOOKAHEAD_CM, nearest)
+
+
+def _already_swept(pose: Sequence[float], angle: float, visited: Sequence[Sequence[float]]) -> bool:
+    """Whether a sweep from near here already covered this direction."""
+    heading = float(pose[2]) + angle
+    return any(
+        math.hypot(point[0] - pose[0], point[1] - pose[1]) <= AUTO_SWEPT_RADIUS_CM
+        and abs(wrap_degrees(heading - float(point[2]))) <= AUTO_SWEEP_HALF_WIDTH_DEGREES
+        for point in visited
+        if len(point) > 2
+    )
+
+
+def choose_new_zone(
+    scan: Sequence[dict[str, object]],
+    pose: Sequence[float],
+    visited: Sequence[Sequence[float]],
+) -> float | None:
+    """Pick the direction (degrees from the current heading) to map next.
+
+    Swept directions count with their measured clearance; directions outside
+    the sweep (beside and behind) are unknown and worth a look unless a sweep
+    from nearby already covered them. Unexplored ground scores higher.
+    """
+    clearances = direction_clearances(scan)
+    options: list[tuple[float, float]] = []
+    for angle, clearance in sorted(clearances.items()):
+        if abs(angle) >= SIDE_MIN_ANGLE_DEGREES and clearance >= AUTO_MIN_CLEARANCE_CM + 20:
+            options.append((0.5 * min(clearance, 200.0) + _novelty(pose, angle, visited), angle))
+    for angle in AUTO_UNSWEPT_DIRECTIONS_DEGREES:
+        if not _already_swept(pose, angle, visited):
+            options.append((AUTO_UNKNOWN_CLEARANCE_SCORE + _novelty(pose, angle, visited), angle))
+    if not options:
+        return None
+    return max(options, key=lambda option: option[0])[1]
 
 
 def plan_explore_step(
     scan: Sequence[dict[str, object]],
     pose: Sequence[float],
     visited: Sequence[Sequence[float]],
-    forward_bursts_since_turn: int,
-    search_turns: int,
+    leg_bursts: int,
+    turns_without_progress: int,
     backup_bursts: int,
-    search_sign: float = 0.0,
+    goal_heading: float | None = None,
+    just_backed_up: bool = False,
 ) -> ExploreStep:
-    """Decide the next autonomous move from the latest sweep (counterclockwise degrees)."""
+    """Decide the next autonomous move from the latest sweep (counterclockwise degrees).
+
+    The car drives legs: forward until the open space ends (or a leg limit),
+    then it picks a new zone and rotates toward it over several stops,
+    sweeping at each, before starting the next leg.
+    """
     ahead = forward_clearance(scan)
     clearances = direction_clearances(scan)
-    ahead_clear = ahead is not None and ahead >= AUTO_MIN_CLEARANCE_CM
+    # Right after backing out of a dead end, never drive straight back in.
+    ahead_clear = ahead is not None and ahead >= AUTO_MIN_CLEARANCE_CM and not just_backed_up
+    can_turn = bool(clearances) and min(clearances.values()) >= AUTO_TURN_MIN_CLEARANCE_CM
 
-    def novelty(angle: float) -> float:
-        target = np.array(pose[:2], dtype=float) + AUTO_NOVELTY_LOOKAHEAD_CM * direction(float(pose[2]) + angle)
-        if not visited:
-            return AUTO_NOVELTY_LOOKAHEAD_CM
-        nearest = min(float(np.linalg.norm(target - np.array(point[:2], dtype=float))) for point in visited)
-        return min(AUTO_NOVELTY_LOOKAHEAD_CM, nearest)
+    def turn_toward(goal: float, reason: str) -> ExploreStep:
+        remaining = wrap_degrees(goal - float(pose[2]))
+        degrees = max(-AUTO_MAX_TURN_DEGREES, min(AUTO_MAX_TURN_DEGREES, remaining))
+        return ExploreStep("turn", degrees, reason, goal)
 
-    if ahead_clear and forward_bursts_since_turn < AUTO_FORWARD_BURSTS_PER_TURN:
-        return ExploreStep("forward", reason="path ahead is clear")
-    openings = [
-        (min(clearance, 200.0) + AUTO_NOVELTY_WEIGHT * novelty(angle), angle)
-        for angle, clearance in sorted(clearances.items())
-        if abs(angle) >= SIDE_MIN_ANGLE_DEGREES and clearance >= AUTO_MIN_CLEARANCE_CM + 20
-    ]
-    if openings:
-        _, angle = max(openings, key=lambda opening: opening[0])
-        degrees = max(-AUTO_MAX_TURN_DEGREES, min(AUTO_MAX_TURN_DEGREES, angle))
-        return ExploreStep("turn", degrees, f"turning {degrees:+.0f}° toward open space")
+    if goal_heading is not None:
+        remaining = wrap_degrees(goal_heading - float(pose[2]))
+        if abs(remaining) > AUTO_GOAL_TOLERANCE_DEGREES and can_turn and turns_without_progress < AUTO_MAX_TURNS_WITHOUT_PROGRESS:
+            return turn_toward(goal_heading, f"turning toward a new zone ({remaining:+.0f}° to go)")
+        if abs(remaining) <= AUTO_GOAL_TOLERANCE_DEGREES:
+            leg_bursts = 0  # facing the new zone: a fresh leg starts here
+
+    if ahead_clear and leg_bursts < AUTO_LEG_BURSTS:
+        return ExploreStep("forward", reason="driving into the open space ahead")
+    if can_turn and turns_without_progress < AUTO_MAX_TURNS_WITHOUT_PROGRESS:
+        angle = choose_new_zone(scan, pose, visited)
+        if angle is not None:
+            goal = wrap_degrees(float(pose[2]) + angle)
+            why = "edge of the open space reached" if not ahead_clear else "this way is mapped"
+            return turn_toward(goal, f"{why}; turning {angle:+.0f}° toward a new zone")
     if ahead_clear:
-        return ExploreStep("forward", reason="no side opening; continuing ahead")
-    if (
-        search_turns < AUTO_MAX_SEARCH_TURNS
-        and clearances
-        and min(clearances.values()) >= AUTO_TURN_MIN_CLEARANCE_CM
-    ):
-        if search_sign == 0.0:
-            left = [clearance for angle, clearance in clearances.items() if angle > 0]
-            right = [clearance for angle, clearance in clearances.items() if angle < 0]
-            search_sign = 1.0 if (np.mean(left) if left else 0.0) >= (np.mean(right) if right else 0.0) else -1.0
-        degrees = search_sign * AUTO_SEARCH_TURN_DEGREES
-        return ExploreStep("search", degrees, f"blocked; turning {degrees:+.0f}° to look for a way out")
-    if backup_bursts < AUTO_MAX_BACKUP_BURSTS:
-        return ExploreStep("reverse", reason="boxed in; backing up once")
-    return ExploreStep("blocked", reason="no safe path after searching")
+        return ExploreStep("forward", reason="no new zone in reach; continuing ahead")
+    if backup_bursts < AUTO_MAX_BACKUP_BURSTS and not just_backed_up:
+        return ExploreStep("reverse", reason="too close to turn; backing up once")
+    return ExploreStep("blocked", reason="no safe path after looking all around")
 
 
 class MappingController:
@@ -735,6 +878,9 @@ class MappingController:
         self._places.load()
         self._place_counts = self._places.counts()
         self._last_place: dict[str, object] | None = None
+        # The exposure that worked best last time is where the next picture starts.
+        self._exposure_index = EXPOSURE_START_INDEX
+        self._vision: dict[str, dict[str, object]] = {}
         self._replay_latest_run()
 
     def _reset_localization(self) -> None:
@@ -935,9 +1081,15 @@ class MappingController:
             self._map_run_id = run_id
         return report
 
+    def _hold_camera(self, held: bool) -> None:
+        hold = getattr(self._camera, "hold", None)
+        if hold is not None:
+            hold(held)
+
     def _run_survey(self) -> None:
         capture_pending = True
         stopped_since: float | None = None
+        self._hold_camera(True)
         try:
             while not self._stop_event.is_set():
                 drive_status = self._drive.status()
@@ -970,13 +1122,16 @@ class MappingController:
                 self._error = f"{type(exc).__name__}: {exc}"
         finally:
             self._drive.set_inhibited(False)
+            self._hold_camera(False)
 
     def _run_autonomous(self) -> None:
         started_at = time.monotonic()
-        forward_bursts_since_turn = 0
+        leg_bursts = 0
+        turns_without_progress = 0
         backup_bursts = 0
-        search_turns = 0
-        search_sign = 0.0
+        just_backed_up = False
+        goal_heading: float | None = None
+        self._hold_camera(True)
         try:
             while not self._stop_event.is_set():
                 if time.monotonic() - started_at >= AUTO_MAX_SECONDS:
@@ -1009,39 +1164,45 @@ class MappingController:
                     scan,
                     pose,
                     visited,
-                    forward_bursts_since_turn,
-                    search_turns,
+                    leg_bursts,
+                    turns_without_progress,
                     backup_bursts,
-                    search_sign,
+                    goal_heading,
+                    just_backed_up,
                 )
                 with self._lock:
                     self._plan = step.reason
                 if step.action == "blocked":
                     self._set_state("blocked")
                     break
+                if goal_heading is not None and step.goal_heading is None:
+                    leg_bursts = 0
+                goal_heading = step.goal_heading
 
                 self._drive.set_inhibited(False)
                 if step.action == "forward":
                     self._set_state("moving")
                     if not self._move_burst(AUTO_FORWARD_COMMAND, AUTO_FORWARD_SECONDS):
                         break
-                    forward_bursts_since_turn += 1
-                    backup_bursts = search_turns = 0
-                    search_sign = 0.0
-                elif step.action in ("turn", "search"):
+                    leg_bursts += 1
+                    turns_without_progress = 0
+                    just_backed_up = False
+                elif step.action == "turn":
                     self._set_state("turning")
                     if not self._turn_and_align(step.degrees):
                         break
-                    forward_bursts_since_turn = 0
-                    if step.action == "search":
-                        search_turns += 1
-                        search_sign = math.copysign(1.0, step.degrees)
+                    turns_without_progress += 1
+                    # Only a change of direction earns another backing-up.
+                    backup_bursts = 0
+                    just_backed_up = False
                 else:
                     self._set_state("backing_up")
                     if not self._move_burst(-AUTO_FORWARD_COMMAND, AUTO_FORWARD_SECONDS):
                         break
                     backup_bursts += 1
-                    search_turns = 0
+                    turns_without_progress = 0
+                    just_backed_up = True
+                    goal_heading = None
                 self._count_move()
                 self._drive.set_inhibited(True)
                 self._set_state("scanning")
@@ -1061,6 +1222,7 @@ class MappingController:
             if not self._stop_event.is_set():
                 self._drive.set_inhibited(False)
             self._set_enabled_false()
+            self._hold_camera(False)
 
     def _turn_and_align(self, degrees: float) -> bool:
         """Turn by `degrees`, then use the camera to measure and correct the turn."""
@@ -1077,10 +1239,21 @@ class MappingController:
         if not self._turn_by(degrees):
             return False
         actual: float | None = None
+        current_frames: tuple[bytes, ...] | None = None
+        corrections = 0
         for attempt in range(AUTO_ALIGN_MAX_CORRECTIONS + 1):
             current = self._capture_views([centre_pan], tilt, centre_pan, frames=AUTO_ALIGN_FRAMES)
-            actual = self._measure_turn(strip, current.get(centre_pan), centre_pan)
+            current_frames = current.get(centre_pan)
+            actual = self._measure_turn(strip, current_frames, centre_pan)
             if actual is None:
+                break
+            odometry_turned = self._drive.odometry()[2] - odometry_before
+            with self._lock:
+                expected = odometry_turned * self._odometry_scale[1]
+            low, high = AUTO_ALIGN_PLAUSIBLE_RATIO
+            if abs(expected) > 3.0 and not low <= actual / expected <= high:
+                logger.info("Camera turn %.1f disagrees with wheels %.1f; trusting the wheels", actual, expected)
+                actual = None
                 break
             # Positive means the car went too far counterclockwise.
             error = actual - degrees
@@ -1088,11 +1261,13 @@ class MappingController:
                 break
             # Correct with the turn ratio this very turn showed, so a badly
             # calibrated turn rate cannot make the correction overshoot too.
-            odometry_turned = self._drive.odometry()[2] - odometry_before
             ratio = actual / odometry_turned if abs(odometry_turned) > 2.0 else None
+            correction = max(-AUTO_ALIGN_MAX_CORRECTION_DEGREES, min(AUTO_ALIGN_MAX_CORRECTION_DEGREES, -error))
             self._set_state("aligning")
-            if not self._turn_by(-error, ratio if ratio is not None and 0.2 <= ratio <= 5.0 else None):
+            if not self._turn_by(correction, ratio if ratio is not None and 0.2 <= ratio <= 5.0 else None):
                 return False
+            corrections += 1
+        self._show_turn(strip, current_frames, centre_pan, degrees, actual, corrections)
         if actual is None:
             return True
         odometry_turned = self._drive.odometry()[2] - odometry_before
@@ -1103,6 +1278,104 @@ class MappingController:
                 rotation_scale = min(2.0, max(0.5, 0.7 * rotation_scale + 0.3 * actual / odometry_turned))
                 self._odometry_scale = (translation_scale, rotation_scale)
         return True
+
+    def _show_turn(
+        self,
+        strip: dict[int, tuple[bytes, ...]],
+        current: tuple[bytes, ...] | None,
+        centre_pan: int,
+        planned: float,
+        actual: float | None,
+        corrections: int,
+    ) -> None:
+        if not strip or not current:
+            return
+        aim = actual if actual is not None else planned
+        best_pan = min(strip, key=lambda pan: abs(pan - centre_pan - aim))
+        lines = [
+            f"planned {planned:+.0f} deg, camera measured "
+            + (f"{actual:+.1f} deg" if actual is not None else "nothing usable (wheels trusted)"),
+            f"left: strip picture at {best_pan - centre_pan:+d} deg; right: view after the turn"
+            + (f"; {corrections} correction(s)" if corrections else ""),
+        ]
+        self._set_vision("turn", "Turn check", lines, lambda: render_matches(strip[best_pan][0], current[0], "Turn check", lines))
+
+    def _set_vision(self, name: str, title: str, lines: list[str], render: Callable[[], bytes | None]) -> None:
+        """Store a dashboard picture; drawing problems never stop mapping."""
+        try:
+            jpeg = render()
+        except Exception:
+            logger.warning("Could not draw the %s picture", name, exc_info=True)
+            return
+        if jpeg:
+            with self._lock:
+                self._vision[name] = {
+                    "title": title,
+                    "caption": " · ".join(lines),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "jpeg": jpeg,
+                }
+
+    def vision_panels(self) -> list[dict[str, object]]:
+        with self._lock:
+            return [
+                {"name": name, "title": panel["title"], "caption": panel["caption"], "updated_at": panel["updated_at"]}
+                for name, panel in self._vision.items()
+            ]
+
+    def vision_image(self, name: str) -> bytes | None:
+        with self._lock:
+            panel = self._vision.get(name)
+            return panel["jpeg"] if panel else None
+
+    def _capture_best_picture(self) -> tuple[bytes | None, dict[str, object] | None]:
+        """Take a picture, check its levels, and retake with adjusted exposure
+        until it is decent or the settings run out; keep the best one."""
+        set_exposure = getattr(self._camera, "set_exposure", None)
+        if set_exposure is None:
+            return self._camera.capture_snapshot(), None
+        with self._lock:
+            index = self._exposure_index
+        tried: dict[int, PictureQuality] = {}
+        best: tuple[int, bytes, PictureQuality] | None = None
+        for _ in range(EXPOSURE_MAX_ATTEMPTS):
+            set_exposure(EXPOSURE_LADDER[index])
+            jpeg = self._camera.capture_snapshot()
+            if jpeg is None:
+                break
+            quality = assess_picture(jpeg)
+            if quality is None:
+                # Not a picture we can measure; keep it rather than nothing.
+                return jpeg, None
+            tried[index] = quality
+            if best is None or quality.score > best[2].score:
+                best = (index, jpeg, quality)
+            if quality.decent:
+                break
+            if quality.too_dark:
+                step = 1
+            elif quality.too_bright:
+                step = -1
+            else:
+                # Levels are fine but detail is thin: try pulling more out of
+                # the shadows, or the highlights in a bright picture.
+                step = 1 if quality.brightness < 120 else -1
+            following = index + step
+            if not 0 <= following < len(EXPOSURE_LADDER) or following in tried:
+                break
+            index = following
+        if best is None:
+            return None, None
+        best_index, jpeg, quality = best
+        set_exposure(EXPOSURE_LADDER[best_index])
+        with self._lock:
+            self._exposure_index = best_index
+        info: dict[str, object] = {
+            "setting": EXPOSURE_LADDER[best_index],
+            "attempts": len(tried),
+            **quality.summary(),
+        }
+        return jpeg, info
 
     @staticmethod
     def _measure_turn(
@@ -1123,8 +1396,17 @@ class MappingController:
                 readings.append((key[0] + visual.yaw_deg, 1.0 / (1.0 + abs(visual.yaw_deg))))
         if not readings:
             return None
-        total = sum(weight for _, weight in readings)
-        return sum(turn * weight for turn, weight in readings) / total
+        agreeing = max(
+            (
+                [other for other in readings if abs(other[0] - reading[0]) <= AUTO_STRIP_AGREEMENT_DEGREES]
+                for reading in readings
+            ),
+            key=lambda group: (len(group), sum(weight for _, weight in group)),
+        )
+        if len(agreeing) < 2:
+            return None
+        total = sum(weight for _, weight in agreeing)
+        return sum(turn * weight for turn, weight in agreeing) / total
 
     def _capture_views(
         self,
@@ -1233,9 +1515,20 @@ class MappingController:
         pan_status = self._pan_tilt.status()
         original_pan = int(pan_status["pan"])
         original_tilt = int(pan_status["tilt"])
-        image_jpeg = self._camera.capture_snapshot()
+        image_jpeg, exposure = self._capture_best_picture()
         if image_jpeg is None:
             raise RuntimeError("Camera snapshot failed; see camera status for details")
+        if exposure is not None:
+            exposure_lines = [
+                f"{exposure_label(exposure['setting'])} after {exposure['attempts']} tr"
+                + ("y" if exposure["attempts"] == 1 else "ies")
+                + ("" if exposure["decent"] else " (best available)"),
+                f"brightness {exposure['brightness']:.0f}/255, contrast {exposure['contrast']:.0f}, "
+                f"clipped {100 * float(exposure['clipped']):.1f}%",
+            ]
+            self._set_vision(
+                "stop", "Stop picture", exposure_lines, lambda: render_features(image_jpeg, "Stop picture", exposure_lines)
+            )
         centre_frames = [image_jpeg]
         for _ in range(CAMERA_MOTION_FRAME_COUNT - 1):
             if self._stop_event.wait(CAMERA_MOTION_FRAME_INTERVAL_SECONDS):
@@ -1287,6 +1580,21 @@ class MappingController:
             # already measured it against the destination view.
             visual = VisualMotion(verified_turn, None, AUTO_ALIGN_FRAMES, 0.0)
         prediction = predict_motion(odometry_delta, visual)
+        previous_centre = (previous_views or {}).get(centre_key)
+        if previous_centre:
+            motion_lines = [
+                "left: previous stop; right: this stop",
+                "camera turn "
+                + (f"{visual.yaw_deg:+.1f} deg" if visual is not None else "not measurable")
+                + (" (used)" if prediction.visual_used else " (rejected)" if prediction.visual_rejected else "")
+                + f"; wheels {odometry_delta[2]:+.1f} deg",
+            ]
+            self._set_vision(
+                "motion",
+                "Stop to stop",
+                motion_lines,
+                lambda: render_matches(previous_centre[0], image_jpeg, "Stop to stop", motion_lines),
+            )
 
         with self._lock:
             run_id = self._run_id
@@ -1330,6 +1638,7 @@ class MappingController:
             "registration": registration.summary(),
             "pose_sigma": [round(position_sigma, 2), round(heading_sigma, 2)],
             "surfaces_before": {"walls": counts[0], "features": counts[1]},
+            "exposure": exposure,
         }
         with self._lock:
             previous_node = self._last_node
@@ -1359,6 +1668,22 @@ class MappingController:
             place_counts = self._places.counts()
         if event is not None:
             logger.info("Recognized place %s: %s", event.keyframe_id, event.summary())
+            remembered = self._store.image(event.keyframe_id)
+            if remembered:
+                place_lines = [
+                    f"left: remembered stop {event.keyframe_id}"
+                    + (" from an earlier session" if event.kind == "relocalized" else "")
+                    + "; right: now",
+                    f"{event.inliers} camera inliers; pose moved "
+                    f"{math.hypot(event.correction[0], event.correction[1]):.0f} cm, {event.correction[2]:+.1f} deg"
+                    + ("; sonar confirmed" if event.metric else ""),
+                ]
+                self._set_vision(
+                    "place",
+                    "Recognized place",
+                    place_lines,
+                    lambda: render_matches(remembered, image_jpeg, "Recognized place", place_lines),
+                )
             report = self._rebuild_map(observation_id, run_id)
         else:
             with self._map_lock:

@@ -80,9 +80,10 @@ Use **Stop camera processing** on the dashboard to pause frame capture and
 object detection. The camera is released while paused, and the video stream
 waits without sending frames. Press **Start camera processing** to resume.
 
-Pan/tilt sliders are also on the dashboard. Their initial software travel is
-limited to 30°–150° to avoid the servo end stops; calibrate the safe range on
-the actual camera head before widening it.
+Pan/tilt sliders are also on the dashboard. The head starts at pan 90° and
+tilt 100°, and **Center head** returns it there. The initial software travel
+is limited to 30°–150° to avoid the servo end stops; calibrate the safe range
+on the actual camera head before widening it.
 
 When physical hardware is enabled, the dashboard also displays the live
 ultrasonic range in centimeters. The sensor samples in the background and
@@ -102,37 +103,51 @@ uses full normalized motor output and the default 4095/4095 motor duty cap.
 
 After each sweep it plans its next move:
 
-- **Forward:** a 0.25-second burst when the corridor ahead (±12°, roughly the
-  car's width) has at least 60 cm clearance. Motor duty ramps up over that
-  interval and down for 0.25 seconds after.
-- **Look around:** after three forward bursts in a row, it turns toward the
-  best side opening (at least 80 cm clear across a car-wide corridor). Turns
-  are at most 25°; a larger change of direction takes several stops, with a
-  fresh sweep after each. Openings that lead away from where the car has
-  already been score higher.
+- **Legs:** it drives forward in 0.25-second bursts while the corridor ahead
+  (±12°, roughly the car's width) has at least 60 cm clearance, up to six
+  bursts. That takes it to the edge of the open space, where it maps that
+  edge. Motor duty ramps up over each burst and down for 0.25 seconds after.
+- **New zones:** at the end of a leg it picks the next zone to map. Swept
+  directions count with their measured clearance; directions beside and
+  behind it that no nearby sweep has covered are worth a look. Ground no
+  session has visited scores higher. It rotates toward that zone 25° at a
+  time over several stops, sweeping at each (which maps the zone as it turns
+  round), then starts a new leg.
 - **Camera-measured turns:** before turning, the camera photographs a strip
   every 10° across the pan on the turn side (0–60°). The car then turns
   closed-loop on wheel odometry. Afterwards its new forward view is matched
-  against every strip picture; each one implies how far the car really
-  turned, and these are combined. If the turn is off by more than 3°, the car
-  makes up to two corrective turns, scaled by the ratio that turn revealed.
-  The measured turn also recalibrates odometry and fixes the pose for the
-  next sweep. Without usable images (a blank wall) it relies on odometry.
-- **Search:** when the way ahead is blocked or gives no echo (often a smooth
-  wall at a steep angle) and no side opening is clear, it turns in place 25°
-  at a time, always the same way, up to eight times, as long as nothing in
-  the sweep is closer than 25 cm.
-- **Back up:** only when that search finds nothing does it back up once for
-  0.25 seconds; if still boxed in, it stops. The rear is not sensed, so keep
-  the area behind the car clear and expect this recovery maneuver may bump
-  into something.
+  against every strip picture, and at least two must agree on how far it
+  really turned. If the turn is off by more than 3° and the measurement
+  roughly agrees with the wheels, the car makes up to two corrective turns
+  (at most 20° each). The measured turn also recalibrates odometry and fixes
+  the pose for the next sweep. Without trustworthy images it relies on
+  odometry.
+- **Back up:** only when it can't turn safely (something within 25 cm), or
+  after about 300° of turning without finding a way forward, does it back up
+  once for 0.25 seconds. After backing up it turns rather than driving
+  straight back in, and if it still can't move it stops. The rear is not
+  sensed, so keep the area behind the car clear and expect this recovery
+  maneuver may bump into something.
 
 If the sensor returns no readings at all, it stops with a sensor fault. The
 dashboard shows the reason for the current move. Each explore session is
-limited to two minutes and 30 moves. **STOP** cancels the session and stops
+limited to four minutes and 60 moves. **STOP** cancels the session and stops
 the drive output. A one-second watchdog stops stale commands, while
 autonomous moves refresh the command until they end. Exploration never
 starts at boot.
+
+**Pictures:** during a mapping session the camera stays open, so auto-exposure
+settles between stops. Each stop's picture is checked for brightness,
+clipping and usable detail. If it isn't decent, it is retaken with adjusted
+exposure (compensation from −1 to +4 EV, then long manual exposures with
+gain), up to five tries, and the best picture is kept. The setting that worked
+is where the next stop starts. The **What the camera sees** panel shows:
+
+- the latest stop picture with its detected features and exposure;
+- stop-to-stop matching (green lines are matches kept, red rejected) with the
+  measured camera turn;
+- the latest turn check against its strip picture;
+- the latest recognized place against the stored picture.
 
 Use **Reset mapping database** to permanently delete all saved observations.
 The dashboard asks for confirmation, and reset is unavailable while mapping is
