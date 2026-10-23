@@ -151,6 +151,7 @@ PICTURE_SHARP_REFERENCE = 60.0
 CAMERA_STEADY_DIFFERENCE = 2.5
 CAMERA_STEADY_TIMEOUT_SECONDS = 2.0
 CAMERA_STEADY_INTERVAL_SECONDS = 0.1
+CAMERA_NOISE_GROWTH = 1.15
 # Dim real pictures produced confident-looking nonsense (136 degree "turns"
 # while driving straight) from a handful of matches; demand real support.
 CAMERA_MIN_MATCHES = 25
@@ -424,7 +425,9 @@ def _steadiness_frame(jpeg: bytes | None) -> np.ndarray | None:
     image = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
     if image is None:
         return None
-    return cv2.GaussianBlur(cv2.resize(image, (160, 120), interpolation=cv2.INTER_AREA), (0, 0), 1.0).astype(np.float32)
+    # A heavy blur keeps frames correlated across small shifts (so movement
+    # builds up from frame to frame) and suppresses sensor noise.
+    return cv2.GaussianBlur(cv2.resize(image, (160, 120), interpolation=cv2.INTER_AREA), (0, 0), 3.0).astype(np.float32)
 
 
 def exposure_label(setting: dict[str, float]) -> str:
@@ -1506,15 +1509,25 @@ class MappingController:
         if previous is None:
             return True
         deadline = time.monotonic() + timeout
+        earlier: np.ndarray | None = None
         while time.monotonic() < deadline:
             if self._stop_event.wait(CAMERA_STEADY_INTERVAL_SECONDS):
                 return False
             current = _steadiness_frame(self._camera.capture_snapshot())
             if current is None:
                 return True
-            if float(np.abs(current - previous).mean()) < CAMERA_STEADY_DIFFERENCE:
+            change = float(np.abs(current - previous).mean())
+            if change < CAMERA_STEADY_DIFFERENCE:
                 return True
-            previous = current
+            # In dim light sensor noise alone exceeds the threshold. Noise does
+            # not build up over two frames the way movement does, so a change
+            # from two frames back no bigger than from one frame back means
+            # the view is still and only noisy.
+            if earlier is not None:
+                two_back = float(np.abs(current - earlier).mean())
+                if two_back <= CAMERA_NOISE_GROWTH * change:
+                    return True
+            earlier, previous = previous, current
         logger.info("Camera still changing after %.1f s; taking the picture anyway", timeout)
         return False
 

@@ -958,3 +958,24 @@ class SteadinessTests(unittest.TestCase):
         jpeg, info = mapping._capture_best_picture()
         self.assertFalse(assess_picture(jpeg).blurred)
         self.assertGreater(info["sharpness"], 20.0)
+
+    def test_sensor_noise_alone_does_not_hold_up_pictures(self):
+        rng = np.random.default_rng(3)
+        base = rng.integers(60, 120, (480, 640)).astype(np.float32)
+
+        class NoisyCamera(ExposureCamera):
+            """A still but dim scene whose frames differ only by sensor noise."""
+
+            def __init__(self):
+                super().__init__(scene_brightness=60.0)
+                self.calls = 0
+
+            def capture_snapshot(self):
+                self.calls += 1
+                noisy = np.clip(base + rng.normal(0, 40, base.shape), 0, 255).astype(np.uint8)
+                return cv2.imencode(".jpg", noisy)[1].tobytes()
+
+        camera = NoisyCamera()
+        mapping = self.controller(camera)
+        self.assertTrue(mapping._wait_until_steady(timeout=5.0))
+        self.assertLessEqual(camera.calls, 8)
