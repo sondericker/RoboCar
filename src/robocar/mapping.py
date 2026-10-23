@@ -24,7 +24,7 @@ from robocar.drive import (
     TURN_DEGREES_PER_SECOND_AT_FULL_DUTY,
     DriveController,
 )
-from robocar.exploration import CoverageGrid
+from robocar.exploration import CELL_CM, CoverageGrid, ExplorationLearner, load_learner, save_learner
 from robocar.localization import (
     MotionPrediction,
     Pose,
@@ -83,34 +83,39 @@ AUTO_FORWARD_COMMAND = 1.0
 AUTO_FORWARD_SECONDS = 0.25
 # With a motion calibration, each exploration step is sized to this distance.
 AUTO_STEP_CM = 25.0
-# With the way ahead clear past this, drive on to find the far wall instead of
-# turning toward nearby gaps; legs are up to AUTO_LONG_STEP_CM between sweeps
-# and stop short of the wall by AUTO_WALL_STANDOFF_CM.
-AUTO_OPEN_AHEAD_CM = 100.0
+# Forward legs run as far toward the next waypoint as a straight line allows,
+# up to AUTO_LONG_STEP_CM between sweeps, stopping AUTO_WALL_STANDOFF_CM short
+# of whatever the sonar sees ahead.
 AUTO_LONG_STEP_CM = 60.0
-AUTO_WALL_STANDOFF_CM = 55.0
-# Somewhere the car has already stood within this distance is not worth a
-# long leg; it has seen that wall from there.
-AUTO_VISITED_RADIUS_CM = 45.0
+AUTO_MIN_STEP_CM = 10.0
+# Too close to a wall to spin: slide this far sideways toward the roomier
+# side (readings beyond AUTO_STRAFE_SIDE_DEGREES), if it has at least
+# AUTO_STRAFE_MIN_ROOM_CM.
+AUTO_STRAFE_CM = 12.0
+AUTO_STRAFE_SIDE_DEGREES = 40.0
+AUTO_STRAFE_MIN_ROOM_CM = 30.0
+# In a corridor, a target within this angle of its direction is reached by
+# following the centre line, aiming this far ahead along it.
+AUTO_CORRIDOR_FOLLOW_DEGREES = 70.0
+AUTO_CORRIDOR_AIM_CM = 60.0
+AUTO_WALL_STANDOFF_CM = 45.0
+CELL_AREA_M2 = (CELL_CM / 100.0) ** 2
 AUTO_TURN_COMMAND = 1.0
 AUTO_MAX_BACKUP_BURSTS = 1
 # Head for the next waypoint once within this angle of it.
-AUTO_HEADING_TOLERANCE_DEGREES = 15.0
-# A needed turn larger than this continues to the right instead of reversing,
-# so the car keeps sweeping round the room the same way.
-AUTO_RIGHT_HAND_LIMIT_DEGREES = 135.0
+AUTO_HEADING_TOLERANCE_DEGREES = 10.0
 # When the sonar blocks a waypoint within this angle of ahead, pick another.
 AUTO_BLOCKED_CONE_DEGREES = 25.0
 # With no reachable frontier, look round this many turns before calling it explored.
-AUTO_LOOK_AROUND_TURNS = 4
-# Turns made just to look (or toward something far round) are bigger: a sweep
-# covers about 114 degrees, and the camera strip can still check 50.
-AUTO_LOOK_TURN_DEGREES = 50.0
-# Targets nearer straight ahead than this are approached in fine 25-degree steps.
-AUTO_FINE_TURN_LIMIT_DEGREES = 40.0
-# Turns are closed-loop on wheel odometry and kept small; a larger change of
-# direction happens over several stops, with a fresh sweep after each.
-AUTO_MAX_TURN_DEGREES = 25.0
+AUTO_LOOK_AROUND_TURNS = 3
+# Turns made just to look cover about a sweep's width (114 degrees), so three
+# looks see all round.
+AUTO_LOOK_TURN_DEGREES = 110.0
+# A turn toward a target is made in one stop, up to this much, as pieces the
+# camera strip can check (at most AUTO_TURN_PIECE_DEGREES each) with no sweep
+# in between: a sweep only pays once the car faces somewhere new.
+AUTO_MAX_TURN_PER_STOP_DEGREES = 150.0
+AUTO_TURN_PIECE_DEGREES = 50.0
 AUTO_MAX_TURN_SECONDS = 3.0
 # Before each turn the camera photographs a strip across the pan, from
 # straight ahead to past the destination. Afterwards the new forward view is
@@ -132,7 +137,9 @@ AUTO_ALIGN_FRAMES = 2
 AUTO_ALIGN_SETTLE_SECONDS = 0.15
 AUTO_VIEW_STEADY_TIMEOUT_SECONDS = 1.0
 PAN_LIMITS = (30, 150)
-AUTO_TURN_MIN_CLEARANCE_CM = 25.0
+# A side reading this short at the sweep's edge (57 degrees) puts a wall about
+# 17 cm from the centre: just room for the car to spin.
+AUTO_TURN_MIN_CLEARANCE_CM = 20.0
 # About 400 degrees of turning without finding a way forward, then back up.
 AUTO_MAX_TURNS_WITHOUT_PROGRESS = 12
 CAMERA_MOTION_FRAME_COUNT = 3
@@ -827,11 +834,14 @@ def direction_clearances(scan: Sequence[dict[str, object]]) -> dict[float, float
 
 @dataclass(frozen=True)
 class ExploreStep:
-    action: str  # "forward", "turn", "reverse", "blocked" or "done"
+    action: str  # "forward", "turn", "strafe", "reverse", "blocked" or "done"
     degrees: float = 0.0
     reason: str = ""
     target: tuple[float, float] | None = None
-    distance_cm: float = AUTO_STEP_CM
+    # For "forward", the leg. For "turn", a leg to drive straight after the
+    # turn if a forward ping confirms the way (0: sweep after turning). For
+    # "strafe", how far to slide sideways (positive: to the right).
+    distance_cm: float = 0.0
 
 
 def plan_explore_step(
@@ -842,68 +852,117 @@ def plan_explore_step(
     backup_bursts: int,
     just_backed_up: bool = False,
     previous_target: Sequence[float] | None = None,
+    learner: ExplorationLearner | None = None,
 ) -> ExploreStep:
-    """Decide the next autonomous move: one step toward the best frontier.
+    """Decide the next autonomous move toward the most promising frontier.
 
-    The coverage grid holds everything every sweep has seen, so the car keeps
-    heading for the edges of what is mapped rather than re-mapping surfaces
-    it already knows. The sonar sweep has the final say on driving forward.
+    The coverage grid holds everything every sweep has seen. The learner
+    weighs how much unknown floor each frontier could reveal (a long reading
+    off to one side leaves a lot) against the driving and turning needed to
+    get there, using what earlier moves actually revealed. The car turns the
+    short way toward the next waypoint and drives as far toward it as a
+    straight line allows; the sonar sweep has the final say on driving.
     """
+    learner = learner or ExplorationLearner()
+    learner.observe(pose, grid.known_count())
+    if turns_without_progress == 0:
+        learner.last_turn = 0.0
     ahead = forward_clearance(scan)
     clearances = direction_clearances(scan)
     # Right after backing out of a dead end, never drive straight back in.
     ahead_clear = ahead is not None and ahead >= AUTO_MIN_CLEARANCE_CM and not just_backed_up
     can_turn = bool(clearances) and min(clearances.values()) >= AUTO_TURN_MIN_CLEARANCE_CM
     turning_allowed = can_turn and turns_without_progress < AUTO_MAX_TURNS_WITHOUT_PROGRESS
+    if not can_turn and clearances:
+        # Too near a wall to spin: slide sideways (the wheels are mecanum)
+        # toward whichever side has more room, rather than back up blind.
+        left = [value for angle, value in clearances.items() if angle >= AUTO_STRAFE_SIDE_DEGREES]
+        right = [value for angle, value in clearances.items() if angle <= -AUTO_STRAFE_SIDE_DEGREES]
+        room_left, room_right = min(left, default=0.0), min(right, default=0.0)
+        room = max(room_left, room_right)
+        if room >= AUTO_STRAFE_MIN_ROOM_CM:
+            slide = AUTO_STRAFE_CM if room_right >= room_left else -AUTO_STRAFE_CM
+            side = "right" if slide > 0 else "left"
+            return ExploreStep("strafe", reason=f"too close to turn; sliding {AUTO_STRAFE_CM:.0f} cm {side}", distance_cm=slide)
 
-    # Open space ahead: go and find where it ends, unless the car has already
-    # been out there. This is what crosses rooms; edges nearby can wait.
-    if ahead is not None and ahead >= AUTO_OPEN_AHEAD_CM and not just_backed_up:
-        reach = min(ahead, SONAR_MAX_RANGE_CM)
-        leg = max(AUTO_STEP_CM, min(AUTO_LONG_STEP_CM, reach - AUTO_WALL_STANDOFF_CM))
-        heading = math.radians(float(pose[2]))
-        forward = (-math.sin(heading), math.cos(heading))
-        probe = min(reach - AUTO_WALL_STANDOFF_CM, leg + AUTO_VISITED_RADIUS_CM)
-        point = (float(pose[0]) + forward[0] * probe, float(pose[1]) + forward[1] * probe)
-        visited = any(
-            math.hypot(point[0] - x, point[1] - y) <= AUTO_VISITED_RADIUS_CM for x, y in grid.stood
-        )
-        if not visited:
-            wall = "no wall in range" if ahead > SONAR_MAX_RANGE_CM else f"wall {ahead:.0f} cm"
-            return ExploreStep(
-                "forward",
-                reason=f"open ahead ({wall}); driving {leg:.0f} cm to find the far side",
-                distance_cm=leg,
-            )
-
-    waypoint = grid.next_waypoint(pose, previous_target=previous_target)
+    waypoint = grid.next_waypoint(pose, previous_target=previous_target, learner=learner)
     if waypoint is None:
+        learner.finish(grid.known_count())
         if turning_allowed and turns_without_progress < AUTO_LOOK_AROUND_TURNS:
-            return ExploreStep("turn", -AUTO_LOOK_TURN_DEGREES, "no unexplored edge in reach yet; turning right to look")
+            return ExploreStep("turn", -AUTO_LOOK_TURN_DEGREES, "nothing worth a trip in view yet; turning to look")
         if can_turn or ahead_clear:
-            return ExploreStep("done", reason="no unexplored edges left within reach")
+            return ExploreStep("done", reason="no unexplored edges left worth a trip")
         if backup_bursts < AUTO_MAX_BACKUP_BURSTS and not just_backed_up:
             return ExploreStep("reverse", reason="too close to turn; backing up once")
         return ExploreStep("blocked", reason="no safe path after looking all around")
     if not ahead_clear and abs(waypoint.bearing_deg) <= AUTO_BLOCKED_CONE_DEGREES:
-        waypoint = grid.next_waypoint(pose, avoid_within_deg=AUTO_BLOCKED_CONE_DEGREES) or waypoint
+        waypoint = (
+            grid.next_waypoint(pose, avoid_within_deg=AUTO_BLOCKED_CONE_DEGREES, learner=learner) or waypoint
+        )
+    learner.pursue(waypoint.frontier, grid.known_count())
     bearing = waypoint.bearing_deg
-    target = waypoint.frontier.target
-    where = f"unexplored edge {waypoint.frontier.path_cm:.0f} cm away"
+    distance_to_waypoint = waypoint.distance_cm
+    frontier = waypoint.frontier
+    corridor = grid.corridor(pose)
+    in_corridor = False
+    if corridor is not None:
+        # Heading for something along the corridor: follow its centre line
+        # rather than picking a way between mapped cells.
+        here = np.array(pose[:2], dtype=float)
+        offset = np.array(frontier.target) - here
+        toward = math.degrees(math.atan2(-offset[0], offset[1]))
+        for axis in (corridor.axis_deg, corridor.axis_deg + 180.0):
+            if abs((toward - axis + 180.0) % 360.0 - 180.0) <= AUTO_CORRIDOR_FOLLOW_DEGREES:
+                centre = corridor.centre_offset_cm if axis == corridor.axis_deg else -corridor.centre_offset_cm
+                aim = here + direction(axis) * AUTO_CORRIDOR_AIM_CM + direction(axis + 90.0) * centre
+                aim_offset = aim - here
+                bearing = (math.degrees(math.atan2(-aim_offset[0], aim_offset[1])) - float(pose[2]) + 180.0) % 360.0 - 180.0
+                distance_to_waypoint = min(float(np.hypot(*offset)), AUTO_LONG_STEP_CM)
+                in_corridor = True
+                break
+    target = frontier.target
+    what = {
+        "open": "open space",
+        "doorway": f"a {frontier.width_cm:.0f} cm opening" if frontier.width_cm else "an opening",
+        "edge": "an unexplored edge",
+        "lead": "an opening the sonar saw into",
+    }[frontier.kind]
+    where = f"{what} {frontier.path_cm:.0f} cm away, could show {frontier.gain * CELL_AREA_M2:.1f} m²"
+    if in_corridor:
+        where = f"the {corridor.width_cm:.0f} cm corridor's centre line, toward {where}"
 
     if abs(bearing) > AUTO_HEADING_TOLERANCE_DEGREES and turning_allowed:
-        # Far round: turn in bigger steps (still within the camera strip),
-        # and past 135 degrees go the long way, keeping to the right.
-        step_limit = AUTO_LOOK_TURN_DEGREES if abs(bearing) > AUTO_FINE_TURN_LIMIT_DEGREES else AUTO_MAX_TURN_DEGREES
-        if bearing > AUTO_RIGHT_HAND_LIMIT_DEGREES:
-            degrees = -step_limit
-        else:
-            degrees = max(-step_limit, min(step_limit, bearing))
-        return ExploreStep("turn", degrees, f"turning toward {where} ({bearing:+.0f}°)", target)
-    if ahead_clear:
-        return ExploreStep("forward", reason=f"driving toward {where}", target=target)
+        limit = AUTO_MAX_TURN_PER_STOP_DEGREES
+        degrees = max(-limit, min(limit, bearing))
+        # Just lining up with a waypoint the map shows clear: no need for a
+        # sweep in between, only a ping ahead before driving on.
+        then = 0.0
+        if degrees == bearing and distance_to_waypoint >= AUTO_MIN_STEP_CM + 10.0:
+            facing = (pose[0], pose[1], float(pose[2]) + degrees)
+            then = min(AUTO_LONG_STEP_CM, distance_to_waypoint, grid.clear_run(facing, AUTO_LONG_STEP_CM))
+            if then < AUTO_MIN_STEP_CM:
+                then = 0.0
+        reason = f"turning toward {where} ({bearing:+.0f}°)" + (f", then {then:.0f} cm" if then else "")
+        learner.last_turn = 0.0 if then else degrees
+        return ExploreStep("turn", degrees, reason, target, distance_cm=then)
+    # The map has a say too: a wall met at a glancing angle never echoes.
+    mapped_run = grid.clear_run(pose, AUTO_LONG_STEP_CM)
+    if ahead_clear and mapped_run >= AUTO_MIN_STEP_CM:
+        leg = min(AUTO_LONG_STEP_CM, distance_to_waypoint, ahead - AUTO_WALL_STANDOFF_CM, mapped_run)
+        leg = max(AUTO_MIN_STEP_CM, leg)
+        return ExploreStep("forward", reason=f"driving {leg:.0f} cm toward {where}", target=target, distance_cm=leg)
+    if ahead_clear and turning_allowed:
+        # The sonar says clear but the map shows a wall close ahead: face the
+        # waypoint squarely, or if already facing it, head somewhere else.
+        if abs(bearing) >= 3.0:
+            return ExploreStep("turn", bearing, f"a mapped wall is close ahead; squaring up toward {where}", target)
+        other = grid.next_waypoint(pose, avoid_within_deg=AUTO_BLOCKED_CONE_DEGREES, learner=learner)
+        if other is not None:
+            limit = AUTO_MAX_TURN_PER_STOP_DEGREES
+            degrees = max(-limit, min(limit, other.bearing_deg))
+            return ExploreStep("turn", degrees, "a mapped wall blocks the way; heading elsewhere", other.frontier.target)
     if turning_allowed:
-        return ExploreStep("turn", -AUTO_LOOK_TURN_DEGREES, "way ahead blocked; turning right to look", target)
+        return ExploreStep("turn", -AUTO_LOOK_TURN_DEGREES, "way ahead blocked; turning to look", target)
     if backup_bursts < AUTO_MAX_BACKUP_BURSTS and not just_backed_up:
         return ExploreStep("reverse", reason="too close to turn; backing up once", target=target)
     return ExploreStep("blocked", reason="no safe path after looking all around", target=target)
@@ -1009,6 +1068,12 @@ class MappingController:
             store_path.parent / "calibration.json" if store_path is not None and str(store_path) != ":memory:" else None
         )
         self._calibration: Calibration | None = self._calibration_store.load()
+        # What exploring has learned (how much each kind of frontier really
+        # shows, and what effort buys), kept across runs beside the database.
+        self._learner_path = (
+            store_path.parent / "exploration.json" if store_path is not None and str(store_path) != ":memory:" else None
+        )
+        self._learner = load_learner(self._learner_path)
         self._reset_localization()
         self._surface_map = SurfaceMap()
         self._grid = CoverageGrid()
@@ -1204,6 +1269,7 @@ class MappingController:
                 "move_count": self._move_count,
                 "plan": self._plan,
                 "calibrated_at": self._calibration.created_at if self._calibration else None,
+                "exploration_learning": self._learner.to_json(),
                 "pose": [round(value, 1) for value in self._pose],
                 "pose_sigma_cm": round(position_sigma, 1),
                 "heading_sigma_deg": round(heading_sigma, 1),
@@ -1376,6 +1442,7 @@ class MappingController:
         turns_without_progress = 0
         backup_bursts = 0
         just_backed_up = False
+        self._learner.start_run()
         self._hold_camera(True)
         try:
             while not self._stop_event.is_set():
@@ -1408,6 +1475,7 @@ class MappingController:
                         backup_bursts,
                         just_backed_up,
                         self._explore_target,
+                        self._learner,
                     )
                     self._explore_target = step.target
                 with self._lock:
@@ -1428,12 +1496,27 @@ class MappingController:
                     just_backed_up = False
                 elif step.action == "turn":
                     self._set_state("turning")
-                    if not self._turn_and_align(step.degrees):
+                    pieces = max(1, math.ceil(abs(step.degrees) / AUTO_TURN_PIECE_DEGREES - 1e-9))
+                    if not all(self._turn_and_align(step.degrees / pieces) for _ in range(pieces)):
                         break
                     turns_without_progress += 1
                     # Only a change of direction earns another backing-up.
                     backup_bursts = 0
                     just_backed_up = False
+                    if step.distance_cm > 0:
+                        # Lined up with a waypoint the map shows clear: one
+                        # ping straight ahead must agree before driving on.
+                        ahead = self._ping_ahead()
+                        if ahead is not None and ahead - step.distance_cm >= AUTO_WALL_STANDOFF_CM:
+                            self._set_state("moving")
+                            if not self._move_burst(AUTO_FORWARD_COMMAND, self._step_seconds(step.distance_cm)):
+                                break
+                            turns_without_progress = 0
+                elif step.action == "strafe":
+                    self._set_state("sliding")
+                    seconds = AUTO_FORWARD_SECONDS * abs(step.distance_cm) / AUTO_STEP_CM
+                    if not self._move_burst(0, seconds, strafe=math.copysign(AUTO_FORWARD_COMMAND, step.distance_cm)):
+                        break
                 else:
                     self._set_state("backing_up")
                     if not self._move_burst(-AUTO_FORWARD_COMMAND, AUTO_FORWARD_SECONDS):
@@ -1461,6 +1544,33 @@ class MappingController:
                 self._drive.set_inhibited(False)
             self._set_enabled_false()
             self._hold_camera(False)
+            with self._map_lock:
+                self._learner.finish(self._grid.known_count())
+            try:
+                save_learner(self._learner_path, self._learner)
+            except OSError as exc:
+                logger.warning("Could not save exploration learning: %s", exc)
+
+    def _ping_ahead(self) -> float | None:
+        """Median of a few sonar readings straight ahead, drive locked meanwhile."""
+        if not self._drive.set_inhibited(True):
+            return None
+        status = self._pan_tilt.status()
+        centre, tilt = int(status["pan"]), int(status["tilt"])
+        self._pan_tilt.set_inhibited(True)
+        try:
+            self._pan_tilt.set_angles(centre, tilt, override=True)
+            readings = []
+            for _ in range(3):
+                if self._stop_event.wait(max(0.06, self._range_sensor.settle_seconds)):
+                    return None
+                reading = self._range_sensor.sample_now()
+                if reading is not None:
+                    readings.append(reading)
+            return statistics.median(readings) if readings else None
+        finally:
+            self._pan_tilt.set_inhibited(False)
+            self._drive.set_inhibited(False)
 
     def _step_seconds(self, distance_cm: float = AUTO_STEP_CM) -> float:
         """Burst length for an exploration step, from calibration when there is one."""
@@ -1799,11 +1909,12 @@ class MappingController:
         duration: float,
         *,
         steering: float = 0,
+        strafe: float = 0,
     ) -> bool:
         if self._stop_event.is_set():
             return False
         try:
-            self._drive.set_command(throttle, 0, steering)
+            self._drive.set_command(throttle, strafe, steering)
             deadline = time.monotonic() + duration
             refresh_interval = min(
                 float(self._drive.status()["watchdog_timeout_seconds"]) / 2,
@@ -1816,7 +1927,7 @@ class MappingController:
                 if self._stop_event.wait(min(refresh_interval, remaining)):
                     return False
                 if time.monotonic() < deadline:
-                    self._drive.set_command(throttle, 0, steering)
+                    self._drive.set_command(throttle, strafe, steering)
         finally:
             self._drive.stop()
             if not self._drive.wait_until_stopped():

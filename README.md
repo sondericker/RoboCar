@@ -103,31 +103,50 @@ and the operator confirms the room is clear and attended. The car scans while
 stopped, moves in short bursts, then stops and scans again. Autonomous motion
 uses full normalized motor output and the default 4095/4095 motor duty cap.
 
-After each sweep it plans its next move with **frontier exploration**:
+After each sweep it decides where to go by **what it could learn there**:
 
-- **Coverage grid:** every sweep marks the space the sound crossed as free
-  and the places it echoed as occupied, in a 5 cm grid shared with earlier
-  sessions. The edges between known-free and unknown space are the
-  *frontiers*: the parts of the room not mapped yet. Spots beside and behind
-  the car, which the forward sonar can never see, don't count.
-- **Crossing open space first:** the sonar only sees walls out to about
-  250 cm. A longer reading, or the sensor's 300 cm "no echo" value, means open
-  space, not a wall. When the corridor ahead is clear for more than 100 cm,
-  and the car hasn't already stood out there, it drives straight on in legs
-  of up to 60 cm, sweeping between legs and stopping about 55 cm short of the
-  wall. That way it crosses rooms instead of turning toward small gaps nearby.
-- **Where to go:** otherwise it plans a path on the grid, keeping a car's radius from
-  obstacles, to the best reachable frontier. Short paths and big frontiers
-  score well, and left turns cost more, so it works round a room clockwise.
-  It sticks with a frontier until another is clearly better. The dashboard
-  marks the target with a crosshair.
-- **Moving:** turns toward the target are 25° when it's near straight ahead,
-  and 50° when it's far round (past 135° it keeps turning right instead of
-  reversing). Forward steps are 25 cm when calibrated (otherwise 0.25-second
-  bursts), and only while the corridor ahead (±12°, roughly the car's width)
-  has at least 60 cm clearance. If the sonar blocks the way the grid wanted,
-  it picks a different frontier.
-- **Camera-measured turns:** before turning, the camera photographs a strip
+- **Coverage map:** every sweep marks the space the sound crossed as free and
+  the places it echoed as walls, in a 5 cm grid shared with earlier runs. The
+  edges between known floor and unknown are *frontiers*.
+- **Treating missing echoes with care:** the sonar sees walls out to about
+  250 cm. A longer reading, or the 300 cm "no echo" value, is open space *or*
+  sound that glanced off a wall at a steep angle and bounced away. That is
+  the norm in corridors. So a missing echo clears only 50 cm. Runs of echoes
+  are fitted as walls the way the 25° beam sees them, and continued. A missing
+  echo that would cross one at a glancing angle stops there. One that crosses
+  nearly head-on would have echoed, so that is a real gap. A ray passing
+  head-on through a mapped wall cell is evidence the wall is not there, which
+  erases stray echoes across doorways.
+- **Leads:** a stretch of readings much deeper than on both sides (25 cm or
+  more, or no echo) is an opening the sonar can see into: a doorway,
+  corridor or open area. "A long distance over there on the left" becomes a
+  lead the car goes to investigate. A lead stays a target until the floor
+  past it is mapped or the car has stood at it.
+- **Judging targets:** for each lead and each 50 cm piece of frontier, rays
+  are cast from where the car would stand, facing it, to count the unknown
+  floor a sweep from there could show. Confirmed walls stop the rays. Walls
+  seen only once let part of the view through, since they may be stray echoes.
+  Targets are classed as open space, doorway or corridor (walls close on both
+  sides), ordinary edge, or lead.
+- **Learning:** each target's value is the floor it is expected to show per
+  centimetre of driving or turning to get there. The car learns, run after
+  run, what share of the promised floor each kind of target really shows
+  (scored only when it got there). It also learns how much new floor a
+  centimetre of effort has been buying, and stops when even the best target
+  promises only a small share of that. What it learned is saved in
+  `exploration.json` beside the map database, and shown in the status.
+- **Corridors:** between two roughly parallel walls up to 130 cm apart, a
+  target along the corridor is reached by following its centre line.
+- **Moving:** turns go the short way, up to 150° in one stop, made as
+  camera-checked pieces of up to 50° with no sweep in between. A turn that
+  only lines up with a waypoint the map shows clear is followed straight away
+  by a drive, after a single forward ping, again with no sweep in between.
+  Forward legs run up to 60 cm, as far as a straight line toward the
+  waypoint allows. They stop 45 cm short of whatever the sonar sees ahead,
+  and before the car would come within its radius of any mapped wall.
+  Walls met at a glancing angle never echo, so the sonar alone cannot be
+  trusted for this. Paths keep away from walls where there is room.
+- **Camera-measured turns:** before each turn piece, the camera photographs a strip
   every 10° across the pan on the turn side (0–60°). The car then turns
   closed-loop on wheel odometry. Afterwards its new forward view is matched
   against every strip picture, and at least two must agree on how far it
@@ -136,13 +155,21 @@ After each sweep it plans its next move with **frontier exploration**:
   (at most 20° each). The measured turn also recalibrates odometry and fixes
   the pose for the next sweep. Without trustworthy images it relies on
   odometry.
-- **Finished:** with no reachable frontier left, it looks round once more
-  and then stops with "explored".
-- **Back up:** only when it can't turn safely (something within 25 cm), or
-  after a lot of turning without finding a way forward, does it back up once.
-  After backing up it turns rather than driving straight back in, and if it
-  still can't move it stops. The rear is not sensed, so keep the area behind
-  the car clear and expect this recovery maneuver may bump into something.
+- **Tight spots:** too close to a wall to spin (a side reading under 20 cm),
+  it slides 12 cm sideways toward the roomier side (the wheels are mecanum).
+  Only if neither side has room does it back up once; the rear is not
+  sensed, so keep the area behind the car clear.
+- **Finished:** with nothing left worth a trip, it looks round (three 110°
+  turns) and then stops with "explored".
+
+In a simulated two-room floor plan joined by an 80 cm corridor, with missing
+echoes reading 300 cm, the previous explorer mapped 49% of the floor on
+average over eight starting points. It crossed into the second room once,
+ended "blocked" four times and bumped into walls 183 times. This one mapped
+77% on average, explored both rooms from six of the eight starts (81–94%)
+and never bumped or got blocked. From the best starts it reached 85% of the
+floor within 30–40 sweeps. `tests/explore_sim.py` is the floor plan and
+`tests/test_exploration.py` checks it.
 
 If the sensor returns no readings at all, it stops with a sensor fault. The
 dashboard shows the reason for the current move. Each explore session is

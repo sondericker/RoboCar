@@ -234,33 +234,70 @@ sonar room):
 - A room with different wall textures was not mistaken for the remembered
   one.
 
-## Exploring (frontiers)
+## Exploring
 
 Code: `src/robocar/exploration.py`; the planner is `plan_explore_step` in
-`mapping.py`.
+`mapping.py`; the benchmark floor plan is `tests/explore_sim.py`.
 
-- **Coverage grid.** A 5 cm log-odds grid built from every sweep (from the
-  joined sessions too, at their optimized poses). Each reading clears space
-  along three rays inside the beam's core, up to 250 cm. Only the centre ray
-  marks the echo as occupied, and at its real distance. Readings past 250 cm
-  (the sensor reports 300 cm when nothing echoes) are open space: they clear
-  out to 250 cm and mark no wall, in the grid and in the surface map. The car's footprint
-  is free.
-- **Frontiers.** Free cells next to unknown ones, excluding those within
-  35 cm of anywhere the car has stood. The forward sonar never sees beside or
-  behind the car, and without this rule the car spun round looking at its own
-  flanks.
-- **Choosing.** Dijkstra over free cells at least a car's radius (16 cm) from
-  obstacles. Each reachable frontier costs its path length, plus 0.4 per
-  degree of turn, plus 25 for a left turn, minus a reward for its size. The
-  current target is kept unless another beats it by a clear margin, which
-  stopped flip-flopping when each sweep reshuffled the costs.
-- **Moving.** See the README. The sonar sweep always has the final word on
-  driving forward.
-- **In simulation** (rendered room, turns 15% long and steps 8% short that
-  odometry doesn't know about): the room interior was 89% mapped in 21 moves.
-  The pose stayed within 3.5 cm and 2.2°, and the learned scales reached the
-  true errors (0.96 vs 0.92 on steps, 1.18 vs 1.15 on turns).
+- **Coverage grid.** A 5 cm log-odds grid built from every sweep (joined
+  sessions too, at their optimized poses). Each reading clears space along
+  three rays inside the beam's core, and only the centre ray marks an echo.
+  A missing echo (past 250 cm; the sensor reports 300) clears only 50 cm.
+- **Walls the way the beam sees them.** A run of echoes at similar ranges is
+  fitted as a flat wall at distance d with normal n, which reads
+  d / cos(max(0, |a − n| − 12.5°)) at sweep angle a. Fitting the echoes'
+  centre lines instead tilted corridor walls by about 13°. Each fitted wall
+  is continued 150 cm past its ends.
+- **Glancing versus head-on.** Sound meeting a wall more than 40° from
+  head-on bounces away silently. A ray that would cross a fitted wall, or a
+  mapped wall whose direction is clear from its neighbouring cells, at such
+  an angle stops there: the corridor side walls. One crossing nearly head-on
+  would have echoed, so that wall cell is wrong, for example an echo from a
+  doorway's edge drawn across the gap. It loses an extra 1.2 in log-odds.
+  An earlier rule that treated a wide stretch of equal readings as a doorway
+  was dropped: near a flat wall the readings creep up so slowly that the
+  stretch spans 75°, and the rule erased the wall. A doorway narrower than
+  the beam is indistinguishable from a wall in one sweep.
+- **Leads.** A reading at least 25 cm deeper than readings on both sides
+  within 18° is part of an opening (the beam smears its edges, so they deepen
+  gradually). Runs of 6° or more become leads: the mouth, at the sides'
+  distance, and the direction into it. They come from the raw readings, so
+  ghost walls on the grid cannot hide them.
+- **Frontiers.** Free cells next to unknown ones, excluding blind spots
+  within 35 cm of anywhere the car has stood, judged in 50 cm pieces. A
+  frontier along a wall can include a doorway that only shows from beside it.
+  The car stands at the drivable spot nearest each piece's middle, within
+  30 cm of it. Cells just behind echoes that stay unknown after three looks
+  are behind walls and stop counting.
+- **Information gain.** Rays every 3° across the 144° a sweep sees, out to
+  250 cm, from the standing spot facing the frontier. Each unknown sample
+  counts for the arc of floor it stands for. Confirmed walls (log-odds above
+  1.5, with gaps under 30 cm closed, since corners rarely echo) stop a ray;
+  each cell of wall seen once lets 60% through.
+- **Choosing.** Value = learned weight for the kind × gain ÷ effort. Effort
+  is path cost plus 1.2 cm per degree of turning, 60 cm overhead per trip,
+  and 120 cm extra for turning straight back. Paths cost up to three times
+  as much within 45 cm of a wall. The current target is kept unless another
+  is worth 1.5× as much. Weights move 30% toward the floor a pursuit really
+  showed ÷ its prediction, only for pursuits that arrived. The rate (cells
+  per cm of effort) tracks every move; exploring ends when the best value is
+  under 5% of it.
+- **Corridors.** Mapped walls within 100 cm forming two straight sides 40–130
+  cm apart. Both principal directions are tried, since short stretches of wall
+  can spread as much across as along. Targets within 70° of the axis are
+  approached by aiming 60 cm ahead on the centre line.
+- **Safety.** Forward legs stop before the car comes within its 16 cm radius
+  of any mapped wall, confirmed or not. Already inside that margin, it may
+  only move where it gets no nearer. Missing echoes from walls met at a
+  glancing angle make the sonar unreliable for this. A side reading under
+  20 cm means no room to spin: it slides 12 cm toward the roomier side.
+- **What did not work** (all in simulation): following one frontier's
+  bearing exactly made the car dither when the target was within 30 cm; it
+  now faces the frontier itself. A fixed "keep turning the same way" rule
+  turned that dithering into full spins. Scoring gain minus a learned
+  rate × effort fell apart late in a run, when the rate collapsed and effort
+  became free. Letting the car leave the wall margin by any route had it
+  stepping deeper into it.
 
 ## Motion calibration
 

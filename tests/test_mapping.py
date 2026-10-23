@@ -19,8 +19,9 @@ from robocar.drive import (
     SimulatedPanTilt,
 )
 from robocar.mapping import (
-    AUTO_LOOK_TURN_DEGREES,
-    AUTO_MAX_TURN_DEGREES,
+    AUTO_LOOK_AROUND_TURNS,
+    AUTO_MAX_TURN_PER_STOP_DEGREES,
+    AUTO_STEP_CM,
     SCAN_ANGLES,
     CameraMotionEstimate,
     assess_picture,
@@ -28,8 +29,6 @@ from robocar.mapping import (
     MappingStore,
     direction_clearances,
     plan_explore_step,
-    AUTO_LONG_STEP_CM,
-    AUTO_WALL_STANDOFF_CM,
     estimate_camera_yaw_change,
     forward_clearance,
 )
@@ -405,7 +404,7 @@ class MappingTests(unittest.TestCase):
             drive = DriveController(driver, max_duty=1000, command_timeout=1, physical=True)
             pan_tilt = PanTiltController(SimulatedPanTilt(), physical=True)
             range_sensor = RangeSensorController(
-                FakeRangeSensor(distance=20.0),
+                FakeRangeSensor(distance=15.0),
                 physical=True,
                 sample_interval=0.02,
             )
@@ -417,7 +416,7 @@ class MappingTests(unittest.TestCase):
                 MappingStore(Path(directory) / "mapping.sqlite3"),
             )
             blocked_scan = [
-                {"angle_deg": angle, "distance_cm": 20.0, "samples": 3, "error": None}
+                {"angle_deg": angle, "distance_cm": 15.0, "samples": 3, "error": None}
                 for angle in (-60, -30, 0, 30, 60)
             ]
             try:
@@ -601,32 +600,26 @@ class MappingTests(unittest.TestCase):
             grid.integrate(room.scan(looking), looking, 25.0)
         return room, grid
 
-    def test_the_first_move_crosses_open_space_ahead(self):
-        room = SonarRoom()
+    def test_a_long_reading_off_to_the_left_draws_the_car_that_way(self):
+        # Walls close ahead and to the right, but nothing echoes on the left:
+        # that is where the unknown is, so that is where it goes to look.
+        scan = [
+            {"angle_deg": angle, "distance_cm": 300.0 if angle >= 30 else 70.0, "samples": 3, "error": None}
+            for angle in range(57, -61, -3)
+        ]
         grid = CoverageGrid()
-        pose = (0.0, -40.0, 0.0)
-        scan = room.scan(pose)
-        grid.integrate(scan, pose, 25.0)
-        step = plan_explore_step(scan, pose, grid, 0, 0)
-        self.assertEqual(step.action, "forward")
-        self.assertIn("open ahead", step.reason)
-
-    def test_the_first_look_turns_right_when_the_way_ahead_is_short(self):
-        room = SonarRoom()
-        grid = CoverageGrid()
-        pose = (0.0, -40.0, 0.0)
-        scan = [{**item, "distance_cm": min(float(item["distance_cm"]), 80.0)} if item["distance_cm"] is not None else item
-                for item in room.scan(pose)]
+        pose = (0.0, 0.0, 0.0)
         grid.integrate(scan, pose, 25.0)
         step = plan_explore_step(scan, pose, grid, 0, 0)
         self.assertEqual(step.action, "turn")
-        self.assertLess(step.degrees, 0)
+        self.assertGreater(step.degrees, 20.0)
 
     def test_it_drives_toward_the_unexplored_far_end_of_a_corridor(self):
         pose = (0.0, 0.0, 0.0)
         room, grid = self.corridor_grid(pose, (0.0, -90.0, 180.0, 90.0))
         step = plan_explore_step(room.scan(pose), pose, grid, 0, 0)
         self.assertEqual(step.action, "forward")
+        self.assertGreater(step.distance_cm, AUTO_STEP_CM)
 
     def test_when_the_sonar_blocks_the_way_it_does_not_drive(self):
         pose = (0.0, 0.0, 0.0)
@@ -643,39 +636,18 @@ class MappingTests(unittest.TestCase):
         pose = (0.0, 0.0, 0.0)
         room, grid = self.corridor_grid(pose, range(0, 360, 30), walls=walls)
         scan = room.scan(pose)
-        # It looks round a few times first, then reports the room explored.
+        # It looks round first, then reports the room explored.
         self.assertEqual(plan_explore_step(scan, pose, grid, 0, 0).action, "turn")
-        self.assertEqual(plan_explore_step(scan, pose, grid, 4, 0).action, "done")
+        self.assertEqual(plan_explore_step(scan, pose, grid, AUTO_LOOK_AROUND_TURNS, 0).action, "done")
 
-    def test_a_turn_of_more_than_135_degrees_keeps_going_right(self):
-        class BehindLeft:
-            def next_waypoint(self, pose, avoid_within_deg=None, previous_target=None):
-                return Waypoint(160.0, 80.0, Frontier((0.0, 0.0), (-30.0, -70.0), 10, 90.0))
+    def test_turns_go_the_short_way_in_one_stop(self):
+        class BehindLeft(CoverageGrid):
+            def next_waypoint(self, pose, avoid_within_deg=None, previous_target=None, learner=None):
+                return Waypoint(160.0, 80.0, Frontier((0.0, 0.0), (-30.0, -70.0), 10, 90.0, 500.0))
 
         scan = [{"angle_deg": angle, "distance_cm": 90.0, "samples": 3, "error": None} for angle in range(-57, 61, 3)]
         step = plan_explore_step(scan, (0.0, 0.0, 0.0), BehindLeft(), 0, 0)
-        self.assertEqual((step.action, step.degrees), ("turn", -AUTO_LOOK_TURN_DEGREES))
-
-    def test_open_space_ahead_is_crossed_in_long_legs(self):
-        far = [{"angle_deg": angle, "distance_cm": 300.0, "samples": 3, "error": None} for angle in range(-57, 61, 3)]
-        grid = CoverageGrid()
-        pose = (0.0, 0.0, 0.0)
-        grid.integrate(far, pose, 25.0)
-        step = plan_explore_step(far, pose, grid, 0, 0)
-        self.assertEqual(step.action, "forward")
-        self.assertEqual(step.distance_cm, AUTO_LONG_STEP_CM)
-        # Nearer the far wall the leg shortens to stop clear of it.
-        near = [{**item, "distance_cm": 110.0} for item in far]
-        self.assertAlmostEqual(plan_explore_step(near, pose, grid, 0, 0).distance_cm, 110.0 - AUTO_WALL_STANDOFF_CM)
-
-    def test_open_space_where_the_car_has_already_been_is_not_crossed_again(self):
-        far = [{"angle_deg": angle, "distance_cm": 200.0, "samples": 3, "error": None} for angle in range(-57, 61, 3)]
-        grid = CoverageGrid()
-        grid.integrate(far, (0.0, 100.0, 180.0), 25.0)
-        pose = (0.0, 0.0, 0.0)
-        grid.integrate(far, pose, 25.0)
-        step = plan_explore_step(far, pose, grid, 0, 0)
-        self.assertNotIn("open ahead", step.reason)
+        self.assertEqual((step.action, step.degrees), ("turn", AUTO_MAX_TURN_PER_STOP_DEGREES))
 
     def test_strip_of_pictures_measures_the_turn_actually_made(self):
         scene = PanoramaScene()
