@@ -28,11 +28,13 @@ from robocar.mapping import (
     MappingStore,
     direction_clearances,
     plan_explore_step,
+    AUTO_LONG_STEP_CM,
+    AUTO_WALL_STANDOFF_CM,
     estimate_camera_yaw_change,
     forward_clearance,
 )
 from robocar.exploration import CoverageGrid, Frontier, Waypoint
-from robocar.localization import relative
+from robocar.localization import compose, relative
 from robocar.vision_debug import render_matches
 from robocar.range_sensor import RangeSensorController
 from camera_scene import PanoramaScene
@@ -599,11 +601,22 @@ class MappingTests(unittest.TestCase):
             grid.integrate(room.scan(looking), looking, 25.0)
         return room, grid
 
-    def test_the_first_look_turns_right_to_see_more(self):
+    def test_the_first_move_crosses_open_space_ahead(self):
         room = SonarRoom()
         grid = CoverageGrid()
         pose = (0.0, -40.0, 0.0)
         scan = room.scan(pose)
+        grid.integrate(scan, pose, 25.0)
+        step = plan_explore_step(scan, pose, grid, 0, 0)
+        self.assertEqual(step.action, "forward")
+        self.assertIn("open ahead", step.reason)
+
+    def test_the_first_look_turns_right_when_the_way_ahead_is_short(self):
+        room = SonarRoom()
+        grid = CoverageGrid()
+        pose = (0.0, -40.0, 0.0)
+        scan = [{**item, "distance_cm": min(float(item["distance_cm"]), 80.0)} if item["distance_cm"] is not None else item
+                for item in room.scan(pose)]
         grid.integrate(scan, pose, 25.0)
         step = plan_explore_step(scan, pose, grid, 0, 0)
         self.assertEqual(step.action, "turn")
@@ -614,7 +627,6 @@ class MappingTests(unittest.TestCase):
         room, grid = self.corridor_grid(pose, (0.0, -90.0, 180.0, 90.0))
         step = plan_explore_step(room.scan(pose), pose, grid, 0, 0)
         self.assertEqual(step.action, "forward")
-        self.assertGreater(step.target[1], 30.0)  # an unexplored pocket ahead
 
     def test_when_the_sonar_blocks_the_way_it_does_not_drive(self):
         pose = (0.0, 0.0, 0.0)
@@ -640,9 +652,30 @@ class MappingTests(unittest.TestCase):
             def next_waypoint(self, pose, avoid_within_deg=None, previous_target=None):
                 return Waypoint(160.0, 80.0, Frontier((0.0, 0.0), (-30.0, -70.0), 10, 90.0))
 
-        scan = [{"angle_deg": angle, "distance_cm": 200.0, "samples": 3, "error": None} for angle in range(-57, 61, 3)]
+        scan = [{"angle_deg": angle, "distance_cm": 90.0, "samples": 3, "error": None} for angle in range(-57, 61, 3)]
         step = plan_explore_step(scan, (0.0, 0.0, 0.0), BehindLeft(), 0, 0)
         self.assertEqual((step.action, step.degrees), ("turn", -AUTO_LOOK_TURN_DEGREES))
+
+    def test_open_space_ahead_is_crossed_in_long_legs(self):
+        far = [{"angle_deg": angle, "distance_cm": 300.0, "samples": 3, "error": None} for angle in range(-57, 61, 3)]
+        grid = CoverageGrid()
+        pose = (0.0, 0.0, 0.0)
+        grid.integrate(far, pose, 25.0)
+        step = plan_explore_step(far, pose, grid, 0, 0)
+        self.assertEqual(step.action, "forward")
+        self.assertEqual(step.distance_cm, AUTO_LONG_STEP_CM)
+        # Nearer the far wall the leg shortens to stop clear of it.
+        near = [{**item, "distance_cm": 110.0} for item in far]
+        self.assertAlmostEqual(plan_explore_step(near, pose, grid, 0, 0).distance_cm, 110.0 - AUTO_WALL_STANDOFF_CM)
+
+    def test_open_space_where_the_car_has_already_been_is_not_crossed_again(self):
+        far = [{"angle_deg": angle, "distance_cm": 200.0, "samples": 3, "error": None} for angle in range(-57, 61, 3)]
+        grid = CoverageGrid()
+        grid.integrate(far, (0.0, 100.0, 180.0), 25.0)
+        pose = (0.0, 0.0, 0.0)
+        grid.integrate(far, pose, 25.0)
+        step = plan_explore_step(far, pose, grid, 0, 0)
+        self.assertNotIn("open ahead", step.reason)
 
     def test_strip_of_pictures_measures_the_turn_actually_made(self):
         scene = PanoramaScene()
@@ -808,6 +841,52 @@ class SlippingRoomTests(unittest.TestCase):
             drive.close()
             pan_tilt.close()
             range_sensor.close()
+
+    def test_a_new_run_after_a_restart_continues_the_existing_map(self):
+        room = SonarRoom()
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "mapping.sqlite3"
+            parked = (0.0, 0.0, 0.0)
+            for run_id, moves in (("first", ((1.0, 0), (0, 1.0))), ("second", ((1.0, 0),))):
+                # Each run is a fresh service: odometry restarts at zero, but
+                # the car is still where the last run left it.
+                drive = DriveController(SimulatedDriver(), max_duty=4095, command_timeout=1, physical=True)
+                pan_driver = SimulatedPanTilt()
+                pan_tilt = PanTiltController(pan_driver, physical=True)
+                start = parked
+
+                def true_pose(drive=drive, start=start):
+                    return compose(start, drive.odometry())
+
+                class RoomSensor(FakeRangeSensor):
+                    def get_distance(self, true_pose=true_pose, pan_driver=pan_driver) -> float | None:
+                        return room.distance(true_pose(), pan_driver.pan - 90)
+
+                range_sensor = RangeSensorController(RoomSensor(), physical=True, sample_interval=0.5)
+                mapping = MappingController(FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(database))
+                try:
+                    mapping._run_id = run_id
+                    mapping._continue_map(run_id)
+                    mapping._capture_observation(mode="explore")
+                    if run_id == "second":
+                        # The first stop of the new run lands where the car
+                        # really is, not back at the origin.
+                        self.assertLess(math.dist(mapping._pose[:2], true_pose()[:2]), 5.0)
+                    for throttle, steering in moves:
+                        self.assertTrue(mapping._move_burst(throttle, 0.25, steering=steering))
+                        mapping._capture_observation(mode="explore")
+                    parked = true_pose()
+                    estimate = mapping._pose
+                    surface_map = mapping.surface_map()
+                finally:
+                    mapping.close()
+                    drive.close()
+                    pan_tilt.close()
+                    range_sensor.close()
+            # Both runs' sweeps refine one map, and the pose stays on track.
+            self.assertEqual(surface_map["scan_count"], 5)
+            self.assertLess(math.dist(estimate[:2], parked[:2]), 5.0)
+            self.assertLess(abs(relative(parked, estimate)[2]), 3.0)
 
 
 if __name__ == "__main__":

@@ -108,7 +108,13 @@ After each sweep it plans its next move with **frontier exploration**:
   sessions. The edges between known-free and unknown space are the
   *frontiers*: the parts of the room not mapped yet. Spots beside and behind
   the car, which the forward sonar can never see, don't count.
-- **Where to go:** it plans a path on the grid, keeping a car's radius from
+- **Crossing open space first:** the sonar only sees walls out to about
+  250 cm. A longer reading, or the sensor's 300 cm "no echo" value, means open
+  space, not a wall. When the corridor ahead is clear for more than 100 cm,
+  and the car hasn't already stood out there, it drives straight on in legs
+  of up to 60 cm, sweeping between legs and stopping about 55 cm short of the
+  wall. That way it crosses rooms instead of turning toward small gaps nearby.
+- **Where to go:** otherwise it plans a path on the grid, keeping a car's radius from
   obstacles, to the best reachable frontier. Short paths and big frontiers
   score well, and left turns cost more, so it works round a room clockwise.
   It sticks with a frontier until another is clearly better. The dashboard
@@ -229,8 +235,17 @@ earlier session moves the new session into the old one's frame, so the map
 becomes one persistent house map built from every joined session, and
 exploration prefers ground no session has covered yet. The dashboard draws
 earlier sessions faintly and recognized places as purple dashed links. The
-whole graph is rebuilt from the database when RoboCar restarts. Sessions that
-never see a remembered place stay in their own frame.
+whole graph is rebuilt from the database when RoboCar restarts.
+
+**Each run builds on the last:** starting a mapping run never clears the map.
+The run starts from the newest stop of any earlier run, with every earlier
+sweep in the map, and its first stop is tied to that stop in the pose graph.
+That tie is loose (±25 cm, ±20°) in case the car was moved by hand in between.
+Wheel odometry since that stop is used when the service kept running. The
+first sweep's fit against the known walls, or a recognized place, then pins
+the pose down. Each run's sweeps refine the same surfaces and coverage, and
+exploration heads for whatever is still unmapped. Only **Reset** clears the
+database.
 
 By default, survey data is stored at
 `~/.local/share/robocar/mapping.sqlite3` (or under `$XDG_DATA_HOME` when set).

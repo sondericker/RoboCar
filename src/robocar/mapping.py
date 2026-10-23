@@ -44,7 +44,7 @@ from robocar.places import (
     make_keyframe,
 )
 from robocar.range_sensor import RangeSensorController
-from robocar.surfaces import IntegrationReport, SurfaceMap, direction, extract_echoes, pose_rotation
+from robocar.surfaces import SONAR_MAX_RANGE_CM, IntegrationReport, SurfaceMap, direction, extract_echoes, pose_rotation
 from robocar.vision_debug import render_features, render_matches
 
 logger = logging.getLogger(__name__)
@@ -73,6 +73,15 @@ AUTO_FORWARD_COMMAND = 1.0
 AUTO_FORWARD_SECONDS = 0.25
 # With a motion calibration, each exploration step is sized to this distance.
 AUTO_STEP_CM = 25.0
+# With the way ahead clear past this, drive on to find the far wall instead of
+# turning toward nearby gaps; legs are up to AUTO_LONG_STEP_CM between sweeps
+# and stop short of the wall by AUTO_WALL_STANDOFF_CM.
+AUTO_OPEN_AHEAD_CM = 100.0
+AUTO_LONG_STEP_CM = 60.0
+AUTO_WALL_STANDOFF_CM = 55.0
+# Somewhere the car has already stood within this distance is not worth a
+# long leg; it has seen that wall from there.
+AUTO_VISITED_RADIUS_CM = 45.0
 AUTO_TURN_COMMAND = 1.0
 AUTO_MAX_BACKUP_BURSTS = 1
 # Head for the next waypoint once within this angle of it.
@@ -120,6 +129,12 @@ CAMERA_MOTION_FRAME_COUNT = 3
 # When the pose graph moves any stop by more than this, the map is rebuilt
 # from every sweep at its corrected pose.
 MAP_REBUILD_MOVE_CM = 4.0
+# A new run carries on the map from the last stop. The car may have been
+# moved by hand in between, so its first stop starts this uncertain and is
+# tied to the last stop only this loosely; its first sweep against the known
+# walls (or a recognized place) pins it down.
+CONTINUE_POSITION_SIGMA_CM = 25.0
+CONTINUE_HEADING_SIGMA_DEG = 20.0
 MAP_REBUILD_TURN_DEG = 2.0
 VIEW_HEADING_SIGMA_AFTER_MATCH = 3.0
 # Exposure settings tried for each stop's picture, darkest to brightest:
@@ -806,6 +821,7 @@ class ExploreStep:
     degrees: float = 0.0
     reason: str = ""
     target: tuple[float, float] | None = None
+    distance_cm: float = AUTO_STEP_CM
 
 
 def plan_explore_step(
@@ -829,6 +845,26 @@ def plan_explore_step(
     ahead_clear = ahead is not None and ahead >= AUTO_MIN_CLEARANCE_CM and not just_backed_up
     can_turn = bool(clearances) and min(clearances.values()) >= AUTO_TURN_MIN_CLEARANCE_CM
     turning_allowed = can_turn and turns_without_progress < AUTO_MAX_TURNS_WITHOUT_PROGRESS
+
+    # Open space ahead: go and find where it ends, unless the car has already
+    # been out there. This is what crosses rooms; edges nearby can wait.
+    if ahead is not None and ahead >= AUTO_OPEN_AHEAD_CM and not just_backed_up:
+        reach = min(ahead, SONAR_MAX_RANGE_CM)
+        leg = max(AUTO_STEP_CM, min(AUTO_LONG_STEP_CM, reach - AUTO_WALL_STANDOFF_CM))
+        heading = math.radians(float(pose[2]))
+        forward = (-math.sin(heading), math.cos(heading))
+        probe = min(reach - AUTO_WALL_STANDOFF_CM, leg + AUTO_VISITED_RADIUS_CM)
+        point = (float(pose[0]) + forward[0] * probe, float(pose[1]) + forward[1] * probe)
+        visited = any(
+            math.hypot(point[0] - x, point[1] - y) <= AUTO_VISITED_RADIUS_CM for x, y in grid.stood
+        )
+        if not visited:
+            wall = "no wall in range" if ahead > SONAR_MAX_RANGE_CM else f"wall {ahead:.0f} cm"
+            return ExploreStep(
+                "forward",
+                reason=f"open ahead ({wall}); driving {leg:.0f} cm to find the far side",
+                distance_cm=leg,
+            )
 
     waypoint = grid.next_waypoint(pose, previous_target=previous_target)
     if waypoint is None:
@@ -998,6 +1034,7 @@ class MappingController:
         # for stop-to-stop image comparison.
         self._verified_turn: float | None = None
         self._last_node: int | None = None
+        self._joining_run = False
 
     def start(self) -> None:
         self._start("survey", self._run_survey)
@@ -1077,23 +1114,53 @@ class MappingController:
             self._run_id = str(uuid.uuid4())
             self._move_count = 0
             self._plan = None
-            self._reset_localization()
-            with self._map_lock:
-                self._surface_map = SurfaceMap()
-                self._grid = CoverageGrid()
-                self._explore_target = None
-                self._path = []
-                self._history = []
-                self._links = []
-                self._map_run_id = self._run_id
             self._last_place = None
+            with self._map_lock:
+                self._explore_target = None
             self._stop_event.clear()
+            run_id = self._run_id
+
+            def run() -> None:
+                # Calibration only measures motion; mapping runs build on
+                # everything mapped so far rather than starting over.
+                if mode != "calibrate":
+                    self._continue_map(run_id)
+                target()
+
             self._thread = threading.Thread(
-                target=target,
+                target=run,
                 name=f"mapping-{mode}",
                 daemon=True,
             )
             self._thread.start()
+
+    def _continue_map(self, run_id: str) -> None:
+        """Start a run from the newest stop of any earlier run, with its map."""
+        with self._places_lock:
+            last = max(self._places.graph.nodes, default=None)
+        if last is None:
+            with self._lock:
+                self._reset_localization()
+            with self._map_lock:
+                self._surface_map = SurfaceMap()
+                self._grid = CoverageGrid()
+                self._path, self._history, self._links = [], [], []
+                self._map_run_id = run_id
+            return
+        self._rebuild_map(last, run_id)
+        with self._places_lock:
+            pose = self._places.graph.nodes[last]
+        with self._lock:
+            # Wheel odometry since that stop, the previous views and the
+            # learned scales carry over when the service has kept running.
+            self._pose = pose
+            self._pose_covariance = np.diag(
+                [CONTINUE_POSITION_SIGMA_CM**2, CONTINUE_POSITION_SIGMA_CM**2, math.radians(CONTINUE_HEADING_SIGMA_DEG) ** 2]
+            )
+            self._last_node = last
+            self._joining_run = True
+            self._last_localization = None
+            self._verified_turn = None
 
     def stop(self) -> None:
         with self._lock:
@@ -1344,7 +1411,7 @@ class MappingController:
                 self._drive.set_inhibited(False)
                 if step.action == "forward":
                     self._set_state("moving")
-                    if not self._move_burst(AUTO_FORWARD_COMMAND, self._step_seconds()):
+                    if not self._move_burst(AUTO_FORWARD_COMMAND, self._step_seconds(step.distance_cm)):
                         break
                     turns_without_progress = 0
                     just_backed_up = False
@@ -1384,12 +1451,14 @@ class MappingController:
             self._set_enabled_false()
             self._hold_camera(False)
 
-    def _step_seconds(self) -> float:
-        """Burst length for one exploration step, from calibration when there is one."""
+    def _step_seconds(self, distance_cm: float = AUTO_STEP_CM) -> float:
+        """Burst length for an exploration step, from calibration when there is one."""
         with self._lock:
             calibration = self._calibration
-        measured = calibration.step_duration(AUTO_STEP_CM) if calibration else None
-        return measured if measured is not None else AUTO_FORWARD_SECONDS
+        measured = calibration.step_duration(distance_cm) if calibration else None
+        # Uncalibrated, scale the basic step; ramps make longer bursts go a
+        # little further than this, which errs short.
+        return measured if measured is not None else AUTO_FORWARD_SECONDS * distance_cm / AUTO_STEP_CM
 
     def _turn_and_align(self, degrees: float) -> bool:
         """Turn by `degrees`, then use the camera to measure and correct the turn."""
@@ -1866,9 +1935,17 @@ class MappingController:
         }
         with self._lock:
             previous_node = self._last_node
+            joining, self._joining_run = self._joining_run, False
         edge = None
         if previous_node is not None:
-            edge = (previous_node, relative(previous_pose, pose), self._edge_sigma(prediction, registration.accepted))
+            sigma = self._edge_sigma(prediction, registration.accepted)
+            if joining:
+                sigma = (
+                    max(sigma[0], CONTINUE_POSITION_SIGMA_CM),
+                    max(sigma[1], CONTINUE_POSITION_SIGMA_CM),
+                    max(sigma[2], CONTINUE_HEADING_SIGMA_DEG),
+                )
+            edge = (previous_node, relative(previous_pose, pose), sigma)
             estimate["edge"] = {
                 "from": previous_node,
                 "delta": [round(value, 3) for value in edge[1]],

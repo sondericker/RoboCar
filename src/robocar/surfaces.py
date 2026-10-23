@@ -31,7 +31,9 @@ SONAR_BEAM_WIDTH_DEGREES = 25.0
 BEAM_WIDTH_LIMITS_DEGREES = (10.0, 40.0)
 BEAM_WIDTH_MIN_SAMPLES = 6
 SONAR_MIN_RANGE_CM = 3.0
-SONAR_MAX_RANGE_CM = 300.0
+# The ultrasonic sees walls reliably only this far. A longer reading (or its
+# 300 cm "no echo" value) means open space out to here, not a wall.
+SONAR_MAX_RANGE_CM = 250.0
 # Distance from the car's turning centre forward to the pan axis that carries
 # the transducer. Measure this on the car; it matters most for turns.
 SONAR_FORWARD_OFFSET_CM = 7.0
