@@ -33,7 +33,7 @@ STEP_SIZES_CM = (5.0, 10.0, 20.0)
 # Steps must land within 7% (at least 1 cm) of the size asked for.
 STEP_TOLERANCE_FRACTION = 0.07
 STEP_TOLERANCE_MIN_CM = 1.0
-STEP_ATTEMPTS = 4
+STEP_ATTEMPTS = 6
 STEP_DURATION_LIMITS_SECONDS = (0.05, 0.5)
 # Each try changes the burst by at most this factor, so one tiny or freak
 # measurement cannot send the next try flying.
@@ -235,7 +235,10 @@ def _turn_tests(
                     return
                 turned = rig.heading_odometry() - before
                 actual = rig.measure_turn(strip, rig.photograph([0]).get(0))
-                if actual is None or abs(turned) < 1.0:
+                if abs(turned) < 1.0:
+                    note(f"{direction} {size:.0f}°: the wheels reported no turn")
+                    break
+                if actual is None:
                     note(f"{direction} {size:.0f}°: camera could not measure the turn (try more light or texture)")
                     break
                 ratio = actual / turned
@@ -263,8 +266,15 @@ def _calibrate_steps(
 ) -> None:
     forward_ratios: list[float] = []
     reverse_ratios: list[float] = []
+    measured: list[tuple[float, float]] = []  # every (seconds, centimetres) this run
+    home: float | None = None  # range when the step tests began, to keep coming back to
     for size in STEP_SIZES_CM:
-        seconds = (previous.step_duration(size) if previous else None) or step_seconds_guess(size)
+        # Every step measured this time is the best guide, then last time's.
+        seconds = (
+            _seconds_for(measured, size)
+            or (previous.step_duration(size) if previous else None)
+            or step_seconds_guess(size)
+        )
         tried: list[tuple[float, float]] = []  # (seconds, centimetres moved)
         for attempt in range(1, STEP_ATTEMPTS + 1):
             if rig.stopped():
@@ -273,6 +283,8 @@ def _calibrate_steps(
             if start is None:
                 note("no steady sonar reading straight ahead; face a flat wall about 1 m away")
                 return
+            if home is None:
+                home = start
             if start - size < MINIMUM_WALL_GAP_CM:
                 note(f"wall only {start:.0f} cm ahead; stopping forward tests to keep {MINIMUM_WALL_GAP_CM:.0f} cm clear")
                 return
@@ -291,13 +303,16 @@ def _calibrate_steps(
                 return
             odometry_back = odometry_before - rig.distance_odometry()
             back = _range(rig)
-            if moved > 0.5 and odometry_forward > 0.5:
+            plausible = -STEP_RETURN_TOLERANCE_CM <= moved <= 3 * size + STEP_PLAUSIBLE_SLACK_CM
+            if plausible and moved > 0.5 and odometry_forward > 0.5:
                 forward_ratios.append(moved / odometry_forward)
-            if back is not None and odometry_back > 0.5 and back - after > 0.5:
+            if plausible and back is not None and odometry_back > 0.5 and back - after > 0.5:
                 reverse_ratios.append((back - after) / odometry_back)
+            if plausible and moved > 0.5:
+                measured.append((seconds, moved))
             if back is not None:
-                back = _return_to(rig, start, back, seconds, max(moved, 1.0))
-            if moved < -STEP_RETURN_TOLERANCE_CM or moved > 3 * size + STEP_PLAUSIBLE_SLACK_CM:
+                back = _return_to(rig, home, back, measured, seconds)
+            if not plausible:
                 note(f"{size:.0f} cm step try {attempt}: sonar jumped ({moved:+.1f} cm); ignoring this try")
                 continue
             note(f"{size:.0f} cm step try {attempt}: {seconds:.3f} s moved {moved:.1f} cm")
@@ -330,7 +345,27 @@ def _calibrate_steps(
         note(f"forward travel is {calibration.forward_ratio:.2f}x what the wheels report")
 
 
-def _return_to(rig: Rig, start: float, back: float, seconds: float, moved: float) -> float:
+def _seconds_for(measured: Sequence[tuple[float, float]], distance_cm: float) -> float | None:
+    """Burst length for a distance from a line through every measured step.
+
+    Travel is roughly linear in burst length past a dead zone, so the line
+    does not go through zero; a single measurement cannot show where it is."""
+    if len({seconds for seconds, _ in measured}) < 2:
+        return None
+    count = len(measured)
+    mean_s = sum(seconds for seconds, _ in measured) / count
+    mean_d = sum(moved for _, moved in measured) / count
+    spread = sum((seconds - mean_s) ** 2 for seconds, _ in measured)
+    slope = sum((seconds - mean_s) * (moved - mean_d) for seconds, moved in measured) / spread
+    if slope <= 0:
+        return None
+    low, high = STEP_DURATION_LIMITS_SECONDS
+    return min(high, max(low, mean_s + (distance_cm - mean_d) / slope))
+
+
+def _return_to(
+    rig: Rig, start: float, back: float, measured: Sequence[tuple[float, float]], seconds: float
+) -> float:
     """Drive out any creep left after a forward-and-back pair, so the tries do
     not walk the car into the wall. Returns the final range."""
     for _ in range(2):
@@ -338,7 +373,8 @@ def _return_to(rig: Rig, start: float, back: float, seconds: float, moved: float
         if abs(gap) <= STEP_RETURN_TOLERANCE_CM or rig.stopped():
             break
         low, high = STEP_DURATION_LIMITS_SECONDS
-        burst = min(high / 2, max(low, seconds * abs(gap) / moved))
+        # A burst too short to clear the dead zone would move nothing.
+        burst = min(high / 2, max(low, _seconds_for(measured, abs(gap)) or seconds * 0.5))
         if not rig.burst(1.0 if gap > 0 else -1.0, burst):
             break
         reading = _range(rig)

@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from robocar.calibration import Calibration, CalibrationStore
+from robocar.calibration import MINIMUM_WALL_GAP_CM, Calibration, CalibrationStore, _calibrate_steps
 from robocar.localization import compose
 from test_places import SimulatedHouse
 
@@ -22,6 +22,41 @@ def true_step(seconds: float) -> float:
     return max(0.0, 105.0 * (seconds + 0.25) / 2 - 8.0)
 
 
+def real_step(seconds: float) -> float:
+    """Roughly what the real car's bursts covered: nothing below 0.08 s."""
+    return max(0.0, 90.0 * (seconds - 0.08))
+
+
+class StepRig:
+    """Just enough car for the step tests: a wall ahead, a dead zone, reverse
+    that falls short, and one sonar glitch."""
+
+    def __init__(self, wall_cm: float = 110.0) -> None:
+        self.position = 0.0
+        self.wall_cm = wall_cm
+        # The car slewing during a burst leaves the sonar on something else
+        # for a whole reading, not just one ping.
+        self.glitches = [165.0] * 7
+        self.closest = wall_cm
+
+    def distance_odometry(self) -> float:
+        return self.position
+
+    def burst(self, throttle: float, seconds: float) -> bool:
+        travel = real_step(seconds) * (1.0 if throttle > 0 else 0.85)
+        self.position += travel if throttle > 0 else -travel
+        self.closest = min(self.closest, self.wall_cm - self.position)
+        return True
+
+    def range_ahead(self) -> float | None:
+        if self.position > 0 and self.glitches:
+            return self.glitches.pop()
+        return self.wall_cm - self.position
+
+    def stopped(self) -> bool:
+        return False
+
+
 class CalibrationTableTests(unittest.TestCase):
     def test_turn_ratios_are_interpolated_by_size_and_direction(self):
         calibration = Calibration({"left": {15.0: 1.4, 45.0: 1.2}, "right": {15.0: 1.3, 45.0: 1.1}})
@@ -34,6 +69,8 @@ class CalibrationTableTests(unittest.TestCase):
         calibration = Calibration(step_durations={10.0: 0.1, 30.0: 0.4})
         self.assertAlmostEqual(calibration.step_duration(20.0), 0.25)
         self.assertAlmostEqual(calibration.step_duration(5.0), 0.05)
+        # Past the largest step it follows the last two, keeping the dead zone.
+        self.assertAlmostEqual(calibration.step_duration(60.0), 0.85)
 
     def test_calibration_survives_a_round_trip_through_its_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -128,3 +165,19 @@ class CalibrationRunTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StepSearchTests(unittest.TestCase):
+    def test_steps_converge_without_creeping_into_the_wall(self):
+        rig = StepRig()
+        calibration = Calibration()
+        notes: list[str] = []
+        # A poor first guess, like the real car's dead zone gave.
+        _calibrate_steps(rig, calibration, None, lambda size: 0.06, notes.append)
+        self.assertTrue(any("sonar jumped" in line for line in notes), notes)
+        for size, seconds in calibration.step_durations.items():
+            self.assertAlmostEqual(real_step(seconds), size, delta=max(1.0, 0.07 * size) + 0.5, msg=notes)
+        # Never further than the largest step from where it started.
+        self.assertGreater(rig.closest, rig.wall_cm - 20.0 - 3.0)
+        self.assertGreater(rig.closest, MINIMUM_WALL_GAP_CM)
+        self.assertLess(abs(rig.position), 3.0)

@@ -80,7 +80,9 @@ Use **Stop camera processing** on the dashboard to pause frame capture and
 object detection. The camera is released while paused, and the video stream
 waits without sending frames. Press **Start camera processing** to resume.
 
-Pan/tilt sliders are also on the dashboard. The head starts at pan 90° and
+Pan/tilt sliders are also on the dashboard. Pan 30° looks to the car's left
+and 150° to its right (the Freenove servo turns clockwise as the angle
+rises). The head starts at pan 90° and
 tilt 100°, and **Center head** returns it there. The initial software travel
 is limited to 30°–150° to avoid the servo end stops; calibrate the safe range
 on the actual camera head before widening it.
@@ -167,12 +169,14 @@ The **What the camera sees** panel shows:
 
 **Calibrate turns & steps** (attended) measures how far the car really turns
 and moves. Face it toward a flat wall about 1–1.5 m away with room to turn.
-It photographs a strip across the pan, then turns 15°, 30° and 45° left and
-right, adjusting each command until the camera says it landed within 2°. It
-then uses the camera to return to its starting heading and makes 10, 20 and
-30 cm steps toward the wall, each followed by the same burst in reverse. It
-adjusts the burst length until the sonar says each step is right (within
-7%). It refuses to start with anything within 25 cm, and stops stepping
+It photographs a strip across the pan, then turns 10°, 20° and 30° left and
+right, adjusting each command until the camera says it landed within 2°. Each
+picture gets the same exposure check as a stop's picture. It then uses the
+camera to return to its starting heading and makes 5, 10 and 20 cm steps
+toward the wall, each followed by the same burst in reverse and, if the car
+crept, a short burst back to where the steps began. It adjusts the burst
+length until the sonar says each step is right (within 7%), changing it by
+at most 1.6× per try and ignoring readings that jump impossibly far. It refuses to start with anything within 25 cm, and stops stepping
 before the wall is closer than 45 cm. Results are saved beside the map
 database (not cleared by reset), shown on the dashboard, and used for every
 turn and step afterwards; each session keeps refining them.

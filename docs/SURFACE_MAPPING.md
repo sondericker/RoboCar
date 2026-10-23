@@ -270,9 +270,20 @@ scaling the command by the measured ratio, until it lands within 2°. Then
 the camera brings the car back to its starting heading, so the step tests
 face the wall squarely. Steps: sonar median of 7 pings before and after each
 burst, and the burst length is updated by fitting a line through the last
-two tries (travel has an offset from dead zone and ramps). In simulation,
-with small turns overshooting 30% and a forward dead zone, every turn landed
-within 2° on its second try and steps converged to 10.0, 19.9 and 30.0 cm.
+two tries (travel has an offset from dead zone and ramps). Each new step size
+starts from a line through every step measured so far, and creep is driven
+back out toward where the steps began. On the real car a 0.1 s burst moved
+about 1 cm, so the first version's scale-from-zero guess jumped to 0.77 s and
+60 cm; changes are now capped at 1.6× per try. In simulation, with small turns
+overshooting 30% and a forward dead zone, every turn landed within 2° on its
+second try. A step simulation using the real car's dead zone hit 5, 10 and
+20 cm, the latter two on the first try, and ended within 3 cm of its start.
+
+**Pan direction.** The first real calibration could not measure a single
+turn. The code had pan 150° looking left, but on the car it looks right. Every
+strip picture was therefore mirrored, and the pictures disagreed with each
+other by twice their angle. Sweeps were mirrored relative to the car's turns
+as well. `pan_bearing()` in `mapping.py` now does the conversion in one place.
 
 ## Sensor findings from the real car
 
