@@ -1,0 +1,684 @@
+{
+ "description": "Seven real 6-degree sweeps facing two walls that meet at a passage (2026-10-23).",
+ "observations": [
+  {
+   "pose": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "pose_sigma": [
+    0.0,
+    0.0
+   ],
+   "scan": [
+    {
+     "angle_deg": -60,
+     "distance_cm": 60.5
+    },
+    {
+     "angle_deg": -54,
+     "distance_cm": 60.4
+    },
+    {
+     "angle_deg": -48,
+     "distance_cm": 60.4
+    },
+    {
+     "angle_deg": -42,
+     "distance_cm": 60.4
+    },
+    {
+     "angle_deg": -36,
+     "distance_cm": 60.4
+    },
+    {
+     "angle_deg": -30,
+     "distance_cm": 60.4
+    },
+    {
+     "angle_deg": -24,
+     "distance_cm": 60.9
+    },
+    {
+     "angle_deg": -18,
+     "distance_cm": 61.2
+    },
+    {
+     "angle_deg": -12,
+     "distance_cm": 61.6
+    },
+    {
+     "angle_deg": -6,
+     "distance_cm": 62.2
+    },
+    {
+     "angle_deg": 0,
+     "distance_cm": 64.0
+    },
+    {
+     "angle_deg": 6,
+     "distance_cm": 95.5
+    },
+    {
+     "angle_deg": 12,
+     "distance_cm": 95.5
+    },
+    {
+     "angle_deg": 18,
+     "distance_cm": 68.1
+    },
+    {
+     "angle_deg": 24,
+     "distance_cm": 67.3
+    },
+    {
+     "angle_deg": 30,
+     "distance_cm": 66.7
+    },
+    {
+     "angle_deg": 36,
+     "distance_cm": 66.0
+    },
+    {
+     "angle_deg": 42,
+     "distance_cm": 66.0
+    },
+    {
+     "angle_deg": 48,
+     "distance_cm": 66.0
+    },
+    {
+     "angle_deg": 54,
+     "distance_cm": 66.0
+    },
+    {
+     "angle_deg": 60,
+     "distance_cm": 66.2
+    }
+   ]
+  },
+  {
+   "pose": [
+    -0.7020096042338697,
+    8.97204547384408,
+    0.01846864219621125
+   ],
+   "pose_sigma": [
+    2.8,
+    1.25
+   ],
+   "scan": [
+    {
+     "angle_deg": -60,
+     "distance_cm": 50.0
+    },
+    {
+     "angle_deg": -54,
+     "distance_cm": 49.2
+    },
+    {
+     "angle_deg": -48,
+     "distance_cm": 49.2
+    },
+    {
+     "angle_deg": -42,
+     "distance_cm": 49.2
+    },
+    {
+     "angle_deg": -36,
+     "distance_cm": 48.8
+    },
+    {
+     "angle_deg": -30,
+     "distance_cm": 48.8
+    },
+    {
+     "angle_deg": -24,
+     "distance_cm": 49.4
+    },
+    {
+     "angle_deg": -18,
+     "distance_cm": 50.2
+    },
+    {
+     "angle_deg": -12,
+     "distance_cm": 50.4
+    },
+    {
+     "angle_deg": -6,
+     "distance_cm": 57.0
+    },
+    {
+     "angle_deg": 0,
+     "distance_cm": 81.4
+    },
+    {
+     "angle_deg": 6,
+     "distance_cm": 81.3
+    },
+    {
+     "angle_deg": 12,
+     "distance_cm": 60.8
+    },
+    {
+     "angle_deg": 18,
+     "distance_cm": 59.0
+    },
+    {
+     "angle_deg": 24,
+     "distance_cm": 58.4
+    },
+    {
+     "angle_deg": 30,
+     "distance_cm": 58.4
+    },
+    {
+     "angle_deg": 36,
+     "distance_cm": 57.7
+    },
+    {
+     "angle_deg": 42,
+     "distance_cm": 57.7
+    },
+    {
+     "angle_deg": 48,
+     "distance_cm": 57.7
+    },
+    {
+     "angle_deg": 54,
+     "distance_cm": 57.7
+    },
+    {
+     "angle_deg": 60,
+     "distance_cm": 57.4
+    }
+   ]
+  },
+  {
+   "pose": [
+    -0.9036989161228572,
+    -1.1150255238861138,
+    -0.4541026602269369
+   ],
+   "pose_sigma": [
+    1.96,
+    1.63
+   ],
+   "scan": [
+    {
+     "angle_deg": -60,
+     "distance_cm": 95.2
+    },
+    {
+     "angle_deg": -54,
+     "distance_cm": 60.8
+    },
+    {
+     "angle_deg": -48,
+     "distance_cm": 60.8
+    },
+    {
+     "angle_deg": -42,
+     "distance_cm": 60.4
+    },
+    {
+     "angle_deg": -36,
+     "distance_cm": 60.9
+    },
+    {
+     "angle_deg": -30,
+     "distance_cm": 60.9
+    },
+    {
+     "angle_deg": -24,
+     "distance_cm": 60.9
+    },
+    {
+     "angle_deg": -18,
+     "distance_cm": 61.1
+    },
+    {
+     "angle_deg": -12,
+     "distance_cm": 61.7
+    },
+    {
+     "angle_deg": -6,
+     "distance_cm": 62.2
+    },
+    {
+     "angle_deg": 0,
+     "distance_cm": 63.2
+    },
+    {
+     "angle_deg": 6,
+     "distance_cm": 95.3
+    },
+    {
+     "angle_deg": 12,
+     "distance_cm": 95.3
+    },
+    {
+     "angle_deg": 18,
+     "distance_cm": 68.3
+    },
+    {
+     "angle_deg": 24,
+     "distance_cm": 67.2
+    },
+    {
+     "angle_deg": 30,
+     "distance_cm": 66.7
+    },
+    {
+     "angle_deg": 36,
+     "distance_cm": 65.7
+    },
+    {
+     "angle_deg": 42,
+     "distance_cm": 65.7
+    },
+    {
+     "angle_deg": 48,
+     "distance_cm": 66.0
+    },
+    {
+     "angle_deg": 54,
+     "distance_cm": 66.0
+    },
+    {
+     "angle_deg": 60,
+     "distance_cm": 65.7
+    }
+   ]
+  },
+  {
+   "pose": [
+    1.3095437548194604,
+    10.050707562678204,
+    0.2921650251227561
+   ],
+   "pose_sigma": [
+    2.05,
+    1.83
+   ],
+   "scan": [
+    {
+     "angle_deg": -60,
+     "distance_cm": 48.4
+    },
+    {
+     "angle_deg": -54,
+     "distance_cm": 47.4
+    },
+    {
+     "angle_deg": -48,
+     "distance_cm": 47.4
+    },
+    {
+     "angle_deg": -42,
+     "distance_cm": 47.4
+    },
+    {
+     "angle_deg": -36,
+     "distance_cm": 48.8
+    },
+    {
+     "angle_deg": -30,
+     "distance_cm": 48.7
+    },
+    {
+     "angle_deg": -24,
+     "distance_cm": 48.5
+    },
+    {
+     "angle_deg": -18,
+     "distance_cm": 48.5
+    },
+    {
+     "angle_deg": -12,
+     "distance_cm": 49.4
+    },
+    {
+     "angle_deg": -6,
+     "distance_cm": 79.4
+    },
+    {
+     "angle_deg": 0,
+     "distance_cm": 79.4
+    },
+    {
+     "angle_deg": 6,
+     "distance_cm": 79.0
+    },
+    {
+     "angle_deg": 12,
+     "distance_cm": 68.4
+    },
+    {
+     "angle_deg": 18,
+     "distance_cm": 57.8
+    },
+    {
+     "angle_deg": 24,
+     "distance_cm": 57.3
+    },
+    {
+     "angle_deg": 30,
+     "distance_cm": 57.1
+    },
+    {
+     "angle_deg": 36,
+     "distance_cm": 56.5
+    },
+    {
+     "angle_deg": 42,
+     "distance_cm": 56.5
+    },
+    {
+     "angle_deg": 48,
+     "distance_cm": 56.5
+    },
+    {
+     "angle_deg": 54,
+     "distance_cm": 56.5
+    },
+    {
+     "angle_deg": 60,
+     "distance_cm": 56.5
+    }
+   ]
+  },
+  {
+   "pose": [
+    -1.7185749432470332,
+    0.14798612070524086,
+    0.20746015935679907
+   ],
+   "pose_sigma": [
+    2.03,
+    2.02
+   ],
+   "scan": [
+    {
+     "angle_deg": -60,
+     "distance_cm": 61.8
+    },
+    {
+     "angle_deg": -54,
+     "distance_cm": 59.3
+    },
+    {
+     "angle_deg": -48,
+     "distance_cm": 59.2
+    },
+    {
+     "angle_deg": -42,
+     "distance_cm": 59.2
+    },
+    {
+     "angle_deg": -36,
+     "distance_cm": 60.1
+    },
+    {
+     "angle_deg": -30,
+     "distance_cm": 60.1
+    },
+    {
+     "angle_deg": -24,
+     "distance_cm": 60.2
+    },
+    {
+     "angle_deg": -18,
+     "distance_cm": 60.4
+    },
+    {
+     "angle_deg": -12,
+     "distance_cm": 61.0
+    },
+    {
+     "angle_deg": -6,
+     "distance_cm": 61.9
+    },
+    {
+     "angle_deg": 0,
+     "distance_cm": 63.8
+    },
+    {
+     "angle_deg": 6,
+     "distance_cm": 93.6
+    },
+    {
+     "angle_deg": 12,
+     "distance_cm": 67.0
+    },
+    {
+     "angle_deg": 18,
+     "distance_cm": 65.6
+    },
+    {
+     "angle_deg": 24,
+     "distance_cm": 65.3
+    },
+    {
+     "angle_deg": 30,
+     "distance_cm": 64.9
+    },
+    {
+     "angle_deg": 36,
+     "distance_cm": 64.3
+    },
+    {
+     "angle_deg": 42,
+     "distance_cm": 64.3
+    },
+    {
+     "angle_deg": 48,
+     "distance_cm": 64.3
+    },
+    {
+     "angle_deg": 54,
+     "distance_cm": 64.3
+    },
+    {
+     "angle_deg": 60,
+     "distance_cm": 64.5
+    }
+   ]
+  },
+  {
+   "pose": [
+    -1.1058151862988068,
+    9.391006641618622,
+    1.6590615036920724
+   ],
+   "pose_sigma": [
+    1.93,
+    2.06
+   ],
+   "scan": [
+    {
+     "angle_deg": -60,
+     "distance_cm": 50.4
+    },
+    {
+     "angle_deg": -54,
+     "distance_cm": 47.8
+    },
+    {
+     "angle_deg": -48,
+     "distance_cm": 47.4
+    },
+    {
+     "angle_deg": -42,
+     "distance_cm": 47.8
+    },
+    {
+     "angle_deg": -36,
+     "distance_cm": 47.8
+    },
+    {
+     "angle_deg": -30,
+     "distance_cm": 47.8
+    },
+    {
+     "angle_deg": -24,
+     "distance_cm": 49.2
+    },
+    {
+     "angle_deg": -18,
+     "distance_cm": 49.2
+    },
+    {
+     "angle_deg": -12,
+     "distance_cm": 50.6
+    },
+    {
+     "angle_deg": -6,
+     "distance_cm": 52.9
+    },
+    {
+     "angle_deg": 0,
+     "distance_cm": 81.7
+    },
+    {
+     "angle_deg": 6,
+     "distance_cm": 81.7
+    },
+    {
+     "angle_deg": 12,
+     "distance_cm": 81.2
+    },
+    {
+     "angle_deg": 18,
+     "distance_cm": 61.6
+    },
+    {
+     "angle_deg": 24,
+     "distance_cm": 60.2
+    },
+    {
+     "angle_deg": 30,
+     "distance_cm": 59.2
+    },
+    {
+     "angle_deg": 36,
+     "distance_cm": 58.5
+    },
+    {
+     "angle_deg": 42,
+     "distance_cm": 58.1
+    },
+    {
+     "angle_deg": 48,
+     "distance_cm": 58.1
+    },
+    {
+     "angle_deg": 54,
+     "distance_cm": 58.1
+    },
+    {
+     "angle_deg": 60,
+     "distance_cm": 58.1
+    }
+   ]
+  },
+  {
+   "pose": [
+    0.4502261852917939,
+    -0.7680058682341345,
+    -0.6890373525482119
+   ],
+   "pose_sigma": [
+    2.2,
+    2.06
+   ],
+   "scan": [
+    {
+     "angle_deg": -60,
+     "distance_cm": 64.6
+    },
+    {
+     "angle_deg": -54,
+     "distance_cm": 62.9
+    },
+    {
+     "angle_deg": -48,
+     "distance_cm": 62.4
+    },
+    {
+     "angle_deg": -42,
+     "distance_cm": 61.9
+    },
+    {
+     "angle_deg": -36,
+     "distance_cm": 62.0
+    },
+    {
+     "angle_deg": -30,
+     "distance_cm": 62.3
+    },
+    {
+     "angle_deg": -24,
+     "distance_cm": 62.3
+    },
+    {
+     "angle_deg": -18,
+     "distance_cm": 62.5
+    },
+    {
+     "angle_deg": -12,
+     "distance_cm": 62.9
+    },
+    {
+     "angle_deg": -6,
+     "distance_cm": 63.5
+    },
+    {
+     "angle_deg": 0,
+     "distance_cm": 64.1
+    },
+    {
+     "angle_deg": 6,
+     "distance_cm": 65.0
+    },
+    {
+     "angle_deg": 12,
+     "distance_cm": 96.0
+    },
+    {
+     "angle_deg": 18,
+     "distance_cm": 96.0
+    },
+    {
+     "angle_deg": 24,
+     "distance_cm": 66.5
+    },
+    {
+     "angle_deg": 30,
+     "distance_cm": 66.3
+    },
+    {
+     "angle_deg": 36,
+     "distance_cm": 65.3
+    },
+    {
+     "angle_deg": 42,
+     "distance_cm": 65.3
+    },
+    {
+     "angle_deg": 48,
+     "distance_cm": 65.2
+    },
+    {
+     "angle_deg": 54,
+     "distance_cm": 64.8
+    },
+    {
+     "angle_deg": 60,
+     "distance_cm": 64.7
+    }
+   ]
+  }
+ ]
+}

@@ -67,7 +67,7 @@ class SonarRoom:
                 return True
         return False
 
-    def scan(self, pose, angles=range(-60, 61, 6)) -> list[dict[str, object]]:
+    def scan(self, pose, angles=range(-60, 61, 3)) -> list[dict[str, object]]:
         return [
             {"angle_deg": angle, "distance_cm": self.distance(pose, angle), "samples": 3, "error": None}
             for angle in angles

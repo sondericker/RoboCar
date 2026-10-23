@@ -16,7 +16,7 @@ from typing import Callable, Protocol, Sequence
 import cv2
 import numpy as np
 
-from robocar.drive import DriveController
+from robocar.drive import MOTOR_RAMP_SECONDS, DriveController
 from robocar.localization import (
     MotionPrediction,
     Pose,
@@ -29,14 +29,17 @@ from robocar.localization import (
     wrap_degrees,
 )
 from robocar.range_sensor import RangeSensorController
-from robocar.surfaces import SurfaceMap, extract_echoes, pose_rotation
+from robocar.surfaces import SurfaceMap, direction, extract_echoes, pose_rotation
 
 logger = logging.getLogger(__name__)
-# Pan positions for each sweep: 21 directions 6 degrees apart, overlapping the
-# ultrasonic beam so surfaces show up as continuous range profiles.
-SCAN_ANGLES = tuple(range(30, 151, 6))
+# Pan positions for each sweep: 40 directions 3 degrees apart, overlapping the
+# ultrasonic beam so surfaces show up as continuous range profiles. The head
+# first parks at the lead-in position and then only ever steps upward, so
+# every reading is reached from the same side and servo backlash cancels out.
+SCAN_LEAD_IN_PAN = 30
+SCAN_ANGLES = tuple(range(33, 151, 3))
 SCAN_FIRST_SETTLE_SECONDS = 0.3
-SCAN_STEP_SETTLE_SECONDS = 0.1
+SCAN_STEP_SETTLE_SECONDS = 0.07
 SCAN_SAMPLES_PER_ANGLE = 3
 SCAN_SAMPLE_INTERVAL_SECONDS = 0.05
 # Extra camera views taken during the sweep when the forward view cannot be
@@ -53,9 +56,20 @@ AUTO_MIN_CLEARANCE_CM = 60.0
 AUTO_FORWARD_COMMAND = 1.0
 AUTO_FORWARD_SECONDS = 0.25
 AUTO_TURN_COMMAND = 1.0
-AUTO_TURN_SECONDS = 0.25
 AUTO_FORWARD_BURSTS_PER_TURN = 3
 AUTO_MAX_BACKUP_BURSTS = 1
+# Turns are closed-loop on wheel odometry, so the car turns by the angle it
+# chose rather than by a fixed nudge.
+AUTO_MAX_TURN_DEGREES = 75.0
+AUTO_MAX_TURN_SECONDS = 3.0
+# When everything ahead and to the sides is close, rotate in place to look
+# for a way out (always the same way) before ever backing up blind.
+AUTO_SEARCH_TURN_DEGREES = 45.0
+AUTO_MAX_SEARCH_TURNS = 4
+AUTO_TURN_MIN_CLEARANCE_CM = 25.0
+# Prefer directions that lead away from where the car has already been.
+AUTO_NOVELTY_LOOKAHEAD_CM = 80.0
+AUTO_NOVELTY_WEIGHT = 0.5
 CAMERA_HORIZONTAL_FOV_DEGREES = 62.2
 CAMERA_MOTION_FRAME_COUNT = 3
 CAMERA_MOTION_FRAME_INTERVAL_SECONDS = 0.05
@@ -457,24 +471,76 @@ def forward_clearance(scan: Sequence[dict[str, object]]) -> float | None:
     )
 
 
-def clearest_side(scan: Sequence[dict[str, object]], minimum_cm: float) -> dict[str, object] | None:
-    """Pick the side direction whose neighbouring readings are also clear."""
+def direction_clearances(scan: Sequence[dict[str, object]]) -> dict[float, float]:
+    """Clearance in each swept direction, taken across a car-wide corridor."""
     valid = {
         float(item["angle_deg"]): float(item["distance_cm"])
         for item in scan
         if item["distance_cm"] is not None
     }
-    best: tuple[float, dict[str, object]] | None = None
-    for item in scan:
-        angle = float(item["angle_deg"])
-        if angle not in valid or abs(angle) < SIDE_MIN_ANGLE_DEGREES:
-            continue
-        clearance = min(
-            distance for other, distance in valid.items() if abs(other - angle) <= 7
+    return {
+        angle: min(
+            distance for other, distance in valid.items() if abs(other - angle) <= FORWARD_CORRIDOR_DEGREES
         )
-        if clearance >= minimum_cm and (best is None or clearance > best[0]):
-            best = (clearance, item)
-    return best[1] if best else None
+        for angle in valid
+    }
+
+
+@dataclass(frozen=True)
+class ExploreStep:
+    action: str  # "forward", "turn", "search", "reverse" or "blocked"
+    degrees: float = 0.0
+    reason: str = ""
+
+
+def plan_explore_step(
+    scan: Sequence[dict[str, object]],
+    pose: Sequence[float],
+    visited: Sequence[Sequence[float]],
+    forward_bursts_since_turn: int,
+    search_turns: int,
+    backup_bursts: int,
+    search_sign: float = 0.0,
+) -> ExploreStep:
+    """Decide the next autonomous move from the latest sweep (counterclockwise degrees)."""
+    ahead = forward_clearance(scan)
+    clearances = direction_clearances(scan)
+    ahead_clear = ahead is not None and ahead >= AUTO_MIN_CLEARANCE_CM
+
+    def novelty(angle: float) -> float:
+        target = np.array(pose[:2], dtype=float) + AUTO_NOVELTY_LOOKAHEAD_CM * direction(float(pose[2]) + angle)
+        if not visited:
+            return AUTO_NOVELTY_LOOKAHEAD_CM
+        nearest = min(float(np.linalg.norm(target - np.array(point[:2], dtype=float))) for point in visited)
+        return min(AUTO_NOVELTY_LOOKAHEAD_CM, nearest)
+
+    if ahead_clear and forward_bursts_since_turn < AUTO_FORWARD_BURSTS_PER_TURN:
+        return ExploreStep("forward", reason="path ahead is clear")
+    openings = [
+        (min(clearance, 200.0) + AUTO_NOVELTY_WEIGHT * novelty(angle), angle)
+        for angle, clearance in sorted(clearances.items())
+        if abs(angle) >= SIDE_MIN_ANGLE_DEGREES and clearance >= AUTO_MIN_CLEARANCE_CM + 20
+    ]
+    if openings:
+        _, angle = max(openings, key=lambda opening: opening[0])
+        degrees = max(-AUTO_MAX_TURN_DEGREES, min(AUTO_MAX_TURN_DEGREES, angle))
+        return ExploreStep("turn", degrees, f"turning {degrees:+.0f}° toward open space")
+    if ahead_clear:
+        return ExploreStep("forward", reason="no side opening; continuing ahead")
+    if (
+        search_turns < AUTO_MAX_SEARCH_TURNS
+        and clearances
+        and min(clearances.values()) >= AUTO_TURN_MIN_CLEARANCE_CM
+    ):
+        if search_sign == 0.0:
+            left = [clearance for angle, clearance in clearances.items() if angle > 0]
+            right = [clearance for angle, clearance in clearances.items() if angle < 0]
+            search_sign = 1.0 if (np.mean(left) if left else 0.0) >= (np.mean(right) if right else 0.0) else -1.0
+        degrees = search_sign * AUTO_SEARCH_TURN_DEGREES
+        return ExploreStep("search", degrees, f"blocked; turning {degrees:+.0f}° to look for a way out")
+    if backup_bursts < AUTO_MAX_BACKUP_BURSTS:
+        return ExploreStep("reverse", reason="boxed in; backing up once")
+    return ExploreStep("blocked", reason="no safe path after searching")
 
 
 class MappingController:
@@ -504,6 +570,7 @@ class MappingController:
         self._run_id: str | None = None
         self._mode = "idle"
         self._move_count = 0
+        self._plan: str | None = None
         self._reset_localization()
         self._surface_map = SurfaceMap()
         self._path: list[Pose] = []
@@ -546,6 +613,7 @@ class MappingController:
             self._error = None
             self._run_id = str(uuid.uuid4())
             self._move_count = 0
+            self._plan = None
             self._reset_localization()
             with self._map_lock:
                 self._surface_map = SurfaceMap()
@@ -588,6 +656,7 @@ class MappingController:
                 "run_id": self._run_id,
                 "pose_model": "wheel odometry + camera yaw/travel + sonar surface registration",
                 "move_count": self._move_count,
+                "plan": self._plan,
                 "pose": [round(value, 1) for value in self._pose],
                 "pose_sigma_cm": round(position_sigma, 1),
                 "heading_sigma_deg": round(heading_sigma, 1),
@@ -628,6 +697,7 @@ class MappingController:
             self._state = "idle"
             self._error = None
             self._move_count = 0
+            self._plan = None
             self._reset_localization()
             with self._map_lock:
                 self._surface_map = SurfaceMap()
@@ -708,6 +778,8 @@ class MappingController:
         started_at = time.monotonic()
         forward_bursts_since_turn = 0
         backup_bursts = 0
+        search_turns = 0
+        search_sign = 0.0
         try:
             while not self._stop_event.is_set():
                 if time.monotonic() - started_at >= AUTO_MAX_SECONDS:
@@ -723,56 +795,53 @@ class MappingController:
                 scan = self._capture_observation(mode="explore")
                 if self._stop_event.is_set():
                     break
-                center_distance = forward_clearance(scan)
-                if center_distance is None:
+                if not any(item["distance_cm"] is not None for item in scan):
                     self._set_state("sensor_fault")
-                    raise RuntimeError("No valid forward ultrasonic reading; motors remain stopped")
-                clear_side = clearest_side(scan, AUTO_MIN_CLEARANCE_CM + 20)
-                obstacle_ahead = center_distance < AUTO_MIN_CLEARANCE_CM
-                periodic_turn_due = (
-                    forward_bursts_since_turn >= AUTO_FORWARD_BURSTS_PER_TURN
+                    raise RuntimeError("No valid ultrasonic readings; motors remain stopped")
+                # A missing straight-ahead echo (often a smooth wall at a steep
+                # angle) counts as blocked: the planner turns rather than drives.
+                with self._lock:
+                    pose = self._pose
+                with self._map_lock:
+                    visited = list(self._path)
+                step = plan_explore_step(
+                    scan,
+                    pose,
+                    visited,
+                    forward_bursts_since_turn,
+                    search_turns,
+                    backup_bursts,
+                    search_sign,
                 )
-                if obstacle_ahead or (periodic_turn_due and clear_side is not None):
-                    if clear_side is None:
-                        if not obstacle_ahead or backup_bursts >= AUTO_MAX_BACKUP_BURSTS:
-                            self._set_state("blocked")
-                            break
-                        self._drive.set_inhibited(False)
-                        self._set_state("backing_up")
-                        if not self._move_burst(
-                            -AUTO_FORWARD_COMMAND,
-                            AUTO_FORWARD_SECONDS,
-                        ):
-                            break
-                        self._count_move()
-                        backup_bursts += 1
-                        self._drive.set_inhibited(True)
-                        continue
-                    direction = 1.0 if float(clear_side["angle_deg"]) > 0 else -1.0
-                    self._drive.set_inhibited(False)
-                    self._set_state("turning")
-                    if not self._move_burst(
-                        0,
-                        AUTO_TURN_SECONDS,
-                        steering=AUTO_TURN_COMMAND * direction,
-                    ):
-                        break
-                    self._count_move()
-                    forward_bursts_since_turn = 0
-                    backup_bursts = 0
-                    self._drive.set_inhibited(True)
-                    continue
+                with self._lock:
+                    self._plan = step.reason
+                if step.action == "blocked":
+                    self._set_state("blocked")
+                    break
 
                 self._drive.set_inhibited(False)
-                self._set_state("moving")
-                if not self._move_burst(
-                    AUTO_FORWARD_COMMAND,
-                    AUTO_FORWARD_SECONDS,
-                ):
-                    break
+                if step.action == "forward":
+                    self._set_state("moving")
+                    if not self._move_burst(AUTO_FORWARD_COMMAND, AUTO_FORWARD_SECONDS):
+                        break
+                    forward_bursts_since_turn += 1
+                    backup_bursts = search_turns = 0
+                    search_sign = 0.0
+                elif step.action in ("turn", "search"):
+                    self._set_state("turning")
+                    if not self._turn_by(step.degrees):
+                        break
+                    forward_bursts_since_turn = 0
+                    if step.action == "search":
+                        search_turns += 1
+                        search_sign = math.copysign(1.0, step.degrees)
+                else:
+                    self._set_state("backing_up")
+                    if not self._move_burst(-AUTO_FORWARD_COMMAND, AUTO_FORWARD_SECONDS):
+                        break
+                    backup_bursts += 1
+                    search_turns = 0
                 self._count_move()
-                forward_bursts_since_turn += 1
-                backup_bursts = 0
                 self._drive.set_inhibited(True)
                 self._set_state("scanning")
                 if self._stop_event.wait(0.1):
@@ -791,6 +860,39 @@ class MappingController:
             if not self._stop_event.is_set():
                 self._drive.set_inhibited(False)
             self._set_enabled_false()
+
+    def _turn_by(self, degrees: float) -> bool:
+        """Rotate in place by about `degrees` (counterclockwise), closed loop on wheel odometry."""
+        if self._stop_event.is_set():
+            return False
+        with self._lock:
+            rotation_scale = self._odometry_scale[1]
+        # Odometry under-reads or over-reads turns by the learned scale.
+        target = abs(degrees) / max(rotation_scale, 1e-3)
+        steering = math.copysign(AUTO_TURN_COMMAND, degrees)
+        start_heading = self._drive.odometry()[2]
+        started = time.monotonic()
+        previous_time, previous_heading = started, start_heading
+        try:
+            self._drive.set_command(0, 0, steering)
+            while True:
+                if self._stop_event.wait(0.02):
+                    return False
+                now = time.monotonic()
+                heading = self._drive.odometry()[2]
+                rate = abs(heading - previous_heading) / max(now - previous_time, 1e-3)
+                previous_time, previous_heading = now, heading
+                # Ramping down after the stop adds about half a ramp of rotation.
+                if (
+                    abs(heading - start_heading) + rate * MOTOR_RAMP_SECONDS / 2 >= target
+                    or now - started >= AUTO_MAX_TURN_SECONDS
+                ):
+                    return True
+                self._drive.set_command(0, 0, steering)
+        finally:
+            self._drive.stop()
+            if not self._drive.wait_until_stopped():
+                raise RuntimeError("Drive output did not stop after the ramp-down interval")
 
     def _move_burst(
         self,
@@ -885,8 +987,8 @@ class MappingController:
         else:
             prior_pose, prior_covariance = propagate(previous_pose, previous_covariance, prediction)
 
-        echoes = [echo for run in extract_echoes(scan) for echo in run]
         with self._map_lock:
+            echoes = [echo for run in extract_echoes(scan, self._surface_map.beam_width_deg) for echo in run]
             registration = register_scan(echoes, prior_pose, prior_covariance, self._surface_map)
         pose, covariance = registration.pose, registration.covariance
         position_sigma, heading_sigma = pose_sigma(covariance)
@@ -956,14 +1058,15 @@ class MappingController:
             return scan, views
         self._pan_tilt.set_inhibited(True)
         try:
-            settle = SCAN_FIRST_SETTLE_SECONDS
+            self._pan_tilt.set_angles(SCAN_LEAD_IN_PAN, tilt, override=True)
+            if self._stop_event.wait(SCAN_FIRST_SETTLE_SECONDS):
+                return None, views
             for pan in pans:
                 if self._stop_event.is_set():
                     return None, views
                 self._pan_tilt.set_angles(pan, tilt, override=True)
-                if self._stop_event.wait(settle):
+                if self._stop_event.wait(SCAN_STEP_SETTLE_SECONDS):
                     return None, views
-                settle = SCAN_STEP_SETTLE_SECONDS
                 if pan in view_pans:
                     frame = self._camera.capture_snapshot()
                     if frame is not None:

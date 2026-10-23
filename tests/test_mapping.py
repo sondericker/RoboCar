@@ -1,3 +1,5 @@
+import json
+import math
 import tempfile
 import time
 import stat
@@ -21,7 +23,8 @@ from robocar.mapping import (
     CameraMotionEstimate,
     MappingController,
     MappingStore,
-    clearest_side,
+    direction_clearances,
+    plan_explore_step,
     estimate_camera_yaw_change,
     forward_clearance,
 )
@@ -317,7 +320,7 @@ class MappingTests(unittest.TestCase):
                 observation = mapping.observations()[0]
                 self.assertEqual(
                     [item["angle_deg"] for item in observation["scan"]],
-                    list(range(-60, 61, 6)),
+                    list(range(-57, 61, 3)),
                 )
                 self.assertTrue(all(item["distance_cm"] == 80 for item in observation["scan"]))
                 self.assertEqual(pan_tilt_driver.pan, 90)
@@ -446,7 +449,7 @@ class MappingTests(unittest.TestCase):
                 while mapping.status()["enabled"] and time.monotonic() < deadline:
                     time.sleep(0.02)
                 self.assertEqual(mapping.status()["state"], "error")
-                self.assertIn("No valid forward", mapping.status()["error"])
+                self.assertIn("No valid ultrasonic readings", mapping.status()["error"])
                 self.assertEqual(driver.command, (0, 0, 0, 0))
             finally:
                 mapping.close()
@@ -487,7 +490,8 @@ class MappingTests(unittest.TestCase):
                     f"state={mapping.status()}, pan={pan_driver.pan}, commands={driver.commands}",
                 )
                 self.assertEqual(mapping.status()["mode"], "explore")
-                deadline = time.monotonic() + 1
+                # A closed-loop turn toward the opening takes over a second.
+                deadline = time.monotonic() + 5
                 while mapping.status()["move_count"] == 0 and time.monotonic() < deadline:
                     time.sleep(0.01)
                 self.assertGreaterEqual(mapping.status()["move_count"], 1)
@@ -520,8 +524,9 @@ class MappingTests(unittest.TestCase):
                 {"angle_deg": angle, "distance_cm": 100.0, "samples": 3, "error": None}
                 for angle in (-60, -30, 0, 30, 60)
             ]
-            movement_durations: list[tuple[float, float, float]] = []
+            moves: list[tuple[str, float]] = []
             original_move_burst = mapping._move_burst
+            original_turn_by = mapping._turn_by
 
             def track_move_burst(
                 throttle: float,
@@ -529,13 +534,18 @@ class MappingTests(unittest.TestCase):
                 *,
                 steering: float = 0,
             ) -> bool:
-                movement_durations.append((throttle, duration, steering))
+                moves.append(("drive", throttle))
                 return original_move_burst(throttle, duration, steering=steering)
+
+            def track_turn_by(degrees: float) -> bool:
+                moves.append(("turn", degrees))
+                return original_turn_by(degrees)
 
             try:
                 with (
                     patch.object(mapping, "_capture_observation", return_value=clear_scan),
                     patch.object(mapping, "_move_burst", side_effect=track_move_burst),
+                    patch.object(mapping, "_turn_by", side_effect=track_turn_by),
                 ):
                     mapping.start_autonomous(attended=True)
                     deadline = time.monotonic() + 5
@@ -561,14 +571,11 @@ class MappingTests(unittest.TestCase):
                             for command in movement_commands
                         )
                     )
+                    # Three bursts ahead, then a real look-around turn to the
+                    # open side's angle rather than a fixed nudge.
                     self.assertEqual(
-                        movement_durations[:4],
-                        [
-                            (1.0, 0.25, 0),
-                            (1.0, 0.25, 0),
-                            (1.0, 0.25, 0),
-                            (0, 0.25, -1.0),
-                        ],
+                        moves[:4],
+                        [("drive", 1.0), ("drive", 1.0), ("drive", 1.0), ("turn", -60.0)],
                     )
                     self.assertEqual(mapping.status()["mode"], "explore")
                     self.assertGreaterEqual(mapping.status()["move_count"], 3)
@@ -601,6 +608,36 @@ class MappingTests(unittest.TestCase):
             pan_tilt.close()
             range_sensor.close()
 
+    def test_sweep_reaches_every_reading_from_the_same_side(self):
+        class RecordingPanTilt(SimulatedPanTilt):
+            def __init__(self) -> None:
+                super().__init__()
+                self.history: list[int] = []
+
+            def set_angles(self, pan: int, tilt: int) -> None:
+                super().set_angles(pan, tilt)
+                self.history.append(pan)
+
+        drive = DriveController(SimulatedDriver(), max_duty=1000, command_timeout=1, physical=False)
+        pan_driver = RecordingPanTilt()
+        pan_tilt = PanTiltController(pan_driver, physical=False)
+        range_sensor = RangeSensorController(FakeRangeSensor(), physical=True, sample_interval=0.5)
+        mapping = MappingController(FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")))
+        try:
+            pan_driver.history.clear()
+            scan, _ = mapping._sweep(90, 90, (54, 126))
+            sweep = pan_driver.history[1:-1]
+            self.assertEqual(pan_driver.history[0], 30)
+            self.assertEqual(sweep, sorted(sweep))
+            self.assertEqual(sweep, list(SCAN_ANGLES))
+            self.assertEqual(pan_driver.history[-1], 90)
+            self.assertEqual(len(scan), len(SCAN_ANGLES))
+        finally:
+            mapping.close()
+            drive.close()
+            pan_tilt.close()
+            range_sensor.close()
+
     def test_forward_clearance_covers_the_corridor_and_side_needs_width(self):
         scan = [
             {"angle_deg": angle, "distance_cm": 200.0, "samples": 3, "error": None}
@@ -616,9 +653,60 @@ class MappingTests(unittest.TestCase):
             for angle in range(-60, 61, 6)
         ]
         sides[0]["distance_cm"] = 300.0  # a single narrow gap on the right
-        for index in (18, 19, 20):
-            sides[index]["distance_cm"] = 150.0  # a wide opening on the left
-        self.assertEqual(clearest_side(sides, 80.0)["angle_deg"], 54)
+        for index in range(16, 21):
+            sides[index]["distance_cm"] = 150.0  # a car-wide opening on the left
+        clearances = direction_clearances(sides)
+        self.assertEqual(clearances[-60.0], 50.0)
+        self.assertEqual(clearances[48.0], 150.0)
+        step = plan_explore_step(sides, (0.0, 0.0, 0.0), [], 0, 0, 0)
+        self.assertEqual((step.action, step.degrees), ("turn", 48.0))
+
+    def test_boxed_in_corner_turns_to_search_instead_of_shuttling(self):
+        # The first real sweep from the passage run: walls 48-66 cm all round.
+        data = json.loads((Path(__file__).parent / "data" / "passage_run.json").read_text())
+        corner = data["observations"][0]["scan"]
+        forward = plan_explore_step(corner, (0.0, 0.0, 0.0), [], 0, 0, 0)
+        self.assertEqual(forward.action, "forward")  # 64 cm ahead is still clear
+        closer = [
+            {**item, "distance_cm": item["distance_cm"] - 9.0 if item["distance_cm"] else None}
+            for item in corner
+        ]
+        first = plan_explore_step(closer, (0.0, 9.0, 0.0), [(0.0, 0.0, 0.0)], 1, 0, 0)
+        self.assertEqual(first.action, "search")
+        second = plan_explore_step(
+            closer, (0.0, 9.0, 45.0), [(0.0, 0.0, 0.0)], 0, 1, 0, search_sign=math.copysign(1, first.degrees)
+        )
+        self.assertEqual(second.degrees, first.degrees)  # keeps turning the same way
+        exhausted = plan_explore_step(closer, (0.0, 9.0, 0.0), [], 0, 4, 0)
+        self.assertEqual(exhausted.action, "reverse")
+        self.assertEqual(plan_explore_step(closer, (0.0, 9.0, 0.0), [], 0, 4, 1).action, "blocked")
+
+    def test_exploration_prefers_openings_away_from_where_it_has_been(self):
+        scan = [
+            {"angle_deg": angle, "distance_cm": 40.0 if abs(angle) < 30 else 150.0, "samples": 3, "error": None}
+            for angle in range(-57, 61, 3)
+        ]
+        # Having come from the left, the car should look right.
+        visited = [(-60.0, 40.0, 0.0), (-40.0, 20.0, 0.0), (0.0, 0.0, 0.0)]
+        step = plan_explore_step(scan, (0.0, 0.0, 0.0), visited, 0, 0, 0)
+        self.assertEqual(step.action, "turn")
+        self.assertLess(step.degrees, 0)
+
+    def test_turn_by_rotates_close_to_the_requested_angle(self):
+        drive = DriveController(SimulatedDriver(), max_duty=4095, command_timeout=1, physical=True)
+        pan_tilt = PanTiltController(SimulatedPanTilt(), physical=True)
+        range_sensor = RangeSensorController(None, physical=False)
+        mapping = MappingController(FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")))
+        try:
+            for degrees in (45.0, -30.0):
+                before = drive.odometry()[2]
+                self.assertTrue(mapping._turn_by(degrees))
+                self.assertAlmostEqual(drive.odometry()[2] - before, degrees, delta=6.0)
+        finally:
+            mapping.close()
+            drive.close()
+            pan_tilt.close()
+            range_sensor.close()
 
     def test_surface_map_survives_restart_by_replaying_the_latest_run(self):
         room = SonarRoom()

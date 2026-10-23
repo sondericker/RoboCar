@@ -98,21 +98,32 @@ does not currently interlock or stop drive commands.
 physical hardware and the ultrasonic sensor are enabled, the car is stopped,
 and the operator confirms the room is clear and attended. The car scans while
 stopped, moves in short bursts, then stops and scans again. Autonomous motion
-uses full normalized motor output and the default 4095/4095 motor duty cap. It turns
-in place to avoid a blocked forward path, and also periodically after three
-forward bursts when a side of its sonar arc has at least 80 cm clearance. It
-turns toward the side with the most clearance. If forward is blocked and no
-side meets the clearance threshold, it backs up once for 0.25 seconds and
-rescans; if still blocked, it stops. The rear is not sensed, so keep the area
-behind the car clear and expect this recovery maneuver may bump into something.
-Forward, reverse, and turn commands are requested for 0.25 seconds; motor duty
-ramps up over that interval and ramps down for 0.25 seconds after each burst.
-It requires at least 60 cm forward clearance to advance and 80 cm in a side
-direction before turning. If the forward reading is missing, it stops. Each
-explore session is
-limited to two minutes and 30 movement bursts. **STOP** cancels the session and
-stops the drive output. A one-second watchdog stops stale commands, while
-autonomous bursts refresh the command until the burst ends. Exploration never
+uses full normalized motor output and the default 4095/4095 motor duty cap.
+
+After each sweep it plans its next move:
+
+- **Forward:** a 0.25-second burst when the corridor ahead (±12°, roughly the
+  car's width) has at least 60 cm clearance. Motor duty ramps up over that
+  interval and down for 0.25 seconds after.
+- **Look around:** after three forward bursts in a row, it turns toward the
+  best side opening (at least 80 cm clear across a car-wide corridor). Turns
+  are closed-loop on wheel odometry, so it turns by that opening's actual
+  angle, up to 75°, not by a fixed nudge. Openings that lead away from where
+  the car has already been score higher.
+- **Search:** when the way ahead is blocked or gives no echo (often a smooth
+  wall at a steep angle) and no side opening is clear, it turns in place 45°
+  at a time, always the same way, up to four times, as long as nothing in
+  the sweep is closer than 25 cm.
+- **Back up:** only when that search finds nothing does it back up once for
+  0.25 seconds; if still boxed in, it stops. The rear is not sensed, so keep
+  the area behind the car clear and expect this recovery maneuver may bump
+  into something.
+
+If the sensor returns no readings at all, it stops with a sensor fault. The
+dashboard shows the reason for the current move. Each explore session is
+limited to two minutes and 30 moves. **STOP** cancels the session and stops
+the drive output. A one-second watchdog stops stale commands, while
+autonomous moves refresh the command until they end. Exploration never
 starts at boot.
 
 Use **Reset mapping database** to permanently delete all saved observations.
@@ -129,11 +140,15 @@ protective devices; the sensor cannot see behind the car or guarantee detection
 of every surface. Test with wheels raised first, then at low speed in a cleared
 area. Keep unauthenticated dashboard access restricted to a trusted network.
 
-At each stop RoboCar sweeps the ultrasonic sensor across 21 directions, 6°
-apart (three pings each), and turns the sweep into **surfaces**: wall segments
-joined at corners into contours, plus point features such as edges and legs.
-The beam-width correction straightens walls that a raw plot would bow. Each
-new sweep refines, extends, merges or retires the surfaces it sees again.
+At each stop RoboCar sweeps the ultrasonic sensor across 40 directions, 3°
+apart (three pings each, always stepping the same way so servo backlash
+cancels). It turns the sweep into **surfaces**: fine wall segments joined at
+corners into contours, plus point features such as edges and legs. Openings
+and passages stay open: echoes are pulled back to the edges they came from,
+walls break wherever their points leave a gap, and contours never close
+across space a beam passed through. The beam-width correction, measured from
+the walls themselves, straightens walls that a raw plot would bow. Each new
+sweep refines, extends, merges or retires the surfaces it sees again.
 
 To place each sweep, RoboCar estimates how the car moved:
 
@@ -155,7 +170,7 @@ This is still an approximate sketch, not a validated or safety-rated map.
 Ultrasonic sensors miss soft and very oblique surfaces, monocular images have
 no absolute scale, and wheel slip varies. Do not use it for autonomous
 navigation or collision avoidance; exploration still steers from the raw
-sweep. A sweep takes about 6–7 seconds, so a two-minute explore session fits
+sweep. A sweep takes about 11–12 seconds, so a two-minute explore session fits
 fewer bursts than before. Separate sessions start in separate local coordinate
 frames and are not merged. The newest session's map is rebuilt from its saved
 sweeps when RoboCar restarts.

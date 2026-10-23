@@ -268,7 +268,7 @@ def _fit_to_surfaces(
             best: tuple[float, np.ndarray, np.ndarray, float] | None = None
             for wall in walls:
                 along = wall.along(point)
-                if not wall.extent[0] - 15.0 <= along <= wall.extent[1] + 15.0:
+                if not wall.near_piece(along, 10.0):
                     continue
                 residual = wall.offset(point)
                 if abs(residual) > gate:

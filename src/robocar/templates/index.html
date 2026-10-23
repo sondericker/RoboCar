@@ -327,7 +327,7 @@
       document.getElementById("map-caption").textContent =
         `Run ${(map.run_id || "").slice(0, 8)} · ${map.surfaces.length} surfaces ` +
         `(${confirmedSurfaces} confirmed) in ${map.contours.length} contours · ` +
-        `${map.features.length} point features · ${map.scan_count} sweeps · ` +
+        `${map.features.length} point features · ${map.scan_count} sweeps · beam ${map.beam_width_deg}° · ` +
         `pose ±${map.pose_sigma_cm.toFixed(1)} cm, ±${map.heading_sigma_deg.toFixed(1)}°. ` +
         "Solid = confirmed, dashed = seen once, dots = raw echoes.";
     }
@@ -397,11 +397,11 @@
           ? (mapping.state === "capturing" || mapping.state === "scanning"
             ? "Stopped; capturing camera and range sweep…"
             : mapping.mode === "explore"
-              ? `Auto explore: ${mapping.state} · ${mapping.move_count} movement bursts · ${localizationSummary(mapping)}`
+              ? `Auto explore: ${mapping.state}${mapping.plan ? ` (${mapping.plan})` : ""} · ${mapping.move_count} moves · ${localizationSummary(mapping)}`
               : "Survey active · drive manually, then stop to record a checkpoint.")
           : mapping.state === "blocked" ? "Auto explore stopped: no safe path visible in the forward scan."
             : mapping.state === "time_limit" ? "Auto explore stopped at its 2-minute limit."
-              : mapping.state === "move_limit" ? "Auto explore stopped after 30 movement bursts."
+              : mapping.state === "move_limit" ? "Auto explore stopped after 30 moves."
                 : "Mapping is off.";
     }
     mappingToggle.addEventListener("click", async () => {

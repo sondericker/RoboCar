@@ -71,7 +71,7 @@ image.
    false positives and model health visible. Use object detection for awareness,
    not as a safety sensor.
 4. **Survey and attended auto explore (implemented, experimental):** persist
-   stationary camera frames and 21-direction ultrasonic sweeps, then permit
+   stationary camera frames and 40-direction ultrasonic sweeps, then permit
    bounded movement bursts only after an explicit attended start. Stop on a
    missing forward echo, insufficient forward/side clearance, session timeout,
    or movement limit. Sweeps are reconstructed into refinable wall/feature
