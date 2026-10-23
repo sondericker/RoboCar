@@ -612,7 +612,13 @@
       const key = event.key.toLowerCase();
       if (heldKeys.has(key)) { stop(heldKeys.get(key)); heldKeys.delete(key); }
     });
-    window.addEventListener("blur", () => { heldKeys.clear(); stop(); });
+    // Only release manual driving here: confirm dialogs also blur the window,
+    // and a full stop would cancel the calibration or session just confirmed.
+    window.addEventListener("blur", () => {
+      if (!active.size && !heldKeys.size) return;
+      heldKeys.clear();
+      stop();
+    });
     async function refreshStatus() {
       try {
         const response = await fetch("/api/status", {cache: "no-store"});
