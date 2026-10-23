@@ -16,7 +16,7 @@ from typing import Callable, Protocol, Sequence
 import cv2
 import numpy as np
 
-from robocar.drive import MOTOR_RAMP_SECONDS, DriveController
+from robocar.drive import MOTOR_RAMP_SECONDS, TURN_DEGREES_PER_SECOND_AT_FULL_DUTY, DriveController
 from robocar.localization import (
     MotionPrediction,
     Pose,
@@ -28,8 +28,15 @@ from robocar.localization import (
     relative,
     wrap_degrees,
 )
+from robocar.places import (
+    CAMERA_HORIZONTAL_FOV_DEGREES,
+    Keyframe,
+    PlaceMemory,
+    detect_features,
+    make_keyframe,
+)
 from robocar.range_sensor import RangeSensorController
-from robocar.surfaces import SurfaceMap, direction, extract_echoes, pose_rotation
+from robocar.surfaces import IntegrationReport, SurfaceMap, direction, extract_echoes, pose_rotation
 
 logger = logging.getLogger(__name__)
 # Pan positions for each sweep: 40 directions 3 degrees apart, overlapping the
@@ -58,20 +65,34 @@ AUTO_FORWARD_SECONDS = 0.25
 AUTO_TURN_COMMAND = 1.0
 AUTO_FORWARD_BURSTS_PER_TURN = 3
 AUTO_MAX_BACKUP_BURSTS = 1
-# Turns are closed-loop on wheel odometry, so the car turns by the angle it
-# chose rather than by a fixed nudge.
-AUTO_MAX_TURN_DEGREES = 75.0
+# Turns are closed-loop on wheel odometry and kept small; a larger change of
+# direction happens over several stops, with a fresh sweep after each.
+AUTO_MAX_TURN_DEGREES = 25.0
 AUTO_MAX_TURN_SECONDS = 3.0
+# Before each turn the camera photographs a strip across the pan, from
+# straight ahead to past the destination. Afterwards the new forward view is
+# matched against every strip picture to measure the turn actually made, and
+# small corrective turns remove the remaining error.
+AUTO_STRIP_STEP_DEGREES = 10
+# The full pan range on the turn side, so even a large overshoot is measured.
+AUTO_STRIP_REACH_DEGREES = 60
+AUTO_STRIP_MAX_YAW_DEGREES = 20.0
+AUTO_ALIGN_TOLERANCE_DEGREES = 3.0
+AUTO_ALIGN_MAX_CORRECTIONS = 2
+AUTO_ALIGN_FRAMES = 2
+AUTO_ALIGN_SETTLE_SECONDS = 0.15
+PAN_LIMITS = (30, 150)
 # When everything ahead and to the sides is close, rotate in place to look
 # for a way out (always the same way) before ever backing up blind.
-AUTO_SEARCH_TURN_DEGREES = 45.0
-AUTO_MAX_SEARCH_TURNS = 4
+AUTO_SEARCH_TURN_DEGREES = 25.0
+AUTO_MAX_SEARCH_TURNS = 8
 AUTO_TURN_MIN_CLEARANCE_CM = 25.0
 # Prefer directions that lead away from where the car has already been.
 AUTO_NOVELTY_LOOKAHEAD_CM = 80.0
 AUTO_NOVELTY_WEIGHT = 0.5
-CAMERA_HORIZONTAL_FOV_DEGREES = 62.2
 CAMERA_MOTION_FRAME_COUNT = 3
+# Let the car stop rocking and the head stop moving before the first picture.
+CAMERA_SETTLE_SECONDS = 0.3
 CAMERA_MOTION_FRAME_INTERVAL_SECONDS = 0.05
 
 
@@ -106,17 +127,12 @@ def estimate_pair_camera_motion(
     current_jpeg: bytes,
 ) -> CameraMotionEstimate | None:
     """Estimate camera yaw (counterclockwise) and unscaled travel direction."""
-    previous_image = cv2.imdecode(np.frombuffer(previous_jpeg, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
-    current_image = cv2.imdecode(np.frombuffer(current_jpeg, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
-    if previous_image is None or current_image is None:
+    previous = detect_features(previous_jpeg, 1000)
+    current = detect_features(current_jpeg, 1000)
+    if previous is None or current is None or previous[2] != current[2]:
         return None
-    if previous_image.shape != current_image.shape:
-        return None
-    image_height, image_width = previous_image.shape
-
-    detector = cv2.ORB_create(nfeatures=1000)
-    previous_points, previous_descriptors = detector.detectAndCompute(previous_image, None)
-    current_points, current_descriptors = detector.detectAndCompute(current_image, None)
+    previous_points, previous_descriptors, (image_height, image_width) = previous
+    current_points, current_descriptors, _ = current
     if previous_descriptors is None or current_descriptors is None:
         return None
     matches = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(
@@ -263,14 +279,11 @@ def combine_view_estimates(
 
 def image_texture_score(jpeg: bytes) -> float:
     """Score how well an image can anchor feature matching (keypoints x coverage)."""
-    image = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
-    if image is None:
+    detected = detect_features(jpeg, 500)
+    if detected is None or not detected[0]:
         return 0.0
-    keypoints = cv2.ORB_create(nfeatures=500).detect(image, None)
-    if not keypoints:
-        return 0.0
+    keypoints, _, (height, width) = detected
     points = np.float32([keypoint.pt for keypoint in keypoints])
-    height, width = image.shape
     coverage = min(1.0, float(np.ptp(points[:, 0])) / (0.6 * width)) * min(
         1.0, float(np.ptp(points[:, 1])) / (0.6 * height)
     )
@@ -319,6 +332,35 @@ class MappingStore:
                 pose_y_cm REAL,
                 heading_deg REAL,
                 estimate_json TEXT
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS keyframes (
+                observation_id INTEGER PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                pan_offset_deg REAL NOT NULL,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                points BLOB NOT NULL,
+                descriptors BLOB NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS place_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source INTEGER NOT NULL,
+                target INTEGER NOT NULL,
+                dx_cm REAL NOT NULL,
+                dy_cm REAL NOT NULL,
+                dheading_deg REAL NOT NULL,
+                sigma_json TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                inliers INTEGER NOT NULL,
+                created_at TEXT NOT NULL
             )
             """
         )
@@ -447,11 +489,120 @@ class MappingStore:
             ).fetchone()
         return bytes(row[0]) if row else None
 
+    def place_observations(self) -> list[dict[str, object]]:
+        """Every stop of every run, without images, oldest first."""
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT id, captured_at, scan_json, run_id, mode,
+                       pose_x_cm, pose_y_cm, heading_deg, estimate_json
+                FROM observations ORDER BY id
+                """
+            ).fetchall()
+        return [self._row(row) for row in rows]
+
+    def save_keyframe(self, keyframe: Keyframe) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT OR REPLACE INTO keyframes (
+                    observation_id, run_id, pan_offset_deg, width, height, points, descriptors
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    keyframe.observation_id,
+                    keyframe.run_id,
+                    keyframe.pan_offset_deg,
+                    keyframe.width,
+                    keyframe.height,
+                    keyframe.points.astype(np.float32).tobytes(),
+                    keyframe.descriptors.astype(np.uint8).tobytes(),
+                ),
+            )
+
+    def keyframes(self) -> list[Keyframe]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT observation_id, run_id, pan_offset_deg, width, height, points, descriptors
+                FROM keyframes ORDER BY observation_id
+                """
+            ).fetchall()
+        return [
+            Keyframe(
+                int(row[0]),
+                str(row[1]),
+                float(row[2]),
+                int(row[3]),
+                int(row[4]),
+                np.frombuffer(row[5], dtype=np.float32).reshape(-1, 2),
+                np.frombuffer(row[6], dtype=np.uint8).reshape(-1, 32),
+            )
+            for row in rows
+        ]
+
+    def save_link(
+        self,
+        source: int,
+        target: int,
+        delta: tuple[float, float, float],
+        sigma: Sequence[float],
+        kind: str,
+        inliers: int,
+    ) -> int:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO place_links (
+                    source, target, dx_cm, dy_cm, dheading_deg, sigma_json, kind, inliers, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source,
+                    target,
+                    delta[0],
+                    delta[1],
+                    delta[2],
+                    json.dumps([round(float(value), 3) for value in sigma]),
+                    kind,
+                    inliers,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def delete_link(self, link_id: int) -> None:
+        with self._lock, self._connection:
+            self._connection.execute("DELETE FROM place_links WHERE id = ?", (link_id,))
+
+    def links(self) -> list[dict[str, object]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT id, source, target, dx_cm, dy_cm, dheading_deg, sigma_json, kind, inliers
+                FROM place_links ORDER BY id
+                """
+            ).fetchall()
+        return [
+            {
+                "id": int(row[0]),
+                "source": int(row[1]),
+                "target": int(row[2]),
+                "delta": (float(row[3]), float(row[4]), float(row[5])),
+                "sigma": json.loads(row[6]),
+                "kind": row[7],
+                "inliers": int(row[8]),
+            }
+            for row in rows
+        ]
+
     def reset(self) -> None:
         with self._lock, self._connection:
             self._connection.execute("DELETE FROM observations")
+            self._connection.execute("DELETE FROM keyframes")
+            self._connection.execute("DELETE FROM place_links")
             self._connection.execute(
-                "DELETE FROM sqlite_sequence WHERE name = 'observations'"
+                "DELETE FROM sqlite_sequence WHERE name IN ('observations', 'place_links')"
             )
 
     def close(self) -> None:
@@ -574,7 +725,16 @@ class MappingController:
         self._reset_localization()
         self._surface_map = SurfaceMap()
         self._path: list[Pose] = []
+        self._history: list[list[Pose]] = []
+        self._links: list[tuple[Pose, Pose]] = []
         self._map_run_id: str | None = None
+        # The place memory is only used from the mapping thread (and at start
+        # up); the dashboard reads the snapshots kept below instead.
+        self._places_lock = threading.Lock()
+        self._places = PlaceMemory(self._store)
+        self._places.load()
+        self._place_counts = self._places.counts()
+        self._last_place: dict[str, object] | None = None
         self._replay_latest_run()
 
     def _reset_localization(self) -> None:
@@ -584,6 +744,10 @@ class MappingController:
         self._last_camera_views: dict[ViewKey, tuple[bytes, ...]] | None = None
         self._odometry_scale = (1.0, 1.0)
         self._last_localization: dict[str, object] | None = None
+        # Camera-verified rotation since the last stop, for turns too large
+        # for stop-to-stop image comparison.
+        self._verified_turn: float | None = None
+        self._last_node: int | None = None
 
     def start(self) -> None:
         self._start("survey", self._run_survey)
@@ -618,7 +782,10 @@ class MappingController:
             with self._map_lock:
                 self._surface_map = SurfaceMap()
                 self._path = []
+                self._history = []
+                self._links = []
                 self._map_run_id = self._run_id
+            self._last_place = None
             self._stop_event.clear()
             self._thread = threading.Thread(
                 target=target,
@@ -662,6 +829,8 @@ class MappingController:
                 "heading_sigma_deg": round(heading_sigma, 1),
                 "odometry_scale": [round(value, 3) for value in self._odometry_scale],
                 "localization": self._last_localization,
+                "places": dict(self._place_counts),
+                "last_place": self._last_place,
             }
         with self._map_lock:
             status["surface_count"] = len(self._surface_map.walls())
@@ -678,6 +847,11 @@ class MappingController:
             data = self._surface_map.to_dict()
             data["run_id"] = self._map_run_id
             data["path"] = [[round(value, 1) for value in pose] for pose in self._path]
+            data["history"] = [[[round(value, 1) for value in pose] for pose in path] for path in self._history]
+            data["links"] = [
+                [[round(start[0], 1), round(start[1], 1)], [round(end[0], 1), round(end[1], 1)]]
+                for start, end in self._links
+            ]
         data["pose_sigma_cm"] = round(position_sigma, 1)
         data["heading_sigma_deg"] = round(heading_sigma, 1)
         return data
@@ -699,9 +873,15 @@ class MappingController:
             self._move_count = 0
             self._plan = None
             self._reset_localization()
+            with self._places_lock:
+                self._places = PlaceMemory(self._store)
+                self._place_counts = self._places.counts()
+            self._last_place = None
             with self._map_lock:
                 self._surface_map = SurfaceMap()
                 self._path = []
+                self._history = []
+                self._links = []
                 self._map_run_id = None
 
     def close(self) -> None:
@@ -709,34 +889,51 @@ class MappingController:
         self._store.close()
 
     def _replay_latest_run(self) -> None:
-        """Rebuild the newest run's surfaces from its saved sweeps and poses."""
+        """Rebuild the newest run's map, joined with every session it recognized."""
         run_id = self._store.latest_run_id()
-        if run_id is None:
+        with self._places_lock:
+            nodes = [node for node, run in self._places.graph.runs.items() if run == run_id]
+        if not nodes:
             return
+        latest = max(nodes)
+        self._rebuild_map(latest, run_id)
+        with self._places_lock:
+            pose = self._places.graph.nodes[latest]
+            position_sigma, heading_sigma = self._places.stop(latest).pose_sigma
+        self._pose = pose
+        self._pose_covariance = np.diag(
+            [position_sigma**2, position_sigma**2, math.radians(heading_sigma) ** 2]
+        )
+
+    def _rebuild_map(self, node: int, run_id: str) -> IntegrationReport | None:
+        """Replay every sweep in the node's connected sessions at their optimized poses."""
+        with self._places_lock:
+            component = self._places.graph.component(node)
+            stops = [
+                (other, self._places.stop(other), self._places.graph.nodes[other])
+                for other in sorted(component)
+            ]
+            links = [
+                (self._places.graph.nodes[source], self._places.graph.nodes[target])
+                for source, target, _ in self._places.loop_links(component)
+            ]
         surface_map = SurfaceMap()
         path: list[Pose] = []
-        position_sigma = heading_sigma = 0.0
-        for observation in self._store.run_observations(run_id):
-            if observation["pose_x_cm"] is None:
-                continue
-            pose = (
-                float(observation["pose_x_cm"]),
-                float(observation["pose_y_cm"]),
-                float(observation["heading_deg"]),
-            )
-            estimate = observation["estimate"] or {}
-            position_sigma, heading_sigma = estimate.get("pose_sigma", (0.0, 0.0))
-            surface_map.integrate(observation["scan"], pose, position_sigma, heading_sigma)
-            path.append(pose)
-        if path:
-            self._pose = path[-1]
-            self._pose_covariance = np.diag(
-                [position_sigma**2, position_sigma**2, math.radians(heading_sigma) ** 2]
-            )
+        history: dict[str, list[Pose]] = {}
+        report = None
+        for other, stop, pose in stops:
+            report = surface_map.integrate(stop.scan, pose, *stop.pose_sigma)
+            if stop.run_id == run_id:
+                path.append(pose)
+            else:
+                history.setdefault(stop.run_id, []).append(pose)
         with self._map_lock:
             self._surface_map = surface_map
             self._path = path
+            self._history = list(history.values())
+            self._links = links
             self._map_run_id = run_id
+        return report
 
     def _run_survey(self) -> None:
         capture_pending = True
@@ -802,8 +999,12 @@ class MappingController:
                 # angle) counts as blocked: the planner turns rather than drives.
                 with self._lock:
                     pose = self._pose
-                with self._map_lock:
-                    visited = list(self._path)
+                    last_node = self._last_node
+                # Every remembered stop in this frame, from earlier sessions too.
+                with self._places_lock:
+                    visited = (
+                        list(self._places.component_poses(last_node).values()) if last_node is not None else []
+                    )
                 step = plan_explore_step(
                     scan,
                     pose,
@@ -829,7 +1030,7 @@ class MappingController:
                     search_sign = 0.0
                 elif step.action in ("turn", "search"):
                     self._set_state("turning")
-                    if not self._turn_by(step.degrees):
+                    if not self._turn_and_align(step.degrees):
                         break
                     forward_bursts_since_turn = 0
                     if step.action == "search":
@@ -861,30 +1062,132 @@ class MappingController:
                 self._drive.set_inhibited(False)
             self._set_enabled_false()
 
-    def _turn_by(self, degrees: float) -> bool:
+    def _turn_and_align(self, degrees: float) -> bool:
+        """Turn by `degrees`, then use the camera to measure and correct the turn."""
+        pan_status = self._pan_tilt.status()
+        centre_pan, tilt = int(pan_status["pan"]), int(pan_status["tilt"])
+        sign = 1 if degrees >= 0 else -1
+        offsets = [
+            sign * step
+            for step in range(0, AUTO_STRIP_REACH_DEGREES + 1, AUTO_STRIP_STEP_DEGREES)
+            if PAN_LIMITS[0] <= centre_pan + sign * step <= PAN_LIMITS[1]
+        ]
+        strip = self._capture_views([centre_pan + offset for offset in offsets], tilt, centre_pan, frames=1)
+        odometry_before = self._drive.odometry()[2]
+        if not self._turn_by(degrees):
+            return False
+        actual: float | None = None
+        for attempt in range(AUTO_ALIGN_MAX_CORRECTIONS + 1):
+            current = self._capture_views([centre_pan], tilt, centre_pan, frames=AUTO_ALIGN_FRAMES)
+            actual = self._measure_turn(strip, current.get(centre_pan), centre_pan)
+            if actual is None:
+                break
+            # Positive means the car went too far counterclockwise.
+            error = actual - degrees
+            if abs(error) <= AUTO_ALIGN_TOLERANCE_DEGREES or attempt == AUTO_ALIGN_MAX_CORRECTIONS:
+                break
+            # Correct with the turn ratio this very turn showed, so a badly
+            # calibrated turn rate cannot make the correction overshoot too.
+            odometry_turned = self._drive.odometry()[2] - odometry_before
+            ratio = actual / odometry_turned if abs(odometry_turned) > 2.0 else None
+            self._set_state("aligning")
+            if not self._turn_by(-error, ratio if ratio is not None and 0.2 <= ratio <= 5.0 else None):
+                return False
+        if actual is None:
+            return True
+        odometry_turned = self._drive.odometry()[2] - odometry_before
+        with self._lock:
+            self._verified_turn = (self._verified_turn or 0.0) + actual
+            translation_scale, rotation_scale = self._odometry_scale
+            if abs(odometry_turned) > 5.0 and 0.3 <= actual / odometry_turned <= 3.0:
+                rotation_scale = min(2.0, max(0.5, 0.7 * rotation_scale + 0.3 * actual / odometry_turned))
+                self._odometry_scale = (translation_scale, rotation_scale)
+        return True
+
+    @staticmethod
+    def _measure_turn(
+        strip: dict[int, tuple[bytes, ...]],
+        current: tuple[bytes, ...] | None,
+        centre_pan: int,
+    ) -> float | None:
+        """Combine the turn each strip picture implies: its pan offset plus the
+        rotation still left between it and the current forward view."""
+        if not current:
+            return None
+        readings: list[tuple[float, float]] = []
+        for pan, frames in strip.items():
+            key = (pan - centre_pan, 0)
+            visual = combine_view_estimates(estimate_view_motion({key: frames}, {key: current}))
+            if visual is not None and abs(visual.yaw_deg) <= AUTO_STRIP_MAX_YAW_DEGREES:
+                # Pictures the car ended up nearly facing overlap most.
+                readings.append((key[0] + visual.yaw_deg, 1.0 / (1.0 + abs(visual.yaw_deg))))
+        if not readings:
+            return None
+        total = sum(weight for _, weight in readings)
+        return sum(turn * weight for turn, weight in readings) / total
+
+    def _capture_views(
+        self,
+        pans: Sequence[int],
+        tilt: int,
+        return_pan: int,
+        frames: int,
+    ) -> dict[int, tuple[bytes, ...]]:
+        """Photograph at each pan in ascending order, approaching every position
+        from below so servo backlash is the same for every picture."""
+        views: dict[int, tuple[bytes, ...]] = {}
+        if not pans:
+            return views
+        ordered = sorted(pans)
+        self._pan_tilt.set_inhibited(True)
+        try:
+            self._pan_tilt.set_angles(max(PAN_LIMITS[0], ordered[0] - 6), tilt, override=True)
+            for pan in ordered:
+                self._pan_tilt.set_angles(pan, tilt, override=True)
+                if self._stop_event.wait(AUTO_ALIGN_SETTLE_SECONDS):
+                    return views
+                pictures = [self._camera.capture_snapshot() for _ in range(frames)]
+                if all(picture is not None for picture in pictures):
+                    views[pan] = tuple(pictures)
+            return views
+        finally:
+            try:
+                if ordered[-1] != return_pan or len(ordered) > 1:
+                    self._pan_tilt.set_angles(max(PAN_LIMITS[0], return_pan - 6), tilt, override=True)
+                    self._pan_tilt.set_angles(return_pan, tilt, override=True)
+            finally:
+                self._pan_tilt.set_inhibited(False)
+
+    def _turn_by(self, degrees: float, rotation_scale: float | None = None) -> bool:
         """Rotate in place by about `degrees` (counterclockwise), closed loop on wheel odometry."""
         if self._stop_event.is_set():
             return False
-        with self._lock:
-            rotation_scale = self._odometry_scale[1]
+        if rotation_scale is None:
+            with self._lock:
+                rotation_scale = self._odometry_scale[1]
         # Odometry under-reads or over-reads turns by the learned scale.
         target = abs(degrees) / max(rotation_scale, 1e-3)
         steering = math.copysign(AUTO_TURN_COMMAND, degrees)
+        peak_rate = TURN_DEGREES_PER_SECOND_AT_FULL_DUTY * DriveController._wheel_speed_fraction(
+            float(self._drive.status()["max_duty"]) * AUTO_TURN_COMMAND
+        )
         start_heading = self._drive.odometry()[2]
         started = time.monotonic()
         previous_time, previous_heading = started, start_heading
         try:
             self._drive.set_command(0, 0, steering)
             while True:
-                if self._stop_event.wait(0.02):
+                if self._stop_event.wait(0.01):
                     return False
                 now = time.monotonic()
                 heading = self._drive.odometry()[2]
                 rate = abs(heading - previous_heading) / max(now - previous_time, 1e-3)
                 previous_time, previous_heading = now, heading
-                # Ramping down after the stop adds about half a ramp of rotation.
+                # The motors ramp down from their current speed after the
+                # stop, adding rotation in proportion to how fast it is turning.
+                coast = rate * MOTOR_RAMP_SECONDS * min(1.0, rate / max(peak_rate, 1e-3)) / 2
                 if (
-                    abs(heading - start_heading) + rate * MOTOR_RAMP_SECONDS / 2 >= target
+                    abs(heading - start_heading) + coast >= target
                     or now - started >= AUTO_MAX_TURN_SECONDS
                 ):
                     return True
@@ -925,6 +1228,8 @@ class MappingController:
 
     def _capture_observation(self, mode: str = "survey") -> list[dict[str, object]]:
         self._store.ensure_capacity()
+        if self._stop_event.wait(CAMERA_SETTLE_SECONDS):
+            return []
         pan_status = self._pan_tilt.status()
         original_pan = int(pan_status["pan"])
         original_tilt = int(pan_status["tilt"])
@@ -975,6 +1280,12 @@ class MappingController:
             views.update(side_views)
             view_estimates += estimate_view_motion(previous_views or {}, side_views)
         visual = combine_view_estimates(view_estimates)
+        with self._lock:
+            verified_turn, self._verified_turn = self._verified_turn, None
+        if visual is None and verified_turn is not None:
+            # The turn was too large for the views to overlap, but the camera
+            # already measured it against the destination view.
+            visual = VisualMotion(verified_turn, None, AUTO_ALIGN_FRAMES, 0.0)
         prediction = predict_motion(odometry_delta, visual)
 
         with self._lock:
@@ -1020,28 +1331,73 @@ class MappingController:
             "pose_sigma": [round(position_sigma, 2), round(heading_sigma, 2)],
             "surfaces_before": {"walls": counts[0], "features": counts[1]},
         }
+        with self._lock:
+            previous_node = self._last_node
+        edge = None
+        if previous_node is not None:
+            edge = (previous_node, relative(previous_pose, pose), self._edge_sigma(prediction, registration.accepted))
+            estimate["edge"] = {
+                "from": previous_node,
+                "delta": [round(value, 3) for value in edge[1]],
+                "sigma": [round(value, 3) for value in edge[2]],
+            }
         observation_id = self._store.save(image_jpeg, scan, run_id, mode, pose, estimate)
-        with self._map_lock:
-            report = self._surface_map.integrate(scan, pose, position_sigma, heading_sigma)
-            self._path.append(pose)
+
+        # Remember this place and try to recognize it from earlier stops.
+        keyframe = make_keyframe(observation_id, run_id, image_jpeg, original_pan - 90)
+        if keyframe is not None:
+            self._store.save_keyframe(keyframe)
+        with self._places_lock:
+            event = self._places.add_stop(
+                observation_id, run_id, pose, scan, (position_sigma, heading_sigma), keyframe, edge
+            )
+            if event is not None:
+                pose = self._places.graph.nodes[observation_id]
+                covariance = np.diag(
+                    [event.sigma[0] ** 2, event.sigma[1] ** 2, math.radians(event.sigma[2]) ** 2]
+                )
+            place_counts = self._places.counts()
+        if event is not None:
+            logger.info("Recognized place %s: %s", event.keyframe_id, event.summary())
+            report = self._rebuild_map(observation_id, run_id)
+        else:
+            with self._map_lock:
+                report = self._surface_map.integrate(scan, pose, position_sigma, heading_sigma)
+                self._path.append(pose)
         captured_at = datetime.now(timezone.utc).isoformat()
         with self._lock:
             self._pose, self._pose_covariance = pose, covariance
+            self._last_node = observation_id
             self._last_odometry = odometry
             self._last_camera_views = views
             self._odometry_scale = scale
+            self._place_counts = place_counts
+            if event is not None:
+                self._last_place = event.summary()
             self._last_localization = {
                 "visual_used": prediction.visual_used,
                 "visual_rejected": prediction.visual_rejected,
                 "side_views": bool(side_views),
                 "registration": registration.summary(),
-                "surfaces_created": report.created,
-                "surfaces_refined": report.fused,
-                "surfaces_retired": report.retired,
+                "place": event.summary() if event is not None else None,
+                "surfaces_created": report.created if event is None and report else None,
+                "surfaces_refined": report.fused if event is None and report else None,
+                "surfaces_retired": report.retired if event is None and report else None,
             }
             self._last_observation = captured_at
             self._last_id = observation_id
         return scan
+
+    @staticmethod
+    def _edge_sigma(prediction: MotionPrediction, registered: bool) -> tuple[float, float, float]:
+        """Uncertainty of the motion between two stops, for the pose graph."""
+        covariance = prediction.covariance
+        factor = 0.5 if registered else 1.0
+        return (
+            factor * math.sqrt(covariance[0, 0]) + 0.5,
+            factor * math.sqrt(covariance[1, 1]) + 0.5,
+            max(0.3, factor * math.degrees(math.sqrt(covariance[2, 2]))),
+        )
 
     def _sweep(
         self,

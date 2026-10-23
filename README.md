@@ -107,12 +107,20 @@ After each sweep it plans its next move:
   interval and down for 0.25 seconds after.
 - **Look around:** after three forward bursts in a row, it turns toward the
   best side opening (at least 80 cm clear across a car-wide corridor). Turns
-  are closed-loop on wheel odometry, so it turns by that opening's actual
-  angle, up to 75°, not by a fixed nudge. Openings that lead away from where
-  the car has already been score higher.
+  are at most 25°; a larger change of direction takes several stops, with a
+  fresh sweep after each. Openings that lead away from where the car has
+  already been score higher.
+- **Camera-measured turns:** before turning, the camera photographs a strip
+  every 10° across the pan on the turn side (0–60°). The car then turns
+  closed-loop on wheel odometry. Afterwards its new forward view is matched
+  against every strip picture; each one implies how far the car really
+  turned, and these are combined. If the turn is off by more than 3°, the car
+  makes up to two corrective turns, scaled by the ratio that turn revealed.
+  The measured turn also recalibrates odometry and fixes the pose for the
+  next sweep. Without usable images (a blank wall) it relies on odometry.
 - **Search:** when the way ahead is blocked or gives no echo (often a smooth
-  wall at a steep angle) and no side opening is clear, it turns in place 45°
-  at a time, always the same way, up to four times, as long as nothing in
+  wall at a steep angle) and no side opening is clear, it turns in place 25°
+  at a time, always the same way, up to eight times, as long as nothing in
   the sweep is closer than 25 cm.
 - **Back up:** only when that search finds nothing does it back up once for
   0.25 seconds; if still boxed in, it stops. The rear is not sensed, so keep
@@ -171,9 +179,21 @@ Ultrasonic sensors miss soft and very oblique surfaces, monocular images have
 no absolute scale, and wheel slip varies. Do not use it for autonomous
 navigation or collision avoidance; exploration still steers from the raw
 sweep. A sweep takes about 11–12 seconds, so a two-minute explore session fits
-fewer bursts than before. Separate sessions start in separate local coordinate
-frames and are not merged. The newest session's map is rebuilt from its saved
-sweeps when RoboCar restarts.
+fewer bursts than before.
+
+**Remembering places:** every stop's picture features, sweep and pose are kept
+in the database across sessions. At each stop RoboCar checks whether it has
+seen the place before. It matches picture features, verifies the camera
+geometry, then confirms with a sonar fit against that place's remembered
+surfaces. Returning to a place within a session closes a loop: a pose graph
+spreads the accumulated drift back along the path, and matches that
+contradict everything else are thrown out. Recognizing a place from an
+earlier session moves the new session into the old one's frame, so the map
+becomes one persistent house map built from every joined session, and
+exploration prefers ground no session has covered yet. The dashboard draws
+earlier sessions faintly and recognized places as purple dashed links. The
+whole graph is rebuilt from the database when RoboCar restarts. Sessions that
+never see a remembered place stay in their own frame.
 
 By default, survey data is stored at
 `~/.local/share/robocar/mapping.sqlite3` (or under `$XDG_DATA_HOME` when set).

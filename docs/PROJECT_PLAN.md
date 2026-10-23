@@ -77,7 +77,8 @@ image.
    or movement limit. Sweeps are reconstructed into refinable wall/feature
    surfaces and contours. Poses fuse wheel odometry, camera yaw/travel
    direction (with side views when needed) and sonar registration against the
-   surface map; see `docs/SURFACE_MAPPING.md`. Treat the display as an
+   surface map; remembered places close loops through a pose graph and join
+   sessions into one persistent map; see `docs/SURFACE_MAPPING.md`. Treat the display as an
    approximate sketch and do not use it for navigation or collision
    avoidance. A dependable room map still needs calibrated sensor geometry and
    better ranging/localization hardware, preferably 2D lidar with wheel

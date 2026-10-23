@@ -140,14 +140,94 @@ opened doors and people fade out.
 confidence ≥ 0.5 (`sightings / (sightings + 2·misses + 1)`). Only confirmed
 surfaces (or walls with ≥5 points) anchor registration.
 
+## Remembering places
+
+Code: `src/robocar/places.py`, wired into each stop by `mapping.py`.
+
+**Dim pictures.** Your first real run's pictures averaged 32–44 out of 255
+in brightness with very low contrast, and most yielded fewer than 40
+features. When a normal detection finds fewer than 300 corners, the picture
+is lightly blurred, contrast-equalized locally (CLAHE) and searched with a
+more sensitive detector. On those real pictures this roughly tripled good
+matches between stops. Well-exposed pictures are left alone, because the
+same treatment adds noisy corners to them. This applies to keyframes and to
+all camera motion estimates. Each stop also waits 0.3 s before its first
+picture so the car and head have stopped moving (one real picture was
+smeared).
+
+**Keyframes.** Every stop keeps the 400 strongest ORB features of its forward
+picture (with the pan angle it was taken at), alongside its sonar sweep and
+pose. They live in the `keyframes` table and are shared by all sessions.
+Older stops without keyframes get them from their saved pictures at start-up.
+
+**Recognition at each stop:**
+
+1. *Retrieval.* The new picture's descriptors vote across every stored
+   keyframe (brute-force Hamming matching in chunks, about 0.4 s for 400
+   places on the Pi 5). The best-voted places become candidates, excluding
+   the last four stops of the same run. Within one frame, a candidate must
+   also lie within 1.5 m (plus 3σ of pose uncertainty) of where the car
+   thinks it is.
+2. *Verification.* Each candidate is matched feature by feature and must fit
+   a camera motion with at least 30 RANSAC inliers. A pure turn is detected
+   when K⁻¹HK is a rotation (equal singular values). Views dominated by one
+   wall use homography decomposition, keeping the solution with points in
+   front and a vertical plane; otherwise the essential matrix is used. In
+   simulation this identifies places reliably but measures the turn between
+   views only to about ±15°, so the camera's turn is a starting point.
+3. *Metric alignment.* The new sweep is registered against a small surface
+   map rebuilt from the remembered place and its neighbouring stops (±3).
+   The fit starts from a spread of offsets (along the camera's direction,
+   plus a ring at 35 and 70 cm) and turns (±10° around the camera's
+   estimate). If two different offsets fit equally well, as in a long
+   corridor, the match is ignored.
+4. *Camera-only links.* With at least 80 inliers, the place nearby in the
+   same frame, and no usable sonar fit, the turn is kept with 8° and the
+   position with 50 cm uncertainty.
+
+**Pose graph.** Nodes are stops. Edges are the motion between consecutive
+stops (from the fused estimate, with its uncertainty; recorded as
+`estimate_json.edge`) and recognized places (`place_links` table).
+Gauss–Newton over SE(2) runs on the connected component, with its oldest stop
+fixed and Huber weighting on place links. After optimizing, any place link
+with χ² > 16.3 (99.9% for 3 dof) is dropped, worst first, and the graph is
+re-solved, so a false match cannot tear the map apart. After a successful
+recognition there's a two-stop pause before the next attempt, and at most
+two candidates per stop get the sonar alignment.
+
+**Sessions.** A new run starts in its own frame. When it recognizes a place
+from an earlier run, the run is moved rigidly into that run's frame and the
+graphs join. From then on its poses, the map (rebuilt from every joined
+session's sweeps at their optimized poses) and exploration's preference for
+unvisited ground all use the shared frame. If the joining link is later
+rejected, the move is undone. On start-up, the whole graph is rebuilt from the
+database and re-optimized, so the latest session reappears joined to
+everything it recognized.
+
+**Results in simulation** (3D-rendered textured room with parallax, plus the
+sonar room):
+
+- A second session starting 38 cm and 25° away from the first one's start
+  recognized it at its first stop. It placed itself within 4.4 cm and 1.7°,
+  then within 1.6 cm and 1.1° after its next sweep.
+- With per-stop sonar fits and camera motion disabled, and odometry 12% long
+  on distance and 10% long on turns, a rectangle round the room drifted to
+  27 cm and 27°. Returning to the start closed the loop, leaving the pose
+  within 2.8 cm and 0.6°.
+- A room with different wall textures was not mistaken for the remembered
+  one.
+
 ## Persistence and API
 
 - Each observation stores the raw sweep, the refined pose and the estimate
   record. On start-up the newest run's map is rebuilt by replaying its sweeps,
   so nothing derived needs migrating when the algorithms improve.
 - `GET /api/mapping/surfaces` returns surfaces, features, contours, recent
-  echoes, the path and the pose uncertainty. `/api/status` reports which
-  sources fixed the latest pose.
+  echoes, the path, earlier joined sessions' paths (`history`), recognized
+  place links (`links`) and the pose uncertainty. `/api/status` reports which
+  sources fixed the latest pose, the place-memory counts (`places`) and the
+  latest recognition (`last_place`).
+- **Reset mapping database** also clears keyframes and place links.
 
 ## Calibrate on the car
 
@@ -178,6 +258,13 @@ the dashboard draws it on the left.
   declines and the pose relies on wheels and camera for that stop.
 - Soft furnishings absorb sound, and very oblique smooth surfaces never echo.
   Expect gaps rather than false walls.
-- Runs are separate frames. Next steps: relocalize a new run against the
-  previous map (global registration search), close loops with a pose graph,
-  and let exploration aim for unexplained contour ends (frontiers).
+- Place recognition relies on visual texture. Bare walls or very dim light give
+  too few features, and the car then falls back to wheels, camera turns and
+  sonar alone. Large lighting changes between sessions weaken matching too.
+- A session that never sees a remembered place stays in its own frame until
+  it does.
+- The pose graph is solved densely. That's fine for a few hundred stops (about
+  0.3 s for 600), but a very long-lived house map would want a sparse solver or
+  pruning of redundant keyframes.
+- Next steps: let exploration aim for unexplained contour ends (frontiers),
+  and validate recognition on real pictures from the car.

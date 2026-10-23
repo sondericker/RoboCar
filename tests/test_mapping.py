@@ -19,6 +19,8 @@ from robocar.drive import (
     SimulatedPanTilt,
 )
 from robocar.mapping import (
+    AUTO_MAX_SEARCH_TURNS,
+    AUTO_MAX_TURN_DEGREES,
     SCAN_ANGLES,
     CameraMotionEstimate,
     MappingController,
@@ -30,6 +32,7 @@ from robocar.mapping import (
 )
 from robocar.localization import relative
 from robocar.range_sensor import RangeSensorController
+from camera_scene import PanoramaScene
 from sonar_room import SonarRoom
 
 
@@ -64,6 +67,7 @@ def fast_sweeps(test: unittest.TestCase) -> None:
         ("SCAN_FIRST_SETTLE_SECONDS", 0.01),
         ("SCAN_STEP_SETTLE_SECONDS", 0.002),
         ("SCAN_SAMPLE_INTERVAL_SECONDS", 0.001),
+    ("CAMERA_SETTLE_SECONDS", 0.0),
     ):
         patcher = patch(f"robocar.mapping.{name}", value)
         patcher.start()
@@ -571,11 +575,11 @@ class MappingTests(unittest.TestCase):
                             for command in movement_commands
                         )
                     )
-                    # Three bursts ahead, then a real look-around turn to the
-                    # open side's angle rather than a fixed nudge.
+                    # Three bursts ahead, then a look-around turn toward the
+                    # open side, kept to one small step.
                     self.assertEqual(
                         moves[:4],
-                        [("drive", 1.0), ("drive", 1.0), ("drive", 1.0), ("turn", -60.0)],
+                        [("drive", 1.0), ("drive", 1.0), ("drive", 1.0), ("turn", -AUTO_MAX_TURN_DEGREES)],
                     )
                     self.assertEqual(mapping.status()["mode"], "explore")
                     self.assertGreaterEqual(mapping.status()["move_count"], 3)
@@ -659,7 +663,8 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(clearances[-60.0], 50.0)
         self.assertEqual(clearances[48.0], 150.0)
         step = plan_explore_step(sides, (0.0, 0.0, 0.0), [], 0, 0, 0)
-        self.assertEqual((step.action, step.degrees), ("turn", 48.0))
+        # Toward the opening at 48 degrees, one small step at a time.
+        self.assertEqual((step.action, step.degrees), ("turn", AUTO_MAX_TURN_DEGREES))
 
     def test_boxed_in_corner_turns_to_search_instead_of_shuttling(self):
         # The first real sweep from the passage run: walls 48-66 cm all round.
@@ -677,9 +682,12 @@ class MappingTests(unittest.TestCase):
             closer, (0.0, 9.0, 45.0), [(0.0, 0.0, 0.0)], 0, 1, 0, search_sign=math.copysign(1, first.degrees)
         )
         self.assertEqual(second.degrees, first.degrees)  # keeps turning the same way
-        exhausted = plan_explore_step(closer, (0.0, 9.0, 0.0), [], 0, 4, 0)
+        exhausted = plan_explore_step(closer, (0.0, 9.0, 0.0), [], 0, AUTO_MAX_SEARCH_TURNS, 0)
         self.assertEqual(exhausted.action, "reverse")
-        self.assertEqual(plan_explore_step(closer, (0.0, 9.0, 0.0), [], 0, 4, 1).action, "blocked")
+        self.assertEqual(
+            plan_explore_step(closer, (0.0, 9.0, 0.0), [], 0, AUTO_MAX_SEARCH_TURNS, 1).action,
+            "blocked",
+        )
 
     def test_exploration_prefers_openings_away_from_where_it_has_been(self):
         scan = [
@@ -691,6 +699,65 @@ class MappingTests(unittest.TestCase):
         step = plan_explore_step(scan, (0.0, 0.0, 0.0), visited, 0, 0, 0)
         self.assertEqual(step.action, "turn")
         self.assertLess(step.degrees, 0)
+
+    def test_strip_of_pictures_measures_the_turn_actually_made(self):
+        scene = PanoramaScene()
+        for planned, actual in ((25, 25), (25, 33), (25, 70), (-25, -55)):
+            sign = 1 if planned >= 0 else -1
+            strip = {90 + sign * step: (scene.view(sign * step),) for step in range(0, 61, 10)}
+            current = (scene.view(actual), scene.view(actual))
+            self.assertAlmostEqual(MappingController._measure_turn(strip, current, 90), actual, delta=1.0)
+
+    def test_camera_aligns_a_turn_when_odometry_under_reads_it(self):
+        scene = PanoramaScene()
+        drive = DriveController(SimulatedDriver(), max_duty=4095, command_timeout=1, physical=True)
+        pan_driver = SimulatedPanTilt()
+        pan_tilt = PanTiltController(pan_driver, physical=True)
+
+        def true_heading() -> float:
+            # The real car turns 2.8 times as far as its odometry says,
+            # as when a planned 25-degree turn came out near 70 degrees.
+            return 2.8 * drive.odometry()[2]
+
+        class SceneCamera:
+            def capture_snapshot(self) -> bytes:
+                return scene.view(true_heading() + pan_driver.pan - 90)
+
+        range_sensor = RangeSensorController(None, physical=False)
+        mapping = MappingController(SceneCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")))
+        try:
+            with patch("robocar.mapping.AUTO_ALIGN_SETTLE_SECONDS", 0.001):
+                self.assertTrue(mapping._turn_and_align(25.0))
+            self.assertAlmostEqual(true_heading(), 25.0, delta=4.0)
+            self.assertAlmostEqual(mapping._verified_turn, true_heading(), delta=1.5)
+            self.assertEqual(pan_driver.pan, 90)
+            # The turn taught odometry that turns run long.
+            self.assertGreater(mapping._odometry_scale[1], 1.2)
+        finally:
+            mapping.close()
+            drive.close()
+            pan_tilt.close()
+            range_sensor.close()
+
+    def test_turn_without_usable_camera_views_relies_on_odometry(self):
+        drive = DriveController(SimulatedDriver(), max_duty=4095, command_timeout=1, physical=True)
+        pan_tilt = PanTiltController(SimulatedPanTilt(), physical=True)
+        range_sensor = RangeSensorController(None, physical=False)
+        mapping = MappingController(FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")))
+        turns: list[float] = []
+        try:
+            with (
+                patch("robocar.mapping.AUTO_ALIGN_SETTLE_SECONDS", 0.001),
+                patch.object(mapping, "_turn_by", side_effect=lambda degrees, *_: turns.append(degrees) or True),
+            ):
+                self.assertTrue(mapping._turn_and_align(-25.0))
+            self.assertEqual(turns, [-25.0])
+            self.assertIsNone(mapping._verified_turn)
+        finally:
+            mapping.close()
+            drive.close()
+            pan_tilt.close()
+            range_sensor.close()
 
     def test_turn_by_rotates_close_to_the_requested_angle(self):
         drive = DriveController(SimulatedDriver(), max_duty=4095, command_timeout=1, physical=True)

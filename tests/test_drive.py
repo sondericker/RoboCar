@@ -1,3 +1,4 @@
+import math
 import time
 import unittest
 
@@ -121,9 +122,10 @@ class DriveControllerTests(unittest.TestCase):
                     self.assertGreater(after[2] - before[2], 5)
                     self.assertAlmostEqual(after[1], before[1], delta=0.01)
                 else:
-                    # Positive strafe slides right; after the small left turn
-                    # that is still mostly +x.
-                    self.assertGreater(after[0] - before[0], 10)
+                    # Positive strafe slides to the car's right (+x in its own frame).
+                    heading = math.radians(before[2])
+                    dx, dy = after[0] - before[0], after[1] - before[1]
+                    self.assertGreater(math.cos(heading) * dx + math.sin(heading) * dy, 10)
         finally:
             drive.close()
 

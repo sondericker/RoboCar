@@ -239,6 +239,7 @@
       const bounds = [{x: 0, y: 0}];
       map.echoes.forEach(([x, y]) => bounds.push({x, y}));
       map.path.forEach(([x, y]) => bounds.push({x, y}));
+      map.history.forEach(path => path.forEach(([x, y]) => bounds.push({x, y})));
       map.surfaces.forEach(surface => bounds.push(
         {x: surface.start[0], y: surface.start[1]}, {x: surface.end[0], y: surface.end[1]}));
       map.features.forEach(feature => bounds.push({x: feature.position[0], y: feature.position[1]}));
@@ -293,6 +294,28 @@
         mapContext.fill();
       }
 
+      // Earlier sessions joined to this one by a recognized place.
+      mapContext.strokeStyle = "rgba(169, 232, 215, .3)";
+      mapContext.lineWidth = 1;
+      for (const path of map.history) {
+        mapContext.beginPath();
+        path.forEach((pose, index) => {
+          const point = toScreen(pose);
+          if (index === 0) mapContext.moveTo(point.x, point.y);
+          else mapContext.lineTo(point.x, point.y);
+        });
+        mapContext.stroke();
+      }
+      mapContext.strokeStyle = "#d58cf0";
+      mapContext.lineWidth = 1.5;
+      mapContext.setLineDash([4, 4]);
+      for (const [from, to] of map.links) {
+        const start = toScreen(from), end = toScreen(to);
+        mapContext.beginPath(); mapContext.moveTo(start.x, start.y); mapContext.lineTo(end.x, end.y); mapContext.stroke();
+        mapContext.fillStyle = "#d58cf0";
+        mapContext.beginPath(); mapContext.arc(start.x, start.y, 3, 0, Math.PI * 2); mapContext.fill();
+      }
+      mapContext.setLineDash([]);
       if (map.path.length) {
         mapContext.strokeStyle = "#a9e8d7";
         mapContext.lineWidth = 1.5;
@@ -329,7 +352,9 @@
         `(${confirmedSurfaces} confirmed) in ${map.contours.length} contours · ` +
         `${map.features.length} point features · ${map.scan_count} sweeps · beam ${map.beam_width_deg}° · ` +
         `pose ±${map.pose_sigma_cm.toFixed(1)} cm, ±${map.heading_sigma_deg.toFixed(1)}°. ` +
-        "Solid = confirmed, dashed = seen once, dots = raw echoes.";
+        (map.history.length ? `${map.history.length} earlier session(s) joined · ` : "") +
+        (map.links.length ? `${map.links.length} recognized place(s) · ` : "") +
+        "Solid = confirmed, dashed = seen once, dots = raw echoes, purple = recognized places.";
     }
     function drawScan(observation) {
       const {width, height} = prepareMapCanvas();
@@ -383,8 +408,14 @@
       const sources = ["wheels"];
       if (last?.visual_used) sources.push(last.side_views ? "camera + side views" : "camera");
       if (last?.registration?.accepted) sources.push(`sonar fit (${last.registration.matches} echoes)`);
+      const place = mapping.last_place;
+      const recognized = place
+        ? ` · recognized ${place.kind === "relocalized" ? "a place from an earlier session" : "a place visited before"}` +
+          ` (moved ${Math.hypot(place.correction[0], place.correction[1]).toFixed(0)} cm)`
+        : "";
       return `pose from ${sources.join(" + ")} · ±${mapping.pose_sigma_cm} cm · ` +
-        `${mapping.surface_count} surfaces, ${mapping.feature_count} features`;
+        `${mapping.surface_count} surfaces, ${mapping.feature_count} features · ` +
+        `${mapping.places.places} remembered places${recognized}`;
     }
     function updateMappingControls(mapping) {
       mappingToggle.textContent = mapping.enabled

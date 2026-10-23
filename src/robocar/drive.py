@@ -18,7 +18,9 @@ FULL_MOTOR_DUTY = 4095
 MOTOR_DEADBAND_FRACTION = 0.1
 FORWARD_CM_PER_SECOND_AT_FULL_DUTY = 121.9
 STRAFE_CM_PER_SECOND_AT_FULL_DUTY = 97.5
-TURN_DEGREES_PER_SECOND_AT_FULL_DUTY = 48.0
+# Raised 8x from the first guess of 48 after closed-loop turns on the car
+# overshot by roughly that factor (a planned turn came out near 270 degrees).
+TURN_DEGREES_PER_SECOND_AT_FULL_DUTY = 384.0
 
 
 class MotorDriver(Protocol):
