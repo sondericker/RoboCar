@@ -8,6 +8,14 @@ from pathlib import Path
 from typing import Protocol
 
 logger = logging.getLogger(__name__)
+# gpiozero's DistanceSensor pings every 0.06 s in the background and reports
+# the median of its last `queue_len` pings. Freenove leaves that at 9 (about
+# half a second), so readings taken right after the head moved still mixed in
+# earlier directions and smeared each sweep. Three pings keep a median but
+# refresh within about 0.2 s.
+GPIOZERO_PING_SECONDS = 0.06
+RANGE_QUEUE_LENGTH = 3
+GPIOZERO_DEFAULT_QUEUE_LENGTH = 9
 
 
 class RangeSensor(Protocol):
@@ -30,6 +38,41 @@ class FreenoveRangeSensor:
             sys.path.remove(str(server_path))
             raise
         self._server_path = str(server_path)
+        self.queue_length = self._shorten_smoothing()
+
+    def _shorten_smoothing(self) -> int:
+        """Rebuild the kit's DistanceSensor with a short median; returns the queue length in use."""
+        device = getattr(self._sensor, "sensor", None)
+        try:
+            gpiozero = importlib.import_module("gpiozero")
+            pins = (self._sensor.echo_pin, self._sensor.trigger_pin, self._sensor.max_distance)
+        except (ImportError, AttributeError):
+            return GPIOZERO_DEFAULT_QUEUE_LENGTH
+        if device is None:
+            return GPIOZERO_DEFAULT_QUEUE_LENGTH
+        echo, trigger, max_distance = pins
+        try:
+            device.close()
+            self._sensor.sensor = gpiozero.DistanceSensor(
+                echo=echo,
+                trigger=trigger,
+                max_distance=max_distance,
+                queue_len=RANGE_QUEUE_LENGTH,
+                partial=True,
+            )
+            return RANGE_QUEUE_LENGTH
+        except Exception as exc:
+            logger.warning("Could not shorten ultrasonic smoothing (%s); sweeps will wait longer", exc)
+            try:
+                self._sensor.sensor = gpiozero.DistanceSensor(echo=echo, trigger=trigger, max_distance=max_distance)
+            except Exception:
+                logger.exception("Could not restore the ultrasonic sensor")
+            return GPIOZERO_DEFAULT_QUEUE_LENGTH
+
+    @property
+    def settle_seconds(self) -> float:
+        """Time after pointing elsewhere until a reading reflects only the new direction."""
+        return self.queue_length * GPIOZERO_PING_SECONDS + 0.02
 
     def get_distance(self) -> float | None:
         return self._sensor.get_distance()
@@ -68,6 +111,11 @@ class RangeSensorController:
                 daemon=True,
             )
             self._sampler.start()
+
+    @property
+    def settle_seconds(self) -> float:
+        """How long readings lag a change of direction (0 for drivers that ping on request)."""
+        return float(getattr(self._driver, "settle_seconds", 0.0))
 
     def status(self) -> dict[str, object]:
         with self._lock:

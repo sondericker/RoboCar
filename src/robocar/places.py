@@ -41,7 +41,7 @@ KEYFRAME_KEEP_FEATURES = 400
 KEYFRAME_MIN_FEATURES = 40
 RETRIEVAL_MAX_DISTANCE = 48
 RETRIEVAL_MIN_VOTES = 15
-RETRIEVAL_CANDIDATES = 4
+RETRIEVAL_CANDIDATES = 8
 RETRIEVAL_CHUNK_ROWS = 200_000
 VERIFY_RATIO = 0.8
 VERIFY_MIN_INLIERS = 30
@@ -61,11 +61,21 @@ METRIC_GRID_DISTANCES_CM = (35.0, 70.0)
 METRIC_PRIOR_SIGMA = (25.0, 25.0, 6.0)
 METRIC_AMBIGUITY_CM = 25.0
 METRIC_ATTEMPTS_PER_STOP = 2
-CAMERA_ONLY_MIN_INLIERS = 80
-CAMERA_ONLY_POSITION_SIGMA_CM = 50.0
-CAMERA_ONLY_YAW_SIGMA_DEGREES = 8.0
-# After recognizing a place, skip a couple of stops before trying again.
+# After a full (sonar-confirmed) closure, skip a couple of stops before
+# trying the costly sonar alignment again; heading checks continue.
 CLOSURE_COOLDOWN_STOPS = 2
+# Every stop is also compared with nearby earlier stops that faced a similar
+# way, not only those the descriptor vote found.
+VIEW_NEIGHBOUR_RADIUS_CM = 120.0
+VIEW_NEIGHBOUR_HEADING_DEGREES = 50.0
+VIEW_NEIGHBOURS = 4
+VIEW_VERIFY_LIMIT = 8
+# Verified matches without a sonar fit constrain the heading only: tightly for
+# a pure turn (which the camera measures well), loosely otherwise.
+VIEW_PURE_TURN_SIGMA_DEGREES = 2.5
+VIEW_MOVED_SIGMA_DEGREES = 8.0
+VIEW_FREE_POSITION_SIGMA_CM = 1000.0
+PLACE_EDGE_KINDS = ("loop", "view")
 # 99.9% chi-square bound for three degrees of freedom.
 LOOP_REJECT_CHI2 = 16.3
 DEFAULT_EDGE_SIGMA = (3.0, 3.0, 2.0)
@@ -372,7 +382,7 @@ class PoseGraph:
                 target_jacobian[:2, :2] = rotation_t
                 target_jacobian[2, 2] = 1.0
                 information = edge.information
-                if edge.kind == "loop":
+                if edge.kind in PLACE_EDGE_KINDS:
                     # Huber weighting keeps one bad place match from tearing the graph.
                     chi = math.sqrt(max(float(error @ information @ error), 0.0))
                     if chi > 3.0:
@@ -398,7 +408,9 @@ class PoseGraph:
         rejected: list[GraphEdge] = []
         while True:
             loops = [
-                edge for edge in self.edges if edge.kind == "loop" and edge.source in component and edge.target in component
+                edge
+                for edge in self.edges
+                if edge.kind in PLACE_EDGE_KINDS and edge.source in component and edge.target in component
             ]
             worst = max(loops, key=self.edge_chi2, default=None)
             if worst is None or self.edge_chi2(worst) <= LOOP_REJECT_CHI2:
@@ -431,6 +443,16 @@ class PlaceEvent:
             "inliers": self.inliers,
             "sonar_aligned": self.metric,
         }
+
+
+@dataclass(frozen=True)
+class StopUpdate:
+    """What remembering a stop changed."""
+
+    event: PlaceEvent | None
+    views: int
+    moved_cm: float
+    moved_deg: float
 
 
 class PlaceStore:
@@ -519,7 +541,7 @@ class PlaceMemory:
                         int(link["target"]),
                         tuple(link["delta"]),
                         information_from_sigma(link["sigma"]),
-                        "loop",
+                        "view" if link["kind"] == "view" else "loop",
                         int(link["id"]),
                     )
                 )
@@ -541,26 +563,25 @@ class PlaceMemory:
         pose_sigma: tuple[float, float],
         keyframe: Keyframe | None,
         edge: tuple[int, Pose, Sequence[float]] | None,
-    ) -> PlaceEvent | None:
-        """Remember a stop, then try to recognize where it is."""
+    ) -> StopUpdate:
+        """Remember a stop, then localize it against every relevant past picture."""
         self._add_stop(node, run_id, pose, scan, pose_sigma)
         if edge is not None and edge[0] in self.graph.nodes:
             self.graph.add_edge(GraphEdge(edge[0], node, edge[1], information_from_sigma(edge[2]), "odometry"))
         self.last_event = None
         if keyframe is None:
-            return None
-        sequence = self._stops[node].sequence
-        cooling = sequence - self._last_closure.get(run_id, -10_000) <= CLOSURE_COOLDOWN_STOPS
+            return StopUpdate(None, 0, 0.0, 0.0)
         try:
-            event = None if cooling else self._recognize(node, keyframe, pose_sigma[0])
+            update = self._localize(node, keyframe, pose_sigma[0])
         finally:
             self.recognizer.add(keyframe)
-        if event is not None:
-            self._last_closure[run_id] = sequence
-        self.last_event = event
-        return event
+        if update.event is not None and update.event.metric:
+            self._last_closure[run_id] = self._stops[node].sequence
+        self.last_event = update.event
+        return update
 
-    def _recognize(self, node: int, keyframe: Keyframe, position_sigma: float) -> PlaceEvent | None:
+    def _candidates(self, node: int, keyframe: Keyframe, position_sigma: float) -> list[Keyframe]:
+        """Descriptor-vote matches from every session, then nearby stops facing a similar way."""
         stop = self._stops[node]
         component = self.graph.component(node)
         pose = self.graph.nodes[node]
@@ -569,37 +590,98 @@ class PlaceMemory:
             other = self._stops.get(candidate.observation_id)
             if other is None or candidate.observation_id not in self.graph.nodes:
                 return False
-            if other.run_id == stop.run_id and stop.sequence - other.sequence <= RECENT_STOPS_EXCLUDED:
-                return False
+            if other.run_id == stop.run_id and stop.sequence - other.sequence <= 1:
+                return False  # the previous stop is already compared directly
             if candidate.observation_id in component:
                 # Within one frame, a remembered place must be plausibly near.
                 place = self.graph.nodes[candidate.observation_id]
                 return math.hypot(place[0] - pose[0], place[1] - pose[1]) <= LOOP_SEARCH_RADIUS_CM + 3 * position_sigma
             return True
 
-        attempts = 0
-        for candidate, _ in self.recognizer.candidates(keyframe, allowed):
-            if attempts >= METRIC_ATTEMPTS_PER_STOP:
-                break
+        chosen = [candidate for candidate, _ in self.recognizer.candidates(keyframe, allowed)]
+        nearby = sorted(
+            (
+                (math.hypot(self.graph.nodes[other][0] - pose[0], self.graph.nodes[other][1] - pose[1]), other)
+                for other in component
+                if other in self.recognizer.keyframes
+                and other != node
+                and allowed(self.recognizer.keyframes[other])
+                and abs(wrap_degrees(self.graph.nodes[other][2] - pose[2])) <= VIEW_NEIGHBOUR_HEADING_DEGREES
+            )
+        )
+        for distance, other in nearby[:VIEW_NEIGHBOURS]:
+            if distance <= VIEW_NEIGHBOUR_RADIUS_CM and all(keyframe.observation_id != other for keyframe in chosen):
+                chosen.append(self.recognizer.keyframes[other])
+        return chosen[:VIEW_VERIFY_LIMIT]
+
+    def _localize(self, node: int, keyframe: Keyframe, position_sigma: float) -> StopUpdate:
+        stop = self._stops[node]
+        before = dict(self.graph.nodes)
+        cooling = stop.sequence - self._last_closure.get(stop.run_id, -10_000) <= CLOSURE_COOLDOWN_STOPS
+        event: PlaceEvent | None = None
+        metric_attempts = 0
+        batched: list[tuple[GraphEdge, tuple[float, float, float], int, str]] = []
+        for candidate in self._candidates(node, keyframe, position_sigma):
             match = verify_place(candidate, keyframe)
             if match is None:
                 continue
-            attempts += 1
-            same_frame = candidate.observation_id in component
-            measured = self._metric_relative(candidate.observation_id, stop.scan, match)
-            if measured is None:
-                if not same_frame or match.inliers < CAMERA_ONLY_MIN_INLIERS:
-                    continue
-                # Strongly matching pictures from nearby in the same frame: trust
-                # the turn, and hold the position loosely to the remembered spot.
-                delta = (0.0, 0.0, match.yaw_deg)
-                sigma = (CAMERA_ONLY_POSITION_SIGMA_CM, CAMERA_ONLY_POSITION_SIGMA_CM, CAMERA_ONLY_YAW_SIGMA_DEGREES)
-            else:
+            place = candidate.observation_id
+            same_frame = place in self.graph.component(node)
+            other = self._stops[place]
+            recent = other.run_id == stop.run_id and stop.sequence - other.sequence <= RECENT_STOPS_EXCLUDED
+            measured = None
+            if metric_attempts < METRIC_ATTEMPTS_PER_STOP and not recent and not (same_frame and cooling):
+                metric_attempts += 1
+                measured = self._metric_relative(place, stop.scan, match)
+            if not same_frame:
+                if measured is not None and event is None:
+                    # A place from another session: join it (adds and settles the edge).
+                    event = self._close(node, place, measured[0], measured[1], match.inliers, True)
+                continue
+            if measured is not None:
                 delta, sigma = measured
-            event = self._close(node, candidate.observation_id, delta, sigma, match.inliers, measured is not None)
-            if event is not None:
-                return event
-        return None
+                kind = "loop"
+            else:
+                # Heading only: keep the position where the graph has it.
+                current = relative(self.graph.nodes[place], self.graph.nodes[node])
+                delta = (current[0], current[1], match.yaw_deg)
+                heading_sigma = VIEW_PURE_TURN_SIGMA_DEGREES if match.bearing_deg is None else VIEW_MOVED_SIGMA_DEGREES
+                sigma = (VIEW_FREE_POSITION_SIGMA_CM, VIEW_FREE_POSITION_SIGMA_CM, heading_sigma)
+                kind = "view"
+            graph_edge = GraphEdge(place, node, tuple(float(value) for value in delta), information_from_sigma(sigma), kind)
+            self.graph.add_edge(graph_edge)
+            batched.append((graph_edge, sigma, match.inliers, kind))
+        if batched:
+            rejected = self._settle(self.graph.component(node))
+            for graph_edge, sigma, inliers, kind in batched:
+                if graph_edge in rejected:
+                    continue
+                graph_edge.link_id = self._store.save_link(
+                    graph_edge.source, graph_edge.target, graph_edge.delta, sigma, kind, inliers
+                )
+                if kind == "loop" and event is None:
+                    after = self.graph.nodes[node]
+                    event = PlaceEvent(
+                        "loop",
+                        node,
+                        graph_edge.source,
+                        self._stops[graph_edge.source].run_id,
+                        (after[0] - before[node][0], after[1] - before[node][1], wrap_degrees(after[2] - before[node][2])),
+                        inliers,
+                        True,
+                        graph_edge.link_id,
+                        sigma,
+                    )
+        views = sum(1 for graph_edge, _, _, kind in batched if kind == "view" and graph_edge in self.graph.edges)
+        moved_cm = max(
+            (math.hypot(pose[0] - before[other][0], pose[1] - before[other][1]) for other, pose in self.graph.nodes.items() if other in before),
+            default=0.0,
+        )
+        moved_deg = max(
+            (abs(wrap_degrees(pose[2] - before[other][2])) for other, pose in self.graph.nodes.items() if other in before),
+            default=0.0,
+        )
+        return StopUpdate(event, views, moved_cm, moved_deg)
 
     def _metric_relative(
         self,
@@ -736,6 +818,7 @@ class PlaceMemory:
         return {
             "places": len(self.recognizer.keyframes),
             "links": sum(1 for edge in self.graph.edges if edge.kind == "loop"),
+            "views": sum(1 for edge in self.graph.edges if edge.kind == "view"),
             "sessions": len(self._run_lengths),
         }
 

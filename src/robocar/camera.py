@@ -55,7 +55,9 @@ class CameraService:
             camera = picamera2.Picamera2()
             camera.configure(
                 camera.create_video_configuration(
-                    main={"format": "BGR888", "size": (self._width, self._height)}
+                    # Picamera2's "RGB888" is stored B, G, R: the order OpenCV
+                    # expects. ("BGR888" swapped red and blue in every frame.)
+                    main={"format": "RGB888", "size": (self._width, self._height)}
                 )
             )
             camera.start()

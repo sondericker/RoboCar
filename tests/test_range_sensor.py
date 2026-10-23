@@ -1,5 +1,6 @@
 import time
 import unittest
+import unittest.mock
 
 from robocar.range_sensor import RangeSensorController
 
@@ -73,3 +74,52 @@ class RangeSensorControllerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SmoothingTests(unittest.TestCase):
+    def test_kit_sensor_is_rebuilt_with_a_short_median(self):
+        import sys
+        import tempfile
+        import types
+        from pathlib import Path
+
+        from robocar.range_sensor import RANGE_QUEUE_LENGTH, FreenoveRangeSensor
+
+        created = []
+
+        class DistanceSensor:
+            def __init__(self, echo, trigger, max_distance=1, queue_len=9, partial=False):
+                self.arguments = (echo, trigger, max_distance, queue_len, partial)
+                self.closed = False
+                created.append(self)
+                self.distance = 0.5
+
+            def close(self):
+                self.closed = True
+
+        class Ultrasonic:
+            def __init__(self):
+                self.echo_pin, self.trigger_pin, self.max_distance = 22, 27, 3.0
+                self.sensor = DistanceSensor(22, 27, 3.0)
+
+            def get_distance(self):
+                return round(self.sensor.distance * 100, 1)
+
+            def close(self):
+                self.sensor.close()
+
+        with tempfile.TemporaryDirectory() as directory, unittest.mock.patch.dict(
+            sys.modules,
+            {
+                "ultrasonic": types.SimpleNamespace(Ultrasonic=Ultrasonic),
+                "gpiozero": types.SimpleNamespace(DistanceSensor=DistanceSensor),
+            },
+        ):
+            sensor = FreenoveRangeSensor(Path(directory))
+            try:
+                self.assertTrue(created[0].closed)
+                self.assertEqual(created[1].arguments, (22, 27, 3.0, RANGE_QUEUE_LENGTH, True))
+                self.assertAlmostEqual(sensor.settle_seconds, RANGE_QUEUE_LENGTH * 0.06 + 0.02)
+                self.assertEqual(sensor.get_distance(), 50.0)
+            finally:
+                sensor.close()

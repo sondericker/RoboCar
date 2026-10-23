@@ -16,7 +16,15 @@ from typing import Callable, Protocol, Sequence
 import cv2
 import numpy as np
 
-from robocar.drive import MOTOR_RAMP_SECONDS, TURN_DEGREES_PER_SECOND_AT_FULL_DUTY, DriveController
+from robocar.calibration import Calibration, CalibrationStore, run_calibration
+from robocar.drive import (
+    FORWARD_CM_PER_SECOND_AT_FULL_DUTY,
+    MOTOR_DEADBAND_FRACTION,
+    MOTOR_RAMP_SECONDS,
+    TURN_DEGREES_PER_SECOND_AT_FULL_DUTY,
+    DriveController,
+)
+from robocar.exploration import CoverageGrid
 from robocar.localization import (
     MotionPrediction,
     Pose,
@@ -63,10 +71,24 @@ AUTO_MAX_MOVES = 60
 AUTO_MIN_CLEARANCE_CM = 60.0
 AUTO_FORWARD_COMMAND = 1.0
 AUTO_FORWARD_SECONDS = 0.25
+# With a motion calibration, each exploration step is sized to this distance.
+AUTO_STEP_CM = 25.0
 AUTO_TURN_COMMAND = 1.0
-# A leg drives forward until the open space ahead ends, but no further than this.
-AUTO_LEG_BURSTS = 6
 AUTO_MAX_BACKUP_BURSTS = 1
+# Head for the next waypoint once within this angle of it.
+AUTO_HEADING_TOLERANCE_DEGREES = 15.0
+# A needed turn larger than this continues to the right instead of reversing,
+# so the car keeps sweeping round the room the same way.
+AUTO_RIGHT_HAND_LIMIT_DEGREES = 135.0
+# When the sonar blocks a waypoint within this angle of ahead, pick another.
+AUTO_BLOCKED_CONE_DEGREES = 25.0
+# With no reachable frontier, look round this many turns before calling it explored.
+AUTO_LOOK_AROUND_TURNS = 4
+# Turns made just to look (or toward something far round) are bigger: a sweep
+# covers about 114 degrees, and the camera strip can still check 50.
+AUTO_LOOK_TURN_DEGREES = 50.0
+# Targets nearer straight ahead than this are approached in fine 25-degree steps.
+AUTO_FINE_TURN_LIMIT_DEGREES = 40.0
 # Turns are closed-loop on wheel odometry and kept small; a larger change of
 # direction happens over several stops, with a fresh sweep after each.
 AUTO_MAX_TURN_DEGREES = 25.0
@@ -89,19 +111,17 @@ AUTO_ALIGN_PLAUSIBLE_RATIO = (0.5, 2.0)
 AUTO_ALIGN_MAX_CORRECTION_DEGREES = 20.0
 AUTO_ALIGN_FRAMES = 2
 AUTO_ALIGN_SETTLE_SECONDS = 0.15
+AUTO_VIEW_STEADY_TIMEOUT_SECONDS = 1.0
 PAN_LIMITS = (30, 150)
 AUTO_TURN_MIN_CLEARANCE_CM = 25.0
-AUTO_GOAL_TOLERANCE_DEGREES = 10.0
-# About 300 degrees of turning without finding a way forward, then back up.
+# About 400 degrees of turning without finding a way forward, then back up.
 AUTO_MAX_TURNS_WITHOUT_PROGRESS = 12
-# Choosing the next zone: unexplored ground scores higher, and directions
-# outside the sweep are worth a look unless a nearby sweep already covered them.
-AUTO_NOVELTY_LOOKAHEAD_CM = 80.0
-AUTO_UNSWEPT_DIRECTIONS_DEGREES = (-150.0, -105.0, -75.0, 75.0, 105.0, 150.0, 180.0)
-AUTO_UNKNOWN_CLEARANCE_SCORE = 40.0
-AUTO_SWEPT_RADIUS_CM = 40.0
-AUTO_SWEEP_HALF_WIDTH_DEGREES = 55.0
 CAMERA_MOTION_FRAME_COUNT = 3
+# When the pose graph moves any stop by more than this, the map is rebuilt
+# from every sweep at its corrected pose.
+MAP_REBUILD_MOVE_CM = 4.0
+MAP_REBUILD_TURN_DEG = 2.0
+VIEW_HEADING_SIGMA_AFTER_MATCH = 3.0
 # Exposure settings tried for each stop's picture, darkest to brightest:
 # auto-exposure with compensation, then long manual exposures with gain.
 EXPOSURE_LADDER = (
@@ -111,14 +131,26 @@ EXPOSURE_LADDER = (
     {"ev": 2.0},
     {"ev": 3.0},
     {"ev": 4.0},
-    {"exposure_us": 50_000, "gain": 6.0},
-    {"exposure_us": 90_000, "gain": 8.0},
+    # Kept short: a 90 ms exposure right after a move came out smeared.
+    {"exposure_us": 33_000, "gain": 8.0},
+    {"exposure_us": 50_000, "gain": 12.0},
 )
 EXPOSURE_START_INDEX = 1
 EXPOSURE_MAX_ATTEMPTS = 5
 PICTURE_BRIGHTNESS_RANGE = (70.0, 170.0)
-PICTURE_MAX_CLIPPED = 0.05
+# Some clipping is unavoidable with dark shelves and bright windows in one
+# view; only chase it when it clearly dominates one end.
+PICTURE_DARK_CLIPPED_LIMIT = 0.25
+PICTURE_BRIGHT_CLIPPED_LIMIT = 0.08
 PICTURE_GOOD_FEATURES = 300
+# Variance of the Laplacian: sharp real pictures scored 30-170, a smeared one 2.
+PICTURE_MIN_SHARPNESS = 20.0
+PICTURE_SHARP_REFERENCE = 60.0
+# Before keeping a picture, take quick frames until two in a row match, so
+# the car and head have stopped moving.
+CAMERA_STEADY_DIFFERENCE = 2.5
+CAMERA_STEADY_TIMEOUT_SECONDS = 2.0
+CAMERA_STEADY_INTERVAL_SECONDS = 0.1
 # Dim real pictures produced confident-looking nonsense (136 degree "turns"
 # while driving straight) from a handful of matches; demand real support.
 CAMERA_MIN_MATCHES = 25
@@ -323,27 +355,42 @@ class PictureQuality:
     clipped_dark: float
     clipped_bright: float
     features: int
+    sharpness: float = PICTURE_SHARP_REFERENCE
 
     @property
     def too_dark(self) -> bool:
-        return self.brightness < PICTURE_BRIGHTNESS_RANGE[0] or self.clipped_dark > PICTURE_MAX_CLIPPED
+        return self.brightness < PICTURE_BRIGHTNESS_RANGE[0] or (
+            self.clipped_dark > PICTURE_DARK_CLIPPED_LIMIT and self.clipped_bright < 0.02
+        )
 
     @property
     def too_bright(self) -> bool:
-        return self.brightness > PICTURE_BRIGHTNESS_RANGE[1] or self.clipped_bright > PICTURE_MAX_CLIPPED
+        return self.brightness > PICTURE_BRIGHTNESS_RANGE[1] or (
+            self.clipped_bright > PICTURE_BRIGHT_CLIPPED_LIMIT and self.clipped_dark < 0.10
+        )
+
+    @property
+    def blurred(self) -> bool:
+        return self.sharpness < PICTURE_MIN_SHARPNESS
 
     @property
     def decent(self) -> bool:
-        return not self.too_dark and not self.too_bright and self.features >= PICTURE_GOOD_FEATURES
+        return (
+            not self.too_dark
+            and not self.too_bright
+            and not self.blurred
+            and self.features >= PICTURE_GOOD_FEATURES
+        )
 
     @property
     def score(self) -> float:
         low, high = PICTURE_BRIGHTNESS_RANGE
         outside = max(0.0, low - self.brightness, self.brightness - high)
         exposure = math.exp(-((outside / 40.0) ** 2))
-        # Usable detail first; between pictures with equally little detail,
-        # the better-exposed one wins.
-        return self.features * (1.0 - self.clipped_dark - self.clipped_bright) * exposure + exposure
+        sharp = min(1.0, self.sharpness / PICTURE_SHARP_REFERENCE)
+        # Usable, sharp detail first; between pictures with equally little
+        # detail, the better-exposed one wins.
+        return self.features * (1.0 - self.clipped_dark - self.clipped_bright) * exposure * sharp + exposure
 
     def summary(self) -> dict[str, object]:
         return {
@@ -351,6 +398,7 @@ class PictureQuality:
             "contrast": round(self.contrast, 1),
             "clipped": round(self.clipped_dark + self.clipped_bright, 3),
             "features": self.features,
+            "sharpness": round(self.sharpness, 1),
             "decent": self.decent,
         }
 
@@ -366,7 +414,17 @@ def assess_picture(jpeg: bytes) -> PictureQuality | None:
         float((image <= 4).mean()),
         float((image >= 251).mean()),
         len(cv2.ORB_create(nfeatures=500).detect(image, None)),
+        float(cv2.Laplacian(image, cv2.CV_64F).var()),
     )
+
+
+def _steadiness_frame(jpeg: bytes | None) -> np.ndarray | None:
+    if jpeg is None:
+        return None
+    image = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        return None
+    return cv2.GaussianBlur(cv2.resize(image, (160, 120), interpolation=cv2.INTER_AREA), (0, 0), 1.0).astype(np.float32)
 
 
 def exposure_label(setting: dict[str, float]) -> str:
@@ -512,6 +570,10 @@ class MappingStore:
                 ),
             )
             return int(cursor.lastrowid)
+
+    @property
+    def path(self) -> Path:
+        return self._path
 
     def ensure_capacity(self) -> None:
         if str(self._path) != ":memory:":
@@ -737,104 +799,131 @@ def direction_clearances(scan: Sequence[dict[str, object]]) -> dict[float, float
 
 @dataclass(frozen=True)
 class ExploreStep:
-    action: str  # "forward", "turn", "reverse" or "blocked"
+    action: str  # "forward", "turn", "reverse", "blocked" or "done"
     degrees: float = 0.0
     reason: str = ""
-    # World heading of the zone being turned toward, kept across stops.
-    goal_heading: float | None = None
-
-
-def _novelty(pose: Sequence[float], angle: float, visited: Sequence[Sequence[float]]) -> float:
-    """How far the spot ahead in this direction is from anywhere already visited."""
-    target = np.array(pose[:2], dtype=float) + AUTO_NOVELTY_LOOKAHEAD_CM * direction(float(pose[2]) + angle)
-    if not visited:
-        return AUTO_NOVELTY_LOOKAHEAD_CM
-    nearest = min(float(np.linalg.norm(target - np.array(point[:2], dtype=float))) for point in visited)
-    return min(AUTO_NOVELTY_LOOKAHEAD_CM, nearest)
-
-
-def _already_swept(pose: Sequence[float], angle: float, visited: Sequence[Sequence[float]]) -> bool:
-    """Whether a sweep from near here already covered this direction."""
-    heading = float(pose[2]) + angle
-    return any(
-        math.hypot(point[0] - pose[0], point[1] - pose[1]) <= AUTO_SWEPT_RADIUS_CM
-        and abs(wrap_degrees(heading - float(point[2]))) <= AUTO_SWEEP_HALF_WIDTH_DEGREES
-        for point in visited
-        if len(point) > 2
-    )
-
-
-def choose_new_zone(
-    scan: Sequence[dict[str, object]],
-    pose: Sequence[float],
-    visited: Sequence[Sequence[float]],
-) -> float | None:
-    """Pick the direction (degrees from the current heading) to map next.
-
-    Swept directions count with their measured clearance; directions outside
-    the sweep (beside and behind) are unknown and worth a look unless a sweep
-    from nearby already covered them. Unexplored ground scores higher.
-    """
-    clearances = direction_clearances(scan)
-    options: list[tuple[float, float]] = []
-    for angle, clearance in sorted(clearances.items()):
-        if abs(angle) >= SIDE_MIN_ANGLE_DEGREES and clearance >= AUTO_MIN_CLEARANCE_CM + 20:
-            options.append((0.5 * min(clearance, 200.0) + _novelty(pose, angle, visited), angle))
-    for angle in AUTO_UNSWEPT_DIRECTIONS_DEGREES:
-        if not _already_swept(pose, angle, visited):
-            options.append((AUTO_UNKNOWN_CLEARANCE_SCORE + _novelty(pose, angle, visited), angle))
-    if not options:
-        return None
-    return max(options, key=lambda option: option[0])[1]
+    target: tuple[float, float] | None = None
 
 
 def plan_explore_step(
     scan: Sequence[dict[str, object]],
     pose: Sequence[float],
-    visited: Sequence[Sequence[float]],
-    leg_bursts: int,
+    grid: CoverageGrid,
     turns_without_progress: int,
     backup_bursts: int,
-    goal_heading: float | None = None,
     just_backed_up: bool = False,
+    previous_target: Sequence[float] | None = None,
 ) -> ExploreStep:
-    """Decide the next autonomous move from the latest sweep (counterclockwise degrees).
+    """Decide the next autonomous move: one step toward the best frontier.
 
-    The car drives legs: forward until the open space ends (or a leg limit),
-    then it picks a new zone and rotates toward it over several stops,
-    sweeping at each, before starting the next leg.
+    The coverage grid holds everything every sweep has seen, so the car keeps
+    heading for the edges of what is mapped rather than re-mapping surfaces
+    it already knows. The sonar sweep has the final say on driving forward.
     """
     ahead = forward_clearance(scan)
     clearances = direction_clearances(scan)
     # Right after backing out of a dead end, never drive straight back in.
     ahead_clear = ahead is not None and ahead >= AUTO_MIN_CLEARANCE_CM and not just_backed_up
     can_turn = bool(clearances) and min(clearances.values()) >= AUTO_TURN_MIN_CLEARANCE_CM
+    turning_allowed = can_turn and turns_without_progress < AUTO_MAX_TURNS_WITHOUT_PROGRESS
 
-    def turn_toward(goal: float, reason: str) -> ExploreStep:
-        remaining = wrap_degrees(goal - float(pose[2]))
-        degrees = max(-AUTO_MAX_TURN_DEGREES, min(AUTO_MAX_TURN_DEGREES, remaining))
-        return ExploreStep("turn", degrees, reason, goal)
+    waypoint = grid.next_waypoint(pose, previous_target=previous_target)
+    if waypoint is None:
+        if turning_allowed and turns_without_progress < AUTO_LOOK_AROUND_TURNS:
+            return ExploreStep("turn", -AUTO_LOOK_TURN_DEGREES, "no unexplored edge in reach yet; turning right to look")
+        if can_turn or ahead_clear:
+            return ExploreStep("done", reason="no unexplored edges left within reach")
+        if backup_bursts < AUTO_MAX_BACKUP_BURSTS and not just_backed_up:
+            return ExploreStep("reverse", reason="too close to turn; backing up once")
+        return ExploreStep("blocked", reason="no safe path after looking all around")
+    if not ahead_clear and abs(waypoint.bearing_deg) <= AUTO_BLOCKED_CONE_DEGREES:
+        waypoint = grid.next_waypoint(pose, avoid_within_deg=AUTO_BLOCKED_CONE_DEGREES) or waypoint
+    bearing = waypoint.bearing_deg
+    target = waypoint.frontier.target
+    where = f"unexplored edge {waypoint.frontier.path_cm:.0f} cm away"
 
-    if goal_heading is not None:
-        remaining = wrap_degrees(goal_heading - float(pose[2]))
-        if abs(remaining) > AUTO_GOAL_TOLERANCE_DEGREES and can_turn and turns_without_progress < AUTO_MAX_TURNS_WITHOUT_PROGRESS:
-            return turn_toward(goal_heading, f"turning toward a new zone ({remaining:+.0f}° to go)")
-        if abs(remaining) <= AUTO_GOAL_TOLERANCE_DEGREES:
-            leg_bursts = 0  # facing the new zone: a fresh leg starts here
-
-    if ahead_clear and leg_bursts < AUTO_LEG_BURSTS:
-        return ExploreStep("forward", reason="driving into the open space ahead")
-    if can_turn and turns_without_progress < AUTO_MAX_TURNS_WITHOUT_PROGRESS:
-        angle = choose_new_zone(scan, pose, visited)
-        if angle is not None:
-            goal = wrap_degrees(float(pose[2]) + angle)
-            why = "edge of the open space reached" if not ahead_clear else "this way is mapped"
-            return turn_toward(goal, f"{why}; turning {angle:+.0f}° toward a new zone")
+    if abs(bearing) > AUTO_HEADING_TOLERANCE_DEGREES and turning_allowed:
+        # Far round: turn in bigger steps (still within the camera strip),
+        # and past 135 degrees go the long way, keeping to the right.
+        step_limit = AUTO_LOOK_TURN_DEGREES if abs(bearing) > AUTO_FINE_TURN_LIMIT_DEGREES else AUTO_MAX_TURN_DEGREES
+        if bearing > AUTO_RIGHT_HAND_LIMIT_DEGREES:
+            degrees = -step_limit
+        else:
+            degrees = max(-step_limit, min(step_limit, bearing))
+        return ExploreStep("turn", degrees, f"turning toward {where} ({bearing:+.0f}°)", target)
     if ahead_clear:
-        return ExploreStep("forward", reason="no new zone in reach; continuing ahead")
+        return ExploreStep("forward", reason=f"driving toward {where}", target=target)
+    if turning_allowed:
+        return ExploreStep("turn", -AUTO_LOOK_TURN_DEGREES, "way ahead blocked; turning right to look", target)
     if backup_bursts < AUTO_MAX_BACKUP_BURSTS and not just_backed_up:
-        return ExploreStep("reverse", reason="too close to turn; backing up once")
-    return ExploreStep("blocked", reason="no safe path after looking all around")
+        return ExploreStep("reverse", reason="too close to turn; backing up once", target=target)
+    return ExploreStep("blocked", reason="no safe path after looking all around", target=target)
+
+
+def _guess_step_seconds(distance_cm: float) -> float:
+    """Burst length expected to cover a distance, before any calibration.
+
+    A burst ramps up for its length and down for MOTOR_RAMP_SECONDS after; at
+    full duty that covers roughly speed x (burst + ramp) / 2 for short bursts.
+    """
+    speed = FORWARD_CM_PER_SECOND_AT_FULL_DUTY * (1 - MOTOR_DEADBAND_FRACTION)
+    return max(0.05, min(0.8, 2 * distance_cm / speed - MOTOR_RAMP_SECONDS))
+
+
+class _CalibrationRig:
+    """The car as calibration sees it: turns, bursts, pictures and ranges."""
+
+    def __init__(self, controller: "MappingController") -> None:
+        self._controller = controller
+        status = controller._pan_tilt.status()
+        self._centre, self._tilt = int(status["pan"]), int(status["tilt"])
+        self._origin: Pose | None = None
+
+    def heading_odometry(self) -> float:
+        return self._controller._drive.odometry()[2]
+
+    def distance_odometry(self) -> float:
+        odometry = self._controller._drive.odometry()
+        if self._origin is None:
+            self._origin = odometry
+        return relative(self._origin, odometry)[1]
+
+    def turn(self, degrees: float, rotation_scale: float) -> bool:
+        return self._controller._turn_by(degrees, rotation_scale)
+
+    def burst(self, throttle: float, seconds: float) -> bool:
+        return self._controller._move_burst(throttle, seconds)
+
+    def photograph(self, pan_offsets: Sequence[int]) -> dict[int, tuple[bytes, ...]]:
+        pans = [self._centre + offset for offset in pan_offsets if PAN_LIMITS[0] <= self._centre + offset <= PAN_LIMITS[1]]
+        views = self._controller._capture_views(pans, self._tilt, self._centre, frames=1 if len(pans) > 1 else AUTO_ALIGN_FRAMES)
+        return {pan - self._centre: frames for pan, frames in views.items()}
+
+    def measure_turn(self, strip: dict[int, tuple[bytes, ...]], current: tuple[bytes, ...] | None) -> float | None:
+        return self._controller._measure_turn({self._centre + offset: frames for offset, frames in strip.items()}, current, self._centre)
+
+    def range_ahead(self) -> float | None:
+        controller = self._controller
+        controller._pan_tilt.set_inhibited(True)
+        try:
+            controller._pan_tilt.set_angles(self._centre, self._tilt, override=True)
+            # Let a running-median sensor forget readings from before the move.
+            controller._stop_event.wait(max(0.06, controller._range_sensor.settle_seconds))
+            return controller._range_sensor.sample_now()
+        finally:
+            controller._pan_tilt.set_inhibited(False)
+
+    def clearance_all_round(self) -> float | None:
+        scan, _ = self._controller._sweep(self._tilt, self._centre, ())
+        distances = [float(item["distance_cm"]) for item in scan or [] if item["distance_cm"] is not None]
+        return min(distances) if distances else None
+
+    def stopped(self) -> bool:
+        return self._controller._stop_event.is_set()
+
+    def report(self, message: str) -> None:
+        with self._controller._lock:
+            self._controller._plan = message
 
 
 class MappingController:
@@ -865,8 +954,15 @@ class MappingController:
         self._mode = "idle"
         self._move_count = 0
         self._plan: str | None = None
+        store_path = getattr(self._store, "path", None)
+        self._calibration_store = CalibrationStore(
+            store_path.parent / "calibration.json" if store_path is not None and str(store_path) != ":memory:" else None
+        )
+        self._calibration: Calibration | None = self._calibration_store.load()
         self._reset_localization()
         self._surface_map = SurfaceMap()
+        self._grid = CoverageGrid()
+        self._explore_target: tuple[float, float] | None = None
         self._path: list[Pose] = []
         self._history: list[list[Pose]] = []
         self._links: list[tuple[Pose, Pose]] = []
@@ -888,7 +984,12 @@ class MappingController:
         self._pose_covariance = np.zeros((3, 3))
         self._last_odometry: Pose | None = None
         self._last_camera_views: dict[ViewKey, tuple[bytes, ...]] | None = None
-        self._odometry_scale = (1.0, 1.0)
+        calibration = getattr(self, "_calibration", None)
+        # Start from what calibration measured; each session keeps refining it.
+        self._odometry_scale = (
+            (calibration.forward_ratio if calibration and calibration.forward_ratio else 1.0),
+            (calibration.mean_turn_ratio() if calibration and calibration.mean_turn_ratio() else 1.0),
+        )
         self._last_localization: dict[str, object] | None = None
         # Camera-verified rotation since the last stop, for turns too large
         # for stop-to-stop image comparison.
@@ -913,6 +1014,55 @@ class MappingController:
             raise RuntimeError("Autonomous exploration requires an enabled ultrasonic sensor")
         self._start("explore", self._run_autonomous)
 
+    def start_calibration(self, attended: bool) -> None:
+        """Measure real turns and steps (car facing a flat wall about 1-1.5 m away)."""
+        if attended is not True:
+            raise ValueError("Attended supervision must be confirmed before calibrating")
+        drive_status = self._drive.status()
+        if drive_status["mode"] != "hardware":
+            raise RuntimeError("Calibration requires hardware mode")
+        if any(abs(float(drive_status[axis])) > 0.01 for axis in ("throttle", "strafe", "steering")):
+            raise RuntimeError("Stop the car before calibrating")
+        if not self._range_sensor.status()["enabled"]:
+            raise RuntimeError("Calibration requires an enabled ultrasonic sensor")
+        self._start("calibrate", self._run_calibration)
+
+    def calibration(self) -> dict[str, object] | None:
+        with self._lock:
+            return self._calibration.to_json() if self._calibration else None
+
+    def _run_calibration(self) -> None:
+        self._hold_camera(True)
+        try:
+            self._set_state("calibrating")
+            self._drive.set_inhibited(False)
+            with self._lock:
+                previous = self._calibration
+            result = run_calibration(_CalibrationRig(self), previous, _guess_step_seconds)
+            if self._stop_event.is_set():
+                return
+            if result.turn_ratios or result.step_durations:
+                self._calibration_store.save(result)
+                with self._lock:
+                    self._calibration = result
+                    self._state = "calibrated"
+                    self._odometry_scale = (
+                        result.forward_ratio or self._odometry_scale[0],
+                        result.mean_turn_ratio() or self._odometry_scale[1],
+                    )
+            else:
+                self._set_state("calibration_failed")
+        except Exception as exc:
+            if not self._stop_event.is_set():
+                logger.exception("Calibration stopped after an error")
+                with self._lock:
+                    self._state = "error"
+                    self._error = f"{type(exc).__name__}: {exc}"
+        finally:
+            self._drive.stop()
+            self._set_enabled_false()
+            self._hold_camera(False)
+
     def _start(self, mode: str, target: Callable[[], None]) -> None:
         with self._lock:
             if self._enabled or (self._thread is not None and self._thread.is_alive()):
@@ -927,6 +1077,8 @@ class MappingController:
             self._reset_localization()
             with self._map_lock:
                 self._surface_map = SurfaceMap()
+                self._grid = CoverageGrid()
+                self._explore_target = None
                 self._path = []
                 self._history = []
                 self._links = []
@@ -970,6 +1122,7 @@ class MappingController:
                 "pose_model": "wheel odometry + camera yaw/travel + sonar surface registration",
                 "move_count": self._move_count,
                 "plan": self._plan,
+                "calibrated_at": self._calibration.created_at if self._calibration else None,
                 "pose": [round(value, 1) for value in self._pose],
                 "pose_sigma_cm": round(position_sigma, 1),
                 "heading_sigma_deg": round(heading_sigma, 1),
@@ -994,6 +1147,14 @@ class MappingController:
             data["run_id"] = self._map_run_id
             data["path"] = [[round(value, 1) for value in pose] for pose in self._path]
             data["history"] = [[[round(value, 1) for value in pose] for pose in path] for path in self._history]
+            if self._grid.log_odds.size:
+                data["grid"] = {
+                    "bounds": [round(value, 1) for value in self._grid.bounds()],
+                    "explored": round(self._grid.explored_fraction(), 3),
+                }
+            data["frontier_target"] = (
+                [round(self._explore_target[0], 1), round(self._explore_target[1], 1)] if self._explore_target else None
+            )
             data["links"] = [
                 [[round(start[0], 1), round(start[1], 1)], [round(end[0], 1), round(end[1], 1)]]
                 for start, end in self._links
@@ -1025,6 +1186,8 @@ class MappingController:
             self._last_place = None
             with self._map_lock:
                 self._surface_map = SurfaceMap()
+                self._grid = CoverageGrid()
+                self._explore_target = None
                 self._path = []
                 self._history = []
                 self._links = []
@@ -1064,17 +1227,20 @@ class MappingController:
                 for source, target, _ in self._places.loop_links(component)
             ]
         surface_map = SurfaceMap()
+        grid = CoverageGrid()
         path: list[Pose] = []
         history: dict[str, list[Pose]] = {}
         report = None
         for other, stop, pose in stops:
             report = surface_map.integrate(stop.scan, pose, *stop.pose_sigma)
+            grid.integrate(stop.scan, pose, surface_map.beam_width_deg)
             if stop.run_id == run_id:
                 path.append(pose)
             else:
                 history.setdefault(stop.run_id, []).append(pose)
         with self._map_lock:
             self._surface_map = surface_map
+            self._grid = grid
             self._path = path
             self._history = list(history.values())
             self._links = links
@@ -1126,11 +1292,9 @@ class MappingController:
 
     def _run_autonomous(self) -> None:
         started_at = time.monotonic()
-        leg_bursts = 0
         turns_without_progress = 0
         backup_bursts = 0
         just_backed_up = False
-        goal_heading: float | None = None
         self._hold_camera(True)
         try:
             while not self._stop_event.is_set():
@@ -1154,37 +1318,31 @@ class MappingController:
                 # angle) counts as blocked: the planner turns rather than drives.
                 with self._lock:
                     pose = self._pose
-                    last_node = self._last_node
-                # Every remembered stop in this frame, from earlier sessions too.
-                with self._places_lock:
-                    visited = (
-                        list(self._places.component_poses(last_node).values()) if last_node is not None else []
+                with self._map_lock:
+                    step = plan_explore_step(
+                        scan,
+                        pose,
+                        self._grid,
+                        turns_without_progress,
+                        backup_bursts,
+                        just_backed_up,
+                        self._explore_target,
                     )
-                step = plan_explore_step(
-                    scan,
-                    pose,
-                    visited,
-                    leg_bursts,
-                    turns_without_progress,
-                    backup_bursts,
-                    goal_heading,
-                    just_backed_up,
-                )
+                    self._explore_target = step.target
                 with self._lock:
                     self._plan = step.reason
+                if step.action == "done":
+                    self._set_state("explored")
+                    break
                 if step.action == "blocked":
                     self._set_state("blocked")
                     break
-                if goal_heading is not None and step.goal_heading is None:
-                    leg_bursts = 0
-                goal_heading = step.goal_heading
 
                 self._drive.set_inhibited(False)
                 if step.action == "forward":
                     self._set_state("moving")
-                    if not self._move_burst(AUTO_FORWARD_COMMAND, AUTO_FORWARD_SECONDS):
+                    if not self._move_burst(AUTO_FORWARD_COMMAND, self._step_seconds()):
                         break
-                    leg_bursts += 1
                     turns_without_progress = 0
                     just_backed_up = False
                 elif step.action == "turn":
@@ -1202,7 +1360,6 @@ class MappingController:
                     backup_bursts += 1
                     turns_without_progress = 0
                     just_backed_up = True
-                    goal_heading = None
                 self._count_move()
                 self._drive.set_inhibited(True)
                 self._set_state("scanning")
@@ -1223,6 +1380,13 @@ class MappingController:
                 self._drive.set_inhibited(False)
             self._set_enabled_false()
             self._hold_camera(False)
+
+    def _step_seconds(self) -> float:
+        """Burst length for one exploration step, from calibration when there is one."""
+        with self._lock:
+            calibration = self._calibration
+        measured = calibration.step_duration(AUTO_STEP_CM) if calibration else None
+        return measured if measured is not None else AUTO_FORWARD_SECONDS
 
     def _turn_and_align(self, degrees: float) -> bool:
         """Turn by `degrees`, then use the camera to measure and correct the turn."""
@@ -1248,8 +1412,7 @@ class MappingController:
             if actual is None:
                 break
             odometry_turned = self._drive.odometry()[2] - odometry_before
-            with self._lock:
-                expected = odometry_turned * self._odometry_scale[1]
+            expected = odometry_turned * self._rotation_ratio(degrees)
             low, high = AUTO_ALIGN_PLAUSIBLE_RATIO
             if abs(expected) > 3.0 and not low <= actual / expected <= high:
                 logger.info("Camera turn %.1f disagrees with wheels %.1f; trusting the wheels", actual, expected)
@@ -1316,6 +1479,15 @@ class MappingController:
                     "jpeg": jpeg,
                 }
 
+    def coverage_png(self) -> bytes | None:
+        """The coverage grid as a transparent PNG, north up."""
+        with self._map_lock:
+            if not self._grid.log_odds.size:
+                return None
+            image = self._grid.to_image()
+        encoded, png = cv2.imencode(".png", image)
+        return png.tobytes() if encoded else None
+
     def vision_panels(self) -> list[dict[str, object]]:
         with self._lock:
             return [
@@ -1328,6 +1500,24 @@ class MappingController:
             panel = self._vision.get(name)
             return panel["jpeg"] if panel else None
 
+    def _wait_until_steady(self, timeout: float = CAMERA_STEADY_TIMEOUT_SECONDS) -> bool:
+        """Take quick frames until two in a row match: the car and head are still."""
+        previous = _steadiness_frame(self._camera.capture_snapshot())
+        if previous is None:
+            return True
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._stop_event.wait(CAMERA_STEADY_INTERVAL_SECONDS):
+                return False
+            current = _steadiness_frame(self._camera.capture_snapshot())
+            if current is None:
+                return True
+            if float(np.abs(current - previous).mean()) < CAMERA_STEADY_DIFFERENCE:
+                return True
+            previous = current
+        logger.info("Camera still changing after %.1f s; taking the picture anyway", timeout)
+        return False
+
     def _capture_best_picture(self) -> tuple[bytes | None, dict[str, object] | None]:
         """Take a picture, check its levels, and retake with adjusted exposure
         until it is decent or the settings run out; keep the best one."""
@@ -1336,7 +1526,10 @@ class MappingController:
             return self._camera.capture_snapshot(), None
         with self._lock:
             index = self._exposure_index
+        set_exposure(EXPOSURE_LADDER[index])
+        self._wait_until_steady()
         tried: dict[int, PictureQuality] = {}
+        retook_blurred = False
         best: tuple[int, bytes, PictureQuality] | None = None
         for _ in range(EXPOSURE_MAX_ATTEMPTS):
             set_exposure(EXPOSURE_LADDER[index])
@@ -1352,6 +1545,12 @@ class MappingController:
                 best = (index, jpeg, quality)
             if quality.decent:
                 break
+            if quality.blurred and not quality.too_dark and not quality.too_bright and not retook_blurred:
+                # Still moving or vibrating: wait and retake at the same exposure.
+                retook_blurred = True
+                del tried[index]
+                self._wait_until_steady()
+                continue
             if quality.too_dark:
                 step = 1
             elif quality.too_bright:
@@ -1428,6 +1627,7 @@ class MappingController:
                 self._pan_tilt.set_angles(pan, tilt, override=True)
                 if self._stop_event.wait(AUTO_ALIGN_SETTLE_SECONDS):
                     return views
+                self._wait_until_steady(AUTO_VIEW_STEADY_TIMEOUT_SECONDS)
                 pictures = [self._camera.capture_snapshot() for _ in range(frames)]
                 if all(picture is not None for picture in pictures):
                     views[pan] = tuple(pictures)
@@ -1440,13 +1640,24 @@ class MappingController:
             finally:
                 self._pan_tilt.set_inhibited(False)
 
+    def _rotation_ratio(self, degrees: float) -> float:
+        """Real degrees per odometry degree for a turn of this size and direction:
+        the calibrated ratio, nudged by what this session has learned since."""
+        with self._lock:
+            session = self._odometry_scale[1]
+            calibration = self._calibration
+        reference = calibration.mean_turn_ratio() if calibration else None
+        measured = calibration.turn_ratio(degrees) if calibration else None
+        if measured is not None and reference:
+            return measured * session / reference
+        return session
+
     def _turn_by(self, degrees: float, rotation_scale: float | None = None) -> bool:
         """Rotate in place by about `degrees` (counterclockwise), closed loop on wheel odometry."""
         if self._stop_event.is_set():
             return False
         if rotation_scale is None:
-            with self._lock:
-                rotation_scale = self._odometry_scale[1]
+            rotation_scale = self._rotation_ratio(degrees)
         # Odometry under-reads or over-reads turns by the learned scale.
         target = abs(degrees) / max(rotation_scale, 1e-3)
         steering = math.copysign(AUTO_TURN_COMMAND, degrees)
@@ -1550,7 +1761,7 @@ class MappingController:
         odometry_delta = (
             raw_odometry[0] * translation_scale,
             raw_odometry[1] * translation_scale,
-            raw_odometry[2] * rotation_scale,
+            raw_odometry[2] * (self._rotation_ratio(raw_odometry[2] * rotation_scale) if raw_odometry[2] else rotation_scale),
         )
         view_estimates = estimate_view_motion(previous_views or {}, views)
         texture = image_texture_score(image_jpeg)
@@ -1657,15 +1868,21 @@ class MappingController:
         if keyframe is not None:
             self._store.save_keyframe(keyframe)
         with self._places_lock:
-            event = self._places.add_stop(
+            update = self._places.add_stop(
                 observation_id, run_id, pose, scan, (position_sigma, heading_sigma), keyframe, edge
             )
+            event = update.event
+            # The pose graph has the final word, using every constraint so far.
+            pose = self._places.graph.nodes[observation_id]
             if event is not None:
-                pose = self._places.graph.nodes[observation_id]
                 covariance = np.diag(
                     [event.sigma[0] ** 2, event.sigma[1] ** 2, math.radians(event.sigma[2]) ** 2]
                 )
+            elif update.views:
+                covariance = covariance.copy()
+                covariance[2, 2] = min(covariance[2, 2], math.radians(VIEW_HEADING_SIGMA_AFTER_MATCH) ** 2)
             place_counts = self._places.counts()
+        rebuild = event is not None or update.moved_cm > MAP_REBUILD_MOVE_CM or update.moved_deg > MAP_REBUILD_TURN_DEG
         if event is not None:
             logger.info("Recognized place %s: %s", event.keyframe_id, event.summary())
             remembered = self._store.image(event.keyframe_id)
@@ -1684,10 +1901,12 @@ class MappingController:
                     place_lines,
                     lambda: render_matches(remembered, image_jpeg, "Recognized place", place_lines),
                 )
+        if rebuild:
             report = self._rebuild_map(observation_id, run_id)
         else:
             with self._map_lock:
                 report = self._surface_map.integrate(scan, pose, position_sigma, heading_sigma)
+                self._grid.integrate(scan, pose, self._surface_map.beam_width_deg)
                 self._path.append(pose)
         captured_at = datetime.now(timezone.utc).isoformat()
         with self._lock:
@@ -1705,9 +1924,11 @@ class MappingController:
                 "side_views": bool(side_views),
                 "registration": registration.summary(),
                 "place": event.summary() if event is not None else None,
-                "surfaces_created": report.created if event is None and report else None,
-                "surfaces_refined": report.fused if event is None and report else None,
-                "surfaces_retired": report.retired if event is None and report else None,
+                "views_matched": update.views,
+                "graph_adjusted_cm": round(update.moved_cm, 1),
+                "surfaces_created": report.created if not rebuild and report else None,
+                "surfaces_refined": report.fused if not rebuild and report else None,
+                "surfaces_retired": report.retired if not rebuild and report else None,
             }
             self._last_observation = captured_at
             self._last_id = observation_id
@@ -1737,6 +1958,11 @@ class MappingController:
         pans = sorted(set(view_pans) | (set(SCAN_ANGLES) if sensor_enabled else set()))
         if not pans:
             return scan, views
+        # A sensor that reports a running median needs time to forget the last
+        # direction; such a reading is already a median, so one per angle will do.
+        lag = self._range_sensor.settle_seconds
+        settle = max(SCAN_STEP_SETTLE_SECONDS, lag)
+        samples_per_angle = 1 if lag > 0 else SCAN_SAMPLES_PER_ANGLE
         self._pan_tilt.set_inhibited(True)
         try:
             self._pan_tilt.set_angles(SCAN_LEAD_IN_PAN, tilt, override=True)
@@ -1746,7 +1972,7 @@ class MappingController:
                 if self._stop_event.is_set():
                     return None, views
                 self._pan_tilt.set_angles(pan, tilt, override=True)
-                if self._stop_event.wait(SCAN_STEP_SETTLE_SECONDS):
+                if self._stop_event.wait(settle):
                     return None, views
                 if pan in view_pans:
                     frame = self._camera.capture_snapshot()
@@ -1756,7 +1982,7 @@ class MappingController:
                     continue
                 samples: list[float] = []
                 errors: list[str] = []
-                for _ in range(SCAN_SAMPLES_PER_ANGLE):
+                for _ in range(samples_per_angle):
                     try:
                         distance = self._range_sensor.sample_now()
                         if distance is not None:

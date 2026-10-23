@@ -19,9 +19,8 @@ from robocar.drive import (
     SimulatedPanTilt,
 )
 from robocar.mapping import (
-    AUTO_LEG_BURSTS,
+    AUTO_LOOK_TURN_DEGREES,
     AUTO_MAX_TURN_DEGREES,
-    AUTO_MAX_TURNS_WITHOUT_PROGRESS,
     SCAN_ANGLES,
     CameraMotionEstimate,
     assess_picture,
@@ -32,6 +31,7 @@ from robocar.mapping import (
     estimate_camera_yaw_change,
     forward_clearance,
 )
+from robocar.exploration import CoverageGrid, Frontier, Waypoint
 from robocar.localization import relative
 from robocar.vision_debug import render_matches
 from robocar.range_sensor import RangeSensorController
@@ -357,7 +357,8 @@ class MappingTests(unittest.TestCase):
                 while mapping.status()["move_count"] == 0 and time.monotonic() < deadline:
                     time.sleep(0.02)
                 self.assertGreaterEqual(mapping.status()["move_count"], 1)
-                self.assertIn(driver.command, ((0, 0, 0, 0), (1000, 1000, 1000, 1000)))
+                # Stopped, or a straight move or turn with every wheel at one speed.
+                self.assertEqual(len({abs(duty) for duty in driver.command}), 1)
             finally:
                 mapping.stop()
                 self.assertEqual(driver.command, (0, 0, 0, 0))
@@ -510,89 +511,6 @@ class MappingTests(unittest.TestCase):
                 pan_tilt.close()
                 range_sensor.close()
 
-    def test_autonomous_mode_drives_a_leg_then_turns_toward_a_new_zone(self):
-        with tempfile.TemporaryDirectory() as directory:
-            driver = RecordingDriver()
-            drive = DriveController(driver, max_duty=1000, command_timeout=1, physical=True)
-            pan_tilt = PanTiltController(SimulatedPanTilt(), physical=True)
-            range_sensor = RangeSensorController(
-                FakeRangeSensor(distance=100.0),
-                physical=True,
-                sample_interval=0.02,
-            )
-            mapping = MappingController(
-                FakeCamera(),
-                drive,
-                pan_tilt,
-                range_sensor,
-                MappingStore(Path(directory) / "mapping.sqlite3"),
-            )
-            clear_scan = [
-                {"angle_deg": angle, "distance_cm": 100.0, "samples": 3, "error": None}
-                for angle in (-60, -30, 0, 30, 60)
-            ]
-            moves: list[tuple[str, float]] = []
-            original_move_burst = mapping._move_burst
-            original_turn_by = mapping._turn_by
-
-            def track_move_burst(
-                throttle: float,
-                duration: float,
-                *,
-                steering: float = 0,
-            ) -> bool:
-                moves.append(("drive", throttle))
-                return original_move_burst(throttle, duration, steering=steering)
-
-            def track_turn_by(degrees: float) -> bool:
-                moves.append(("turn", degrees))
-                return original_turn_by(degrees)
-
-            try:
-                with (
-                    patch.object(mapping, "_capture_observation", return_value=clear_scan),
-                    patch.object(mapping, "_move_burst", side_effect=track_move_burst),
-                    patch.object(mapping, "_turn_by", side_effect=track_turn_by),
-                ):
-                    mapping.start_autonomous(attended=True)
-                    deadline = time.monotonic() + 12
-                    while not any(
-                        command[0] != command[2] and command != (0, 0, 0, 0)
-                        for command in driver.commands
-                    ) and time.monotonic() < deadline:
-                        time.sleep(0.01)
-
-                    movement_commands = [
-                        command for command in driver.commands if command != (0, 0, 0, 0)
-                    ]
-                    self.assertGreaterEqual(len(movement_commands), 4)
-                    self.assertTrue(
-                        any(
-                            all(0 < duty < 1000 for duty in command)
-                            for command in movement_commands
-                        )
-                    )
-                    self.assertTrue(
-                        any(
-                            command[0] != command[2]
-                            for command in movement_commands
-                        )
-                    )
-                    # A full leg ahead, then the first small step of the turn
-                    # toward the most open new zone.
-                    self.assertEqual(
-                        moves[: AUTO_LEG_BURSTS + 1],
-                        [("drive", 1.0)] * AUTO_LEG_BURSTS + [("turn", -AUTO_MAX_TURN_DEGREES)],
-                    )
-                    self.assertEqual(mapping.status()["mode"], "explore")
-                    self.assertGreaterEqual(mapping.status()["move_count"], 3)
-            finally:
-                mapping.stop()
-                mapping.close()
-                drive.close()
-                pan_tilt.close()
-                range_sensor.close()
-
     def test_exploration_requires_attendance_and_hardware(self):
         drive = DriveController(SimulatedDriver(), max_duty=1000, command_timeout=1, physical=False)
         pan_tilt = PanTiltController(SimulatedPanTilt(), physical=False)
@@ -665,66 +583,66 @@ class MappingTests(unittest.TestCase):
         clearances = direction_clearances(sides)
         self.assertEqual(clearances[-60.0], 50.0)
         self.assertEqual(clearances[48.0], 150.0)
-        step = plan_explore_step(sides, (0.0, 0.0, 0.0), [], 0, 0, 0)
-        # Toward the opening at 48 degrees, one small step at a time.
-        self.assertEqual((step.action, step.degrees, step.goal_heading), ("turn", AUTO_MAX_TURN_DEGREES, 48.0))
 
-    def test_at_the_edge_of_open_space_it_turns_to_a_new_zone_instead_of_shuttling(self):
-        # The first real sweep from the passage run: walls 48-66 cm all round.
-        data = json.loads((Path(__file__).parent / "data" / "passage_run.json").read_text())
-        corner = data["observations"][0]["scan"]
-        forward = plan_explore_step(corner, (0.0, 0.0, 0.0), [], 0, 0, 0)
-        self.assertEqual(forward.action, "forward")  # 64 cm ahead is still clear
-        closer = [
-            {**item, "distance_cm": item["distance_cm"] - 9.0 if item["distance_cm"] else None}
-            for item in corner
-        ]
-        visited = [(0.0, 0.0, 0.0), (0.0, 9.0, 0.0)]
-        first = plan_explore_step(closer, (0.0, 9.0, 0.0), visited, 1, 0, 0)
-        self.assertEqual(first.action, "turn")
-        self.assertIsNotNone(first.goal_heading)
-        self.assertGreaterEqual(abs(first.goal_heading), 75.0)  # a genuinely new direction
-        # The goal is kept while it rotates, one step per stop.
-        second = plan_explore_step(closer, (0.0, 9.0, first.degrees), visited, 1, 1, 0, first.goal_heading)
-        self.assertEqual(second.goal_heading, first.goal_heading)
-        self.assertEqual(math.copysign(1, second.degrees), math.copysign(1, first.degrees))
-        exhausted = plan_explore_step(closer, (0.0, 9.0, 0.0), visited, 0, AUTO_MAX_TURNS_WITHOUT_PROGRESS, 0)
-        self.assertEqual(exhausted.action, "reverse")
-        self.assertEqual(
-            plan_explore_step(closer, (0.0, 9.0, 0.0), visited, 0, AUTO_MAX_TURNS_WITHOUT_PROGRESS, 1).action,
-            "blocked",
+    def corridor_grid(self, pose, headings, walls=None):
+        # A corridor whose far end (at 290 cm) is beyond where one sweep clears space.
+        walls = walls or (
+            ((-40.0, -50.0), (-40.0, 290.0)),
+            ((40.0, -50.0), (40.0, 290.0)),
+            ((-40.0, -50.0), (40.0, -50.0)),
+            ((-40.0, 290.0), (40.0, 290.0)),
         )
+        room = SonarRoom(walls=walls, posts=())
+        grid = CoverageGrid()
+        for heading in headings:
+            looking = (pose[0], pose[1], heading)
+            grid.integrate(room.scan(looking), looking, 25.0)
+        return room, grid
 
-    def test_it_finishes_turning_toward_a_zone_before_driving(self):
-        open_scan = [
-            {"angle_deg": angle, "distance_cm": 200.0, "samples": 3, "error": None} for angle in range(-57, 61, 3)
-        ]
-        midway = plan_explore_step(open_scan, (0.0, 0.0, 30.0), [], 0, 2, 0, goal_heading=90.0)
-        self.assertEqual((midway.action, midway.degrees, midway.goal_heading), ("turn", 25.0, 90.0))
-        # Facing the zone, a fresh leg starts even if the last one was long.
-        arrived = plan_explore_step(open_scan, (0.0, 0.0, 85.0), [], AUTO_LEG_BURSTS, 4, 0, goal_heading=90.0)
-        self.assertEqual((arrived.action, arrived.goal_heading), ("forward", None))
-
-    def test_directions_already_swept_from_nearby_are_not_revisited(self):
-        blocked = [
-            {"angle_deg": angle, "distance_cm": 40.0, "samples": 3, "error": None} for angle in range(-57, 61, 3)
-        ]
-        # It has already looked left (heading 90) and right (heading -90) from here.
-        visited = [(0.0, 0.0, 0.0), (0.0, 0.0, 90.0), (0.0, 0.0, -90.0)]
-        step = plan_explore_step(blocked, (0.0, 0.0, 0.0), visited, 0, 0, 0)
-        self.assertEqual(step.action, "turn")
-        self.assertGreater(abs(step.goal_heading), 140.0)  # behind is all that is left
-
-    def test_exploration_prefers_openings_away_from_where_it_has_been(self):
-        scan = [
-            {"angle_deg": angle, "distance_cm": 40.0 if abs(angle) < 30 else 150.0, "samples": 3, "error": None}
-            for angle in range(-57, 61, 3)
-        ]
-        # Having come from the left, the car should look right.
-        visited = [(-60.0, 40.0, 0.0), (-40.0, 20.0, 0.0), (0.0, 0.0, 0.0)]
-        step = plan_explore_step(scan, (0.0, 0.0, 0.0), visited, 0, 0, 0)
+    def test_the_first_look_turns_right_to_see_more(self):
+        room = SonarRoom()
+        grid = CoverageGrid()
+        pose = (0.0, -40.0, 0.0)
+        scan = room.scan(pose)
+        grid.integrate(scan, pose, 25.0)
+        step = plan_explore_step(scan, pose, grid, 0, 0)
         self.assertEqual(step.action, "turn")
         self.assertLess(step.degrees, 0)
+
+    def test_it_drives_toward_the_unexplored_far_end_of_a_corridor(self):
+        pose = (0.0, 0.0, 0.0)
+        room, grid = self.corridor_grid(pose, (0.0, -90.0, 180.0, 90.0))
+        step = plan_explore_step(room.scan(pose), pose, grid, 0, 0)
+        self.assertEqual(step.action, "forward")
+        self.assertGreater(step.target[1], 30.0)  # an unexplored pocket ahead
+
+    def test_when_the_sonar_blocks_the_way_it_does_not_drive(self):
+        pose = (0.0, 0.0, 0.0)
+        room, grid = self.corridor_grid(pose, (0.0, -90.0, 180.0, 90.0))
+        blocked = [
+            {**item, "distance_cm": 30.0 if abs(item["angle_deg"]) <= 15 else item["distance_cm"]}
+            for item in room.scan(pose)
+        ]
+        step = plan_explore_step(blocked, pose, grid, 0, 0)
+        self.assertEqual(step.action, "turn")
+
+    def test_a_fully_seen_room_is_explored(self):
+        walls = (((-60.0, -60.0), (60.0, -60.0)), ((60.0, -60.0), (60.0, 60.0)), ((60.0, 60.0), (-60.0, 60.0)), ((-60.0, 60.0), (-60.0, -60.0)))
+        pose = (0.0, 0.0, 0.0)
+        room, grid = self.corridor_grid(pose, range(0, 360, 30), walls=walls)
+        scan = room.scan(pose)
+        # It looks round a few times first, then reports the room explored.
+        self.assertEqual(plan_explore_step(scan, pose, grid, 0, 0).action, "turn")
+        self.assertEqual(plan_explore_step(scan, pose, grid, 4, 0).action, "done")
+
+    def test_a_turn_of_more_than_135_degrees_keeps_going_right(self):
+        class BehindLeft:
+            def next_waypoint(self, pose, avoid_within_deg=None, previous_target=None):
+                return Waypoint(160.0, 80.0, Frontier((0.0, 0.0), (-30.0, -70.0), 10, 90.0))
+
+        scan = [{"angle_deg": angle, "distance_cm": 200.0, "samples": 3, "error": None} for angle in range(-57, 61, 3)]
+        step = plan_explore_step(scan, (0.0, 0.0, 0.0), BehindLeft(), 0, 0)
+        self.assertEqual((step.action, step.degrees), ("turn", -AUTO_LOOK_TURN_DEGREES))
 
     def test_strip_of_pictures_measures_the_turn_actually_made(self):
         scene = PanoramaScene()
@@ -982,3 +900,61 @@ class ExposureTests(unittest.TestCase):
         picture = cv2.imdecode(np.frombuffer(mapping.vision_image("motion"), np.uint8), cv2.IMREAD_COLOR)
         self.assertEqual(picture.shape[1], 640)
         self.assertIsNone(mapping.vision_image("place"))
+
+
+class SteadinessTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch("robocar.mapping.CAMERA_STEADY_INTERVAL_SECONDS", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def controller(self, camera):
+        drive = DriveController(SimulatedDriver(), max_duty=1000, command_timeout=1, physical=False)
+        pan_tilt = PanTiltController(SimulatedPanTilt(), physical=False)
+        range_sensor = RangeSensorController(None, physical=False)
+        mapping = MappingController(camera, drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")))
+        for resource in (range_sensor, pan_tilt, drive, mapping):
+            self.addCleanup(resource.close)
+        return mapping
+
+    def test_pictures_wait_until_the_view_stops_moving(self):
+        scene = PanoramaScene()
+
+        class SwayingCamera(ExposureCamera):
+            """Still swinging for the first few frames after a turn."""
+
+            def __init__(self):
+                super().__init__(scene_brightness=60.0)
+                self.calls = 0
+
+            def capture_snapshot(self):
+                self.calls += 1
+                return scene.view(max(0, 5 - self.calls) * 3.0)
+
+        camera = SwayingCamera()
+        mapping = self.controller(camera)
+        self.assertTrue(mapping._wait_until_steady())
+        self.assertGreaterEqual(camera.calls, 5)
+
+    def test_a_blurred_picture_is_retaken(self):
+        sharp_camera = ExposureCamera(scene_brightness=60.0)
+        sharp = sharp_camera.capture_snapshot()
+        blurred_image = cv2.blur(cv2.imdecode(np.frombuffer(sharp, np.uint8), cv2.IMREAD_GRAYSCALE), (25, 1))
+        blurred = cv2.imencode(".jpg", blurred_image)[1].tobytes()
+        self.assertTrue(assess_picture(blurred).blurred)
+
+        class ShakyCamera(ExposureCamera):
+            def __init__(self):
+                super().__init__(scene_brightness=60.0)
+                self.calls = 0
+
+            def capture_snapshot(self):
+                self.calls += 1
+                # The steadiness check sees matching frames, but the kept
+                # picture comes out smeared once before the car settles.
+                return blurred if self.calls == 3 else sharp
+
+        mapping = self.controller(ShakyCamera())
+        jpeg, info = mapping._capture_best_picture()
+        self.assertFalse(assess_picture(jpeg).blurred)
+        self.assertGreater(info["sharpness"], 20.0)

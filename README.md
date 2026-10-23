@@ -101,18 +101,24 @@ and the operator confirms the room is clear and attended. The car scans while
 stopped, moves in short bursts, then stops and scans again. Autonomous motion
 uses full normalized motor output and the default 4095/4095 motor duty cap.
 
-After each sweep it plans its next move:
+After each sweep it plans its next move with **frontier exploration**:
 
-- **Legs:** it drives forward in 0.25-second bursts while the corridor ahead
-  (±12°, roughly the car's width) has at least 60 cm clearance, up to six
-  bursts. That takes it to the edge of the open space, where it maps that
-  edge. Motor duty ramps up over each burst and down for 0.25 seconds after.
-- **New zones:** at the end of a leg it picks the next zone to map. Swept
-  directions count with their measured clearance; directions beside and
-  behind it that no nearby sweep has covered are worth a look. Ground no
-  session has visited scores higher. It rotates toward that zone 25° at a
-  time over several stops, sweeping at each (which maps the zone as it turns
-  round), then starts a new leg.
+- **Coverage grid:** every sweep marks the space the sound crossed as free
+  and the places it echoed as occupied, in a 5 cm grid shared with earlier
+  sessions. The edges between known-free and unknown space are the
+  *frontiers*: the parts of the room not mapped yet. Spots beside and behind
+  the car, which the forward sonar can never see, don't count.
+- **Where to go:** it plans a path on the grid, keeping a car's radius from
+  obstacles, to the best reachable frontier. Short paths and big frontiers
+  score well, and left turns cost more, so it works round a room clockwise.
+  It sticks with a frontier until another is clearly better. The dashboard
+  marks the target with a crosshair.
+- **Moving:** turns toward the target are 25° when it's near straight ahead,
+  and 50° when it's far round (past 135° it keeps turning right instead of
+  reversing). Forward steps are 25 cm when calibrated (otherwise 0.25-second
+  bursts), and only while the corridor ahead (±12°, roughly the car's width)
+  has at least 60 cm clearance. If the sonar blocks the way the grid wanted,
+  it picks a different frontier.
 - **Camera-measured turns:** before turning, the camera photographs a strip
   every 10° across the pan on the turn side (0–60°). The car then turns
   closed-loop on wheel odometry. Afterwards its new forward view is matched
@@ -122,12 +128,13 @@ After each sweep it plans its next move:
   (at most 20° each). The measured turn also recalibrates odometry and fixes
   the pose for the next sweep. Without trustworthy images it relies on
   odometry.
+- **Finished:** with no reachable frontier left, it looks round once more
+  and then stops with "explored".
 - **Back up:** only when it can't turn safely (something within 25 cm), or
-  after about 300° of turning without finding a way forward, does it back up
-  once for 0.25 seconds. After backing up it turns rather than driving
-  straight back in, and if it still can't move it stops. The rear is not
-  sensed, so keep the area behind the car clear and expect this recovery
-  maneuver may bump into something.
+  after a lot of turning without finding a way forward, does it back up once.
+  After backing up it turns rather than driving straight back in, and if it
+  still can't move it stops. The rear is not sensed, so keep the area behind
+  the car clear and expect this recovery maneuver may bump into something.
 
 If the sensor returns no readings at all, it stops with a sensor fault. The
 dashboard shows the reason for the current move. Each explore session is
@@ -137,17 +144,32 @@ autonomous moves refresh the command until they end. Exploration never
 starts at boot.
 
 **Pictures:** during a mapping session the camera stays open, so auto-exposure
-settles between stops. Each stop's picture is checked for brightness,
-clipping and usable detail. If it isn't decent, it is retaken with adjusted
-exposure (compensation from −1 to +4 EV, then long manual exposures with
-gain), up to five tries, and the best picture is kept. The setting that worked
-is where the next stop starts. The **What the camera sees** panel shows:
+settles between stops. Before each picture it waits until two quick frames in
+a row match (the car and head have stopped moving), up to 2 seconds. Each
+stop's picture is checked for brightness, clipping, sharpness and usable
+detail. If it isn't decent, it is retaken: a blurred one at the same exposure
+after a pause, otherwise with adjusted exposure (compensation from −1 to
++4 EV, then manual exposures up to 50 ms with gain), up to five tries. The best
+picture is kept, and the setting that worked is where the next stop starts.
+The **What the camera sees** panel shows:
 
 - the latest stop picture with its detected features and exposure;
 - stop-to-stop matching (green lines are matches kept, red rejected) with the
   measured camera turn;
 - the latest turn check against its strip picture;
 - the latest recognized place against the stored picture.
+
+**Calibrate turns & steps** (attended) measures how far the car really turns
+and moves. Face it toward a flat wall about 1–1.5 m away with room to turn.
+It photographs a strip across the pan, then turns 15°, 30° and 45° left and
+right, adjusting each command until the camera says it landed within 2°. It
+then uses the camera to return to its starting heading and makes 10, 20 and
+30 cm steps toward the wall, each followed by the same burst in reverse. It
+adjusts the burst length until the sonar says each step is right (within
+7%). It refuses to start with anything within 25 cm, and stops stepping
+before the wall is closer than 45 cm. Results are saved beside the map
+database (not cleared by reset), shown on the dashboard, and used for every
+turn and step afterwards; each session keeps refining them.
 
 Use **Reset mapping database** to permanently delete all saved observations.
 The dashboard asks for confirmation, and reset is unavailable while mapping is

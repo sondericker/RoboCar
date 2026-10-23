@@ -121,9 +121,36 @@ def create_app(config: Config | None = None) -> Flask:
             return jsonify({"error": str(exc)}), 409
         return jsonify(mapping.status())
 
+    @app.get("/api/calibration")
+    def calibration_status():
+        return jsonify({"calibration": mapping.calibration()})
+
+    @app.post("/api/calibration")
+    def calibration_control():
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict) or not isinstance(payload.get("enabled"), bool):
+            return jsonify({"error": "enabled must be a boolean"}), 400
+        if payload["enabled"] and not isinstance(payload.get("attended"), bool):
+            return jsonify({"error": "attended must be a boolean"}), 400
+        try:
+            if payload["enabled"]:
+                mapping.start_calibration(payload["attended"])
+            else:
+                mapping.stop()
+        except (RuntimeError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 409
+        return jsonify(mapping.status())
+
     @app.get("/api/mapping/observations")
     def mapping_observations():
         return jsonify({"observations": mapping.observations()})
+
+    @app.get("/api/mapping/coverage.png")
+    def mapping_coverage():
+        image = mapping.coverage_png()
+        if image is None:
+            return jsonify({"error": "Nothing swept yet"}), 404
+        return Response(image, mimetype="image/png", headers={"Cache-Control": "no-store"})
 
     @app.get("/api/mapping/vision")
     def mapping_vision():

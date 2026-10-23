@@ -81,8 +81,10 @@
     <section class="mapping-section">
       <h2>Mapping &amp; exploration</h2>
       <button id="mapping-toggle" type="button" aria-pressed="false">Start mapping &amp; auto explore</button>
+      <button id="calibrate-motion" type="button">Calibrate turns &amp; steps</button>
       <button id="reset-mapping" type="button">Reset mapping database</button>
       <p id="mapping-status" class="status" aria-live="polite">Mapping is off.</p>
+      <p id="calibration-status" class="status">Motion not calibrated yet.</p>
       <div class="mapping-layout">
         <div>
           <canvas id="map-view" class="map-view" aria-label="Surface map built from ultrasonic sweeps"></canvas>
@@ -242,6 +244,17 @@
       const radians = angleDegrees * Math.PI / 180;
       return {x: -Math.sin(radians), y: Math.cos(radians)};
     }
+    const coverageImage = new Image();
+    let coverageStamp = null;
+    let lastMap = null;
+    function loadCoverage(map) {
+      if (!map.grid) return;
+      const stamp = `${map.run_id}-${map.scan_count}-${map.path.length}`;
+      if (stamp === coverageStamp) return;
+      coverageStamp = stamp;
+      coverageImage.onload = () => { if (lastMap) drawSurfaceMap(lastMap); };
+      coverageImage.src = `/api/mapping/coverage.png?t=${encodeURIComponent(stamp)}`;
+    }
     function drawSurfaceMap(map) {
       const {width, height} = prepareMapCanvas();
       const bounds = [{x: 0, y: 0}];
@@ -267,6 +280,21 @@
         y: height - offsetY - (y - minY) * scale
       });
 
+      // The coverage grid: free space, obstacles and unexplored edges.
+      if (map.grid && coverageImage.complete && coverageImage.naturalWidth) {
+        const [x0, y0, x1, y1] = map.grid.bounds;
+        const topLeft = toScreen([x0, y1]), bottomRight = toScreen([x1, y0]);
+        mapContext.imageSmoothingEnabled = false;
+        mapContext.drawImage(coverageImage, topLeft.x, topLeft.y, bottomRight.x - topLeft.x, bottomRight.y - topLeft.y);
+      }
+      if (map.frontier_target) {
+        const target = toScreen(map.frontier_target);
+        mapContext.strokeStyle = "#f2b35d";
+        mapContext.lineWidth = 2;
+        mapContext.beginPath(); mapContext.arc(target.x, target.y, 7, 0, Math.PI * 2); mapContext.stroke();
+        mapContext.beginPath(); mapContext.moveTo(target.x - 10, target.y); mapContext.lineTo(target.x + 10, target.y);
+        mapContext.moveTo(target.x, target.y - 10); mapContext.lineTo(target.x, target.y + 10); mapContext.stroke();
+      }
       mapContext.fillStyle = "rgba(242, 179, 93, .35)";
       for (const echo of map.echoes) {
         const point = toScreen(echo);
@@ -362,7 +390,9 @@
         `pose ±${map.pose_sigma_cm.toFixed(1)} cm, ±${map.heading_sigma_deg.toFixed(1)}°. ` +
         (map.history.length ? `${map.history.length} earlier session(s) joined · ` : "") +
         (map.links.length ? `${map.links.length} recognized place(s) · ` : "") +
-        "Solid = confirmed, dashed = seen once, dots = raw echoes, purple = recognized places.";
+        (map.grid ? `${(100 * map.grid.explored).toFixed(0)}% of the grid known · ` : "") +
+        "Solid = confirmed, dashed = seen once, dots = raw echoes, purple = recognized places, " +
+        "teal = swept free space, gold = unexplored edges, crosshair = where it is heading.";
     }
     function drawScan(observation) {
       const {width, height} = prepareMapCanvas();
@@ -434,6 +464,8 @@
         const map = await surfacesResponse.json();
         savedObservations = data.observations;
         if (map.path.length || map.surfaces.length || map.features.length) {
+          lastMap = map;
+          loadCoverage(map);
           drawSurfaceMap(map);
         } else {
           drawScan(data.observations[data.observations.length - 1] || null);
@@ -460,15 +492,23 @@
       mappingToggle.textContent = mapping.enabled
         ? "Stop mapping & auto explore" : "Start mapping & auto explore";
       mappingToggle.setAttribute("aria-pressed", String(mapping.enabled));
+      const calibrating = mapping.enabled && mapping.mode === "calibrate";
+      document.getElementById("calibrate-motion").dataset.running = String(calibrating);
+      document.getElementById("calibrate-motion").textContent = calibrating ? "Stop calibration" : "Calibrate turns & steps";
       resetMappingButton.disabled = mapping.enabled;
       document.getElementById("mapping-status").textContent = mapping.error
         ? `Mapping stopped: ${mapping.error}`
         : mapping.enabled
-          ? (mapping.state === "capturing" || mapping.state === "scanning"
+          ? (mapping.mode === "calibrate"
+            ? `Calibrating: ${mapping.plan || "starting"}`
+            : mapping.state === "capturing" || mapping.state === "scanning"
             ? "Stopped; capturing camera and range sweep…"
             : mapping.mode === "explore"
               ? `Auto explore: ${mapping.state}${mapping.plan ? ` (${mapping.plan})` : ""} · ${mapping.move_count} moves · ${localizationSummary(mapping)}`
               : "Survey active · drive manually, then stop to record a checkpoint.")
+          : mapping.state === "calibrated" ? "Calibration finished and saved."
+          : mapping.state === "calibration_failed" ? `Calibration measured nothing usable: ${mapping.plan || ""}`
+          : mapping.state === "explored" ? "Auto explore finished: no unexplored edges left within reach."
           : mapping.state === "blocked" ? "Auto explore stopped: no safe path visible in the forward scan."
             : mapping.state === "time_limit" ? "Auto explore stopped at its 4-minute limit."
               : mapping.state === "move_limit" ? "Auto explore stopped after 60 moves."
@@ -492,6 +532,45 @@
         mappingToggle.disabled = false;
       }
     });
+    const calibrateButton = document.getElementById("calibrate-motion");
+    calibrateButton.addEventListener("click", async () => {
+      const running = calibrateButton.dataset.running === "true";
+      if (!running && !window.confirm(
+        "Calibration turns the car left and right and drives it a little forward and back. " +
+        "Face it toward a flat wall about 1-1.5 m away, with room to turn, and stay beside it. Start?")) return;
+      calibrateButton.disabled = true;
+      try {
+        const response = await fetch("/api/calibration", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({enabled: !running, attended: true})
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+        updateMappingControls(result);
+      } catch (error) {
+        document.getElementById("calibration-status").textContent = `Calibration error: ${error.message}`;
+      } finally {
+        calibrateButton.disabled = false;
+      }
+    });
+    async function refreshCalibration() {
+      try {
+        const data = await (await fetch("/api/calibration", {cache: "no-store"})).json();
+        const calibration = data.calibration;
+        if (!calibration) return;
+        const turns = Object.entries(calibration.turn_ratios || {}).map(([side, sizes]) =>
+          `${side} ${Object.entries(sizes).map(([size, ratio]) => `${Number(size).toFixed(0)}°×${ratio.toFixed(2)}`).join(" ")}`);
+        const steps = Object.entries(calibration.step_durations || {}).map(([size, seconds]) =>
+          `${Number(size).toFixed(0)} cm=${(seconds * 1000).toFixed(0)} ms`);
+        document.getElementById("calibration-status").textContent =
+          `Calibrated ${new Date(calibration.created_at).toLocaleString()} · turns (real per odometry degree): ` +
+          `${turns.join("; ") || "none"} · steps: ${steps.join(", ") || "none"}` +
+          (calibration.forward_ratio ? ` · forward ×${calibration.forward_ratio.toFixed(2)}` : "");
+      } catch (_) {}
+    }
+    refreshCalibration();
+    setInterval(refreshCalibration, 5000);
     resetMappingButton.addEventListener("click", async () => {
       if (!window.confirm("Permanently delete all saved mapping observations?")) return;
       resetMappingButton.disabled = true;

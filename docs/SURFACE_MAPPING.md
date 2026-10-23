@@ -192,9 +192,14 @@ Older stops without keyframes get them from their saved pictures at start-up.
    plus a ring at 35 and 70 cm) and turns (±10° around the camera's
    estimate). If two different offsets fit equally well, as in a long
    corridor, the match is ignored.
-4. *Camera-only links.* With at least 80 inliers, the place nearby in the
-   same frame, and no usable sonar fit, the turn is kept with 8° and the
-   position with 50 cm uncertainty.
+4. *Heading links from every relevant picture.* Every stop is compared not
+   only with the best-voted places but also with nearby earlier stops (within
+   1.2 m) that faced a similar way (within 50°), up to eight verified per
+   stop. Only the immediately previous stop is skipped, since stop-to-stop
+   matching already covers it. A verified match without a sonar fit becomes
+   a heading-only link: tight (2.5°) for a pure turn, which the camera
+   measures well, loose (8°) otherwise. So the heading is always pinned to
+   everything the camera has seen before.
 
 **Pose graph.** Nodes are stops. Edges are the motion between consecutive
 stops (from the fused estimate, with its uncertainty; recorded as
@@ -202,9 +207,10 @@ stops (from the fused estimate, with its uncertainty; recorded as
 Gauss–Newton over SE(2) runs on the connected component, with its oldest stop
 fixed and Huber weighting on place links. After optimizing, any place link
 with χ² > 16.3 (99.9% for 3 dof) is dropped, worst first, and the graph is
-re-solved, so a false match cannot tear the map apart. After a successful
-recognition there's a two-stop pause before the next attempt, and at most
-two candidates per stop get the sonar alignment.
+re-solved, so a false match cannot tear the map apart. The graph's pose for
+the current stop is used every time, and the map is rebuilt whenever any stop
+moves by more than 4 cm or 2°. At most two candidates per stop get the
+costly sonar alignment, with a two-stop pause after a confirmed closure.
 
 **Sessions.** A new run starts in its own frame. When it recognizes a place
 from an earlier run, the run is moved rigidly into that run's frame and the
@@ -228,6 +234,61 @@ sonar room):
 - A room with different wall textures was not mistaken for the remembered
   one.
 
+## Exploring (frontiers)
+
+Code: `src/robocar/exploration.py`; the planner is `plan_explore_step` in
+`mapping.py`.
+
+- **Coverage grid.** A 5 cm log-odds grid built from every sweep (from the
+  joined sessions too, at their optimized poses). Each reading clears space
+  along three rays inside the beam's core, up to 250 cm. Only the centre ray
+  marks the echo as occupied, and at its real distance. The car's footprint
+  is free.
+- **Frontiers.** Free cells next to unknown ones, excluding those within
+  35 cm of anywhere the car has stood. The forward sonar never sees beside or
+  behind the car, and without this rule the car spun round looking at its own
+  flanks.
+- **Choosing.** Dijkstra over free cells at least a car's radius (16 cm) from
+  obstacles. Each reachable frontier costs its path length, plus 0.4 per
+  degree of turn, plus 25 for a left turn, minus a reward for its size. The
+  current target is kept unless another beats it by a clear margin, which
+  stopped flip-flopping when each sweep reshuffled the costs.
+- **Moving.** See the README. The sonar sweep always has the final word on
+  driving forward.
+- **In simulation** (rendered room, turns 15% long and steps 8% short that
+  odometry doesn't know about): the room interior was 89% mapped in 21 moves.
+  The pose stayed within 3.5 cm and 2.2°, and the learned scales reached the
+  true errors (0.96 vs 0.92 on steps, 1.18 vs 1.15 on turns).
+
+## Motion calibration
+
+Code: `src/robocar/calibration.py`. Turns: a strip of pictures every 5°
+across the whole pan range, then each turn size and direction is repeated,
+scaling the command by the measured ratio, until it lands within 2°. Then
+the camera brings the car back to its starting heading, so the step tests
+face the wall squarely. Steps: sonar median of 7 pings before and after each
+burst, and the burst length is updated by fitting a line through the last
+two tries (travel has an offset from dead zone and ramps). In simulation,
+with small turns overshooting 30% and a forward dead zone, every turn landed
+within 2° on its second try and steps converged to 10.0, 19.9 and 30.0 cm.
+
+## Sensor findings from the real car
+
+- **Ultrasonic smoothing.** The kit's gpiozero `DistanceSensor` reports the
+  median of its last 9 background pings (about 0.54 s). The sweep read each
+  angle after about 0.2 s, so readings mixed in earlier directions. That
+  smeared every profile in the sweep direction and inflated the apparent beam
+  width. The sensor is now rebuilt with a 3-ping median, and the sweep waits
+  for it to refresh at each angle.
+- **Colour order.** Picamera2's `"BGR888"` delivers R, G, B, so every frame had
+  red and blue swapped (the wood walls looked blue). The camera now uses
+  `"RGB888"`, which is B, G, R as OpenCV expects. This also matters for the
+  person/cat detector.
+- **Exposure and blur.** Snapshots used to grab the first frame of a freshly
+  opened camera (badly underexposed). Long exposures right after a move
+  smeared. See the README for the exposure ladder, steadiness check and
+  sharpness scoring.
+
 ## Persistence and API
 
 - Each observation stores the raw sweep, the refined pose and the estimate
@@ -249,8 +310,8 @@ transfers to the real car:
 | --- | --- | --- |
 | `SONAR_FORWARD_OFFSET_CM` | surfaces.py | Turning centre to the pan axis. |
 | `SONAR_BEAM_WIDTH_DEGREES` | surfaces.py | Starting value only; each map re-measures it from flat walls (`beam_width_deg` in `/api/mapping/surfaces`). |
-| `FORWARD_CM_PER_SECOND_AT_FULL_DUTY` | drive.py | Drive 1 s forward; measure. |
-| `TURN_DEGREES_PER_SECOND_AT_FULL_DUTY` | drive.py | Rotate 2 s; measure. The camera also reports turns. |
+| `FORWARD_CM_PER_SECOND_AT_FULL_DUTY` | drive.py | Run **Calibrate turns & steps**; it measures the real ratio. |
+| `TURN_DEGREES_PER_SECOND_AT_FULL_DUTY` | drive.py | Run **Calibrate turns & steps**; it measures per size and direction. |
 | `STRAFE_CM_PER_SECOND_AT_FULL_DUTY`, `MOTOR_DEADBAND_FRACTION` | drive.py | Strafe 1 s; lowest duty that moves the car. |
 | `CAMERA_HORIZONTAL_FOV_DEGREES` | mapping.py | IMX477 lens field of view. |
 

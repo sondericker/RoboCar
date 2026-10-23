@@ -215,7 +215,7 @@ class RememberedPlacesTests(unittest.TestCase):
             self.assertLess(position_error(estimate, (35.0, -15.0)), 4.0)
             surface_map = house.mapping.surface_map()
             self.assertEqual(len(surface_map["history"]), 1)
-            self.assertEqual(len(surface_map["links"]), 1)
+            self.assertGreaterEqual(len(surface_map["links"]), 1)
             self.assertEqual(house.mapping.status()["places"]["sessions"], 2)
         finally:
             house.close()
@@ -224,7 +224,9 @@ class RememberedPlacesTests(unittest.TestCase):
         reopened = SimulatedHouse(self.database)
         try:
             status = reopened.mapping.status()
-            self.assertEqual(status["places"], {"places": 7, "links": 1, "sessions": 2})
+            self.assertEqual(status["places"]["places"], 7)
+            self.assertGreaterEqual(status["places"]["links"], 1)
+            self.assertEqual(status["places"]["sessions"], 2)
             self.assertLess(position_error(status["pose"], (35.0, -15.0)), 4.0)
             self.assertEqual(len(reopened.mapping.surface_map()["history"]), 1)
         finally:
