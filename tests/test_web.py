@@ -88,6 +88,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/pan-tilt").get_json(), {
             "enabled": False,
             "mode": "simulation",
+            "fault": None,
             "pan": 90,
             "tilt": 100,
         })
@@ -170,6 +171,33 @@ class WebTests(unittest.TestCase):
             app.extensions["robocar_pan_tilt"].close()
             app.extensions["robocar_range_sensor"].close()
             app.extensions["robocar_camera"].close()
+
+
+
+class MissingCarBoardTests(unittest.TestCase):
+    """With the car's board switched off or unplugged the dashboard must still run."""
+
+    def test_the_service_starts_and_reports_the_motor_board_unavailable(self):
+        app = create_app(
+            Config(mapping_database=Path(":memory:"), hardware_enabled=True, freenove_server_path=Path("/no/such/kit"))
+        )
+        try:
+            client = app.test_client()
+            status = client.get("/api/status").get_json()
+            self.assertEqual(status["drive"]["mode"], "unavailable")
+            self.assertIn("not found", status["drive"]["fault"])
+            self.assertEqual(status["range"]["mode"], "unavailable")
+            refused = client.post("/api/drive", json={"throttle": 1, "strafe": 0, "steering": 0})
+            self.assertEqual(refused.status_code, 409)
+            self.assertIn("Motor board unavailable", refused.get_json()["error"])
+            self.assertEqual(client.post("/api/stop").status_code, 200)
+            self.assertEqual(client.post("/api/pan-tilt", json={"pan": 60, "tilt": 100}).status_code, 409)
+            explore = client.post("/api/mapping/explore", json={"enabled": True, "attended": True})
+            self.assertEqual(explore.status_code, 409)
+            self.assertIn("Motor board unavailable", explore.get_json()["error"])
+        finally:
+            for name in ("robocar_mapping", "robocar_drive", "robocar_pan_tilt", "robocar_range_sensor", "robocar_camera"):
+                app.extensions[name].close()
 
 
 if __name__ == "__main__":

@@ -63,6 +63,7 @@ class RangeSensorControllerTests(unittest.TestCase):
                 {
                     "enabled": False,
                     "mode": "disabled",
+                    "fault": None,
                     "distance_cm": None,
                     "error": None,
                     "updated_at": None,

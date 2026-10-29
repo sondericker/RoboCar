@@ -139,9 +139,14 @@ class FreenovePanTilt:
 
 
 class PanTiltController:
-    def __init__(self, driver: SimulatedPanTilt | FreenovePanTilt, physical: bool) -> None:
+    def __init__(
+        self, driver: SimulatedPanTilt | FreenovePanTilt, physical: bool, *, fault: str | None = None
+    ) -> None:
+        """With `fault` set (the servo board could not be reached) every move is
+        refused with that reason, so the rest of the service still runs."""
         self._driver = driver
         self._physical = physical
+        self._fault = fault
         self._lock = threading.Lock()
         self._inhibited = False
         self._pan, self._tilt = DEFAULT_PAN, DEFAULT_TILT
@@ -159,6 +164,8 @@ class PanTiltController:
         if isinstance(tilt, bool) or not isinstance(tilt, int) or not 30 <= tilt <= 150:
             raise ValueError("tilt must be an integer between 30 and 150")
         with self._lock:
+            if self._fault:
+                raise PanTiltInhibitedError(f"Pan/tilt unavailable: {self._fault}")
             if self._inhibited and not override:
                 raise PanTiltInhibitedError("Pan/tilt is controlled by the active mapping scan")
             self._driver.set_angles(pan, tilt)
@@ -172,8 +179,9 @@ class PanTiltController:
     def status(self) -> dict[str, object]:
         with self._lock:
             return {
-                "enabled": self._physical,
-                "mode": "hardware" if self._physical else "simulation",
+                "enabled": self._physical and not self._fault,
+                "mode": "unavailable" if self._fault else "hardware" if self._physical else "simulation",
+                "fault": self._fault,
                 "pan": self._pan,
                 "tilt": self._tilt,
             }
@@ -183,8 +191,13 @@ class PanTiltController:
 
 
 class DriveController:
-    def __init__(self, driver: MotorDriver, max_duty: int, command_timeout: float, physical: bool) -> None:
+    def __init__(
+        self, driver: MotorDriver, max_duty: int, command_timeout: float, physical: bool, *, fault: str | None = None
+    ) -> None:
+        """With `fault` set (the motor board could not be reached) every command
+        but stop is refused with that reason, so the rest of the service runs."""
         self._driver = driver
+        self._fault = fault
         self._max_duty = max_duty
         self._timeout = command_timeout
         self._physical = physical
@@ -217,6 +230,8 @@ class DriveController:
         rear_right = throttle + strafe + steering
         peak = max(1.0, abs(front_left), abs(rear_left), abs(front_right), abs(rear_right))
         with self._lock:
+            if self._fault and (throttle, strafe, steering) != (0, 0, 0):
+                raise DriveInhibitedError(f"Motor board unavailable: {self._fault}")
             if self._output_error is not None:
                 raise RuntimeError("Drive output worker failed") from self._output_error
             if self._inhibited and (throttle, strafe, steering) != (0, 0, 0):
@@ -278,8 +293,9 @@ class DriveController:
     def status(self) -> dict[str, object]:
         with self._lock:
             return {
-                "enabled": self._physical,
-                "mode": "hardware" if self._physical else "simulation",
+                "enabled": self._physical and not self._fault,
+                "mode": "unavailable" if self._fault else "hardware" if self._physical else "simulation",
+                "fault": self._fault,
                 "throttle": self._command[0],
                 "strafe": self._command[1],
                 "steering": self._command[2],

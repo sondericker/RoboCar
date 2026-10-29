@@ -299,6 +299,36 @@ Code: `src/robocar/exploration.py`; the planner is `plan_explore_step` in
   became free. Letting the car leave the wall margin by any route had it
   stepping deeper into it.
 
+## Recognized objects (`semantics.py`)
+
+- **Detection.** `ObjectDetector` (`detector.py`) runs YOLOv8s on the AI
+  HAT+ through HailoRT's `InferVStreams`. The model's output is "NMS by
+  class": for each class, rows of [y_min, x_min, y_max, x_max, score] as
+  fractions of the 640×640 letterboxed input, mapped back to frame pixels.
+  Without the HAT it falls back to YOLO11n on the CPU. A failure on the HAT
+  hands over to the CPU and the HAT is retried after 30 s; if both fail,
+  there are simply no detections.
+- **Bearings.** The OV5647 in the 640×480 mode reads 2560 of 2592 sensor
+  columns: about 53° across. Column u lies atan((u − 320)/f) to the right of
+  the axis, with f = 320/tan(26.5°); the head's pan bearing is added on top.
+- **Ranges.** The nearest sonar reading within the box's angular width plus
+  4° each side. None when the sweep saw nothing there, for example an object
+  below or above the beam.
+- **Moving things.** Readings toward a person or animal, out to 40 cm past
+  the nearest one and within its width plus 6°, are flagged `dynamic` in the
+  stored scan. `static_scan` blanks them for every mapping consumer; the
+  planner's clearances still use the raw scan.
+- **Landmarks.** A ranged sighting is a point with σ = 8 cm + 8% of range.
+  It joins the nearest landmark of the same label within max(60 cm, 3σ), as
+  a weighted mean. A bearing-only sighting confirms a landmark within 8° of
+  its ray. Otherwise it is paired with an earlier ray from at least 30 cm
+  away, at least 10° apart, crossing in front of both within 4 m, and the
+  crossing becomes a point with σ = 25 cm.
+- **Rooms.** Single-linkage groups of confirmed landmarks with room hints,
+  links up to 250 cm that cross no confirmed grid wall. The room hint
+  scores, weighted by each landmark's certainty, name the group when the
+  best reaches 1.5.
+
 ## Motion calibration
 
 Code: `src/robocar/calibration.py`. Turns: a strip of pictures every 5°

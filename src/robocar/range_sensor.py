@@ -91,6 +91,8 @@ class RangeSensorController:
         driver: RangeSensor | None,
         physical: bool,
         sample_interval: float = 0.2,
+        *,
+        fault: str | None = None,
     ) -> None:
         if sample_interval <= 0:
             raise ValueError("sample_interval must be greater than 0")
@@ -100,7 +102,8 @@ class RangeSensorController:
         self._lock = threading.Lock()
         self._read_lock = threading.Lock()
         self._distance_cm: float | None = None
-        self._error: str | None = None
+        self._fault = fault
+        self._error: str | None = fault
         self._updated_at: float | None = None
         self._closed = threading.Event()
         self._sampler: threading.Thread | None = None
@@ -119,9 +122,11 @@ class RangeSensorController:
 
     def status(self) -> dict[str, object]:
         with self._lock:
+            unavailable = self._physical and self._driver is None
             return {
-                "enabled": self._physical,
-                "mode": "hardware" if self._physical else "disabled",
+                "enabled": self._physical and not unavailable,
+                "mode": "unavailable" if unavailable else "hardware" if self._physical else "disabled",
+                "fault": self._fault,
                 "distance_cm": self._distance_cm,
                 "error": self._error,
                 "updated_at": self._updated_at,

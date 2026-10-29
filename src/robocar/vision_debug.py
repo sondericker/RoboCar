@@ -89,3 +89,26 @@ def render_matches(first_jpeg: bytes, second_jpeg: bytes, title: str, lines: lis
                         cv2.LINE_AA,
                     )
     return _with_caption(canvas, title, [f"{kept} matches kept (green), {rejected} rejected (red)", *lines])
+
+
+def render_detections(jpeg: bytes, detections: list[dict[str, object]], title: str, lines: list[str]) -> bytes | None:
+    """The stop picture with what the detector recognized boxed and labelled."""
+    thumbnail = _thumbnail(jpeg)
+    if thumbnail is None:
+        return None
+    image, scale = thumbnail
+    for detection in detections:
+        x, y, width, height = (round(float(value) * scale) for value in detection["box"])
+        colour = (80, 160, 255) if detection.get("dynamic") else (45, 220, 90)
+        cv2.rectangle(image, (x, y), (x + width, y + height), colour, 2)
+        cv2.putText(
+            image,
+            f"{detection['label']} {float(detection['confidence']):.0%}",
+            (x + 2, max(y - 4, 12)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            colour,
+            1,
+            cv2.LINE_AA,
+        )
+    return _with_caption(image, title, lines)

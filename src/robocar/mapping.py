@@ -8,7 +8,7 @@ import statistics
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
@@ -44,8 +44,9 @@ from robocar.places import (
     make_keyframe,
 )
 from robocar.range_sensor import RangeSensorController
+from robocar.semantics import SemanticMap, Sighting, hazards_from, mark_dynamic, sightings_from, static_scan
 from robocar.surfaces import SONAR_MAX_RANGE_CM, IntegrationReport, SurfaceMap, direction, extract_echoes, pose_rotation
-from robocar.vision_debug import render_features, render_matches
+from robocar.vision_debug import render_detections, render_features, render_matches
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,10 @@ AUTO_STEP_CM = 25.0
 # of whatever the sonar sees ahead.
 AUTO_LONG_STEP_CM = 60.0
 AUTO_MIN_STEP_CM = 10.0
+# A person or animal the camera sees within AUTO_BLOCKED_CONE_DEGREES of
+# where the car would drive, nearer than this (or at an unknown distance),
+# blocks the way.
+AUTO_HAZARD_RANGE_CM = 150.0
 # Too close to a wall to spin: slide this far sideways toward the roomier
 # side (readings beyond AUTO_STRAFE_SIDE_DEGREES), if it has at least
 # AUTO_STRAFE_MIN_ROOM_CM.
@@ -485,6 +490,10 @@ class SnapshotCamera(Protocol):
     def capture_snapshot(self) -> bytes | None: ...
 
 
+class ObjectDetectorLike(Protocol):
+    def detect(self, frame: np.ndarray) -> list[dict[str, object]]: ...
+
+
 class PanTilt(Protocol):
     def set_angles(
         self,
@@ -853,6 +862,37 @@ def plan_explore_step(
     just_backed_up: bool = False,
     previous_target: Sequence[float] | None = None,
     learner: ExplorationLearner | None = None,
+    hazards: Sequence[tuple[float, float | None]] = (),
+) -> ExploreStep:
+    """Plan the next move; people and animals the camera sees close ahead
+    (`hazards`: bearing and range) block the way like a wall would."""
+    step = _plan_explore_step(
+        scan, pose, grid, turns_without_progress, backup_bursts, just_backed_up, previous_target, learner, hazards
+    )
+    if _hazard_within(hazards, 0.0) and step.action != "forward":
+        step = replace(step, reason="a person or animal is close ahead; " + step.reason)
+    return step
+
+
+def _hazard_within(hazards: Sequence[tuple[float, float | None]], heading_change: float) -> bool:
+    """Whether a person or animal is close ahead once the car has turned by `heading_change`."""
+    return any(
+        abs((bearing - heading_change + 180.0) % 360.0 - 180.0) <= AUTO_BLOCKED_CONE_DEGREES
+        and (distance is None or distance < AUTO_HAZARD_RANGE_CM)
+        for bearing, distance in hazards
+    )
+
+
+def _plan_explore_step(
+    scan: Sequence[dict[str, object]],
+    pose: Sequence[float],
+    grid: CoverageGrid,
+    turns_without_progress: int,
+    backup_bursts: int,
+    just_backed_up: bool,
+    previous_target: Sequence[float] | None,
+    learner: ExplorationLearner | None,
+    hazards: Sequence[tuple[float, float | None]],
 ) -> ExploreStep:
     """Decide the next autonomous move toward the most promising frontier.
 
@@ -870,7 +910,12 @@ def plan_explore_step(
     ahead = forward_clearance(scan)
     clearances = direction_clearances(scan)
     # Right after backing out of a dead end, never drive straight back in.
-    ahead_clear = ahead is not None and ahead >= AUTO_MIN_CLEARANCE_CM and not just_backed_up
+    ahead_clear = (
+        ahead is not None
+        and ahead >= AUTO_MIN_CLEARANCE_CM
+        and not just_backed_up
+        and not _hazard_within(hazards, 0.0)
+    )
     can_turn = bool(clearances) and min(clearances.values()) >= AUTO_TURN_MIN_CLEARANCE_CM
     turning_allowed = can_turn and turns_without_progress < AUTO_MAX_TURNS_WITHOUT_PROGRESS
     if not can_turn and clearances:
@@ -937,7 +982,7 @@ def plan_explore_step(
         # Just lining up with a waypoint the map shows clear: no need for a
         # sweep in between, only a ping ahead before driving on.
         then = 0.0
-        if degrees == bearing and distance_to_waypoint >= AUTO_MIN_STEP_CM + 10.0:
+        if degrees == bearing and distance_to_waypoint >= AUTO_MIN_STEP_CM + 10.0 and not _hazard_within(hazards, degrees):
             facing = (pose[0], pose[1], float(pose[2]) + degrees)
             then = min(AUTO_LONG_STEP_CM, distance_to_waypoint, grid.clear_run(facing, AUTO_LONG_STEP_CM))
             if then < AUTO_MIN_STEP_CM:
@@ -1043,8 +1088,14 @@ class MappingController:
         pan_tilt: PanTilt,
         range_sensor: RangeSensorController,
         store: MappingStore,
+        detector: "ObjectDetectorLike | None" = None,
     ) -> None:
         self._camera = camera
+        # Recognizes objects in each stop's picture (on the AI HAT+ when present).
+        self._detector = detector
+        self._semantic = SemanticMap()
+        # People and animals seen at the latest stop, as (bearing, range).
+        self._hazards: list[tuple[float, float | None]] = []
         self._drive = drive
         self._pan_tilt = pan_tilt
         self._range_sensor = range_sensor
@@ -1119,6 +1170,8 @@ class MappingController:
         if attended is not True:
             raise ValueError("Attended supervision must be confirmed before exploring")
         drive_status = self._drive.status()
+        if drive_status.get("fault"):
+            raise RuntimeError(f"Motor board unavailable: {drive_status['fault']}")
         if drive_status["mode"] != "hardware":
             raise RuntimeError("Autonomous exploration requires hardware mode")
         if any(
@@ -1135,6 +1188,8 @@ class MappingController:
         if attended is not True:
             raise ValueError("Attended supervision must be confirmed before calibrating")
         drive_status = self._drive.status()
+        if drive_status.get("fault"):
+            raise RuntimeError(f"Motor board unavailable: {drive_status['fault']}")
         if drive_status["mode"] != "hardware":
             raise RuntimeError("Calibration requires hardware mode")
         if any(abs(float(drive_status[axis])) > 0.01 for axis in ("throttle", "strafe", "steering")):
@@ -1220,6 +1275,7 @@ class MappingController:
             with self._map_lock:
                 self._surface_map = SurfaceMap()
                 self._grid = CoverageGrid()
+                self._semantic = SemanticMap()
                 self._path, self._history, self._links = [], [], []
                 self._map_run_id = run_id
             return
@@ -1270,6 +1326,10 @@ class MappingController:
                 "plan": self._plan,
                 "calibrated_at": self._calibration.created_at if self._calibration else None,
                 "exploration_learning": self._learner.to_json(),
+                "hazards": [
+                    {"bearing_deg": round(bearing, 1), "range_cm": None if distance is None else round(distance, 1)}
+                    for bearing, distance in self._hazards
+                ],
                 "pose": [round(value, 1) for value in self._pose],
                 "pose_sigma_cm": round(position_sigma, 1),
                 "heading_sigma_deg": round(heading_sigma, 1),
@@ -1281,6 +1341,9 @@ class MappingController:
         with self._map_lock:
             status["surface_count"] = len(self._surface_map.walls())
             status["feature_count"] = len(self._surface_map.features())
+            status["landmark_count"] = len(self._semantic.confirmed())
+        detector_info = getattr(self._detector, "info", None)
+        status["detector"] = detector_info() if callable(detector_info) else None
         return status
 
     def observations(self) -> list[dict[str, object]]:
@@ -1306,6 +1369,7 @@ class MappingController:
                 [[round(start[0], 1), round(start[1], 1)], [round(end[0], 1), round(end[1], 1)]]
                 for start, end in self._links
             ]
+            data.update(self._semantic.to_json(self._grid.wall_between))
         data["pose_sigma_cm"] = round(position_sigma, 1)
         data["heading_sigma_deg"] = round(heading_sigma, 1)
         return data
@@ -1334,6 +1398,7 @@ class MappingController:
             with self._map_lock:
                 self._surface_map = SurfaceMap()
                 self._grid = CoverageGrid()
+                self._semantic = SemanticMap()
                 self._explore_target = None
                 self._path = []
                 self._history = []
@@ -1375,12 +1440,14 @@ class MappingController:
             ]
         surface_map = SurfaceMap()
         grid = CoverageGrid()
+        semantic = SemanticMap()
         path: list[Pose] = []
         history: dict[str, list[Pose]] = {}
         report = None
         for other, stop, pose in stops:
             report = surface_map.integrate(stop.scan, pose, *stop.pose_sigma)
             grid.integrate(stop.scan, pose, surface_map.beam_width_deg)
+            semantic.add(stop.sightings, pose)
             if stop.run_id == run_id:
                 path.append(pose)
             else:
@@ -1388,6 +1455,7 @@ class MappingController:
         with self._map_lock:
             self._surface_map = surface_map
             self._grid = grid
+            self._semantic = semantic
             self._path = path
             self._history = list(history.values())
             self._links = links
@@ -1466,6 +1534,7 @@ class MappingController:
                 # angle) counts as blocked: the planner turns rather than drives.
                 with self._lock:
                     pose = self._pose
+                    hazards = list(self._hazards)
                 with self._map_lock:
                     step = plan_explore_step(
                         scan,
@@ -1476,6 +1545,7 @@ class MappingController:
                         just_backed_up,
                         self._explore_target,
                         self._learner,
+                        hazards,
                     )
                     self._explore_target = step.target
                 with self._lock:
@@ -1656,6 +1726,39 @@ class MappingController:
             + (f"; {corrections} correction(s)" if corrections else ""),
         ]
         self._set_vision("turn", "Turn check", lines, lambda: render_matches(strip[best_pan][0], current[0], "Turn check", lines))
+
+    def _recognize(self, image_jpeg: bytes | None, camera_bearing: float, scan: list[dict[str, object]]) -> list[Sighting]:
+        """Objects in a stop's picture, placed by bearing and sonar range.
+        Recognition is a bonus: any trouble with it leaves the stop without."""
+        if self._detector is None or not image_jpeg:
+            return []
+        try:
+            frame = cv2.imdecode(np.frombuffer(image_jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                return []
+            detections = self._detector.detect(frame)
+            sightings = sightings_from(detections, frame.shape[1], camera_bearing, scan)
+        except Exception:
+            logger.exception("Object recognition failed at this stop; carrying on without it")
+            return []
+        if detections:
+            drawn = [
+                {**detection, "dynamic": detection.get("label") in {s.label for s in sightings if s.dynamic}}
+                for detection in detections
+            ]
+            lines = [
+                ", ".join(
+                    f"{s.label} {s.bearing_deg:+.0f} deg" + (f" {s.range_cm:.0f} cm" if s.range_cm is not None else "")
+                    for s in sightings[:4]
+                )
+                or "nothing that matters for the map",
+            ]
+            if any(s.dynamic for s in sightings):
+                lines.append("people/animals (orange) are kept out of the map")
+            self._set_vision(
+                "objects", "What the camera recognized", lines, lambda: render_detections(image_jpeg, drawn, "What the camera recognized", lines)
+            )
+        return sightings
 
     def _set_vision(self, name: str, title: str, lines: list[str], render: Callable[[], bytes | None]) -> None:
         """Store a dashboard picture; drawing problems never stop mapping."""
@@ -1994,6 +2097,11 @@ class MappingController:
         scan, side_views = self._sweep(original_tilt, original_pan, side_pans)
         if scan is None:
             return []
+        # What the camera recognizes: people and animals are kept out of the
+        # map (mapping_scan), furniture becomes landmarks.
+        sightings = self._recognize(image_jpeg, pan_bearing(original_pan), scan)
+        scan = mark_dynamic(scan, sightings)
+        mapping_scan = static_scan(scan)
         if side_views:
             views.update(side_views)
             view_estimates += estimate_view_motion(previous_views or {}, side_views)
@@ -2032,7 +2140,7 @@ class MappingController:
             prior_pose, prior_covariance = propagate(previous_pose, previous_covariance, prediction)
 
         with self._map_lock:
-            echoes = [echo for run in extract_echoes(scan, self._surface_map.beam_width_deg) for echo in run]
+            echoes = [echo for run in extract_echoes(mapping_scan, self._surface_map.beam_width_deg) for echo in run]
             registration = register_scan(echoes, prior_pose, prior_covariance, self._surface_map)
         pose, covariance = registration.pose, registration.covariance
         position_sigma, heading_sigma = pose_sigma(covariance)
@@ -2064,6 +2172,7 @@ class MappingController:
             "pose_sigma": [round(position_sigma, 2), round(heading_sigma, 2)],
             "surfaces_before": {"walls": counts[0], "features": counts[1]},
             "exposure": exposure,
+            "detections": [sighting.to_json() for sighting in sightings],
         }
         with self._lock:
             previous_node = self._last_node
@@ -2091,7 +2200,7 @@ class MappingController:
             self._store.save_keyframe(keyframe)
         with self._places_lock:
             update = self._places.add_stop(
-                observation_id, run_id, pose, scan, (position_sigma, heading_sigma), keyframe, edge
+                observation_id, run_id, pose, scan, (position_sigma, heading_sigma), keyframe, edge, sightings
             )
             event = update.event
             # The pose graph has the final word, using every constraint so far.
@@ -2127,12 +2236,14 @@ class MappingController:
             report = self._rebuild_map(observation_id, run_id)
         else:
             with self._map_lock:
-                report = self._surface_map.integrate(scan, pose, position_sigma, heading_sigma)
-                self._grid.integrate(scan, pose, self._surface_map.beam_width_deg)
+                report = self._surface_map.integrate(mapping_scan, pose, position_sigma, heading_sigma)
+                self._grid.integrate(mapping_scan, pose, self._surface_map.beam_width_deg)
+                self._semantic.add(sightings, pose)
                 self._path.append(pose)
         captured_at = datetime.now(timezone.utc).isoformat()
         with self._lock:
             self._pose, self._pose_covariance = pose, covariance
+            self._hazards = hazards_from(sightings)
             self._last_node = observation_id
             self._last_odometry = odometry
             self._last_camera_views = views

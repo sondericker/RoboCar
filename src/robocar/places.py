@@ -31,6 +31,7 @@ import cv2
 import numpy as np
 
 from robocar.localization import Pose, compose, register_scan, relative, wrap_degrees
+from robocar.semantics import Sighting, static_scan
 from robocar.surfaces import SurfaceMap, extract_echoes, pose_rotation
 
 logger = logging.getLogger(__name__)
@@ -477,8 +478,9 @@ class PlaceStore:
 class _Stop:
     run_id: str
     sequence: int
-    scan: list[dict[str, object]]
+    scan: list[dict[str, object]]  # for mapping: readings that hit people or animals left out
     pose_sigma: tuple[float, float]
+    sightings: list[Sighting] = field(default_factory=list)
 
 
 class PlaceMemory:
@@ -508,7 +510,8 @@ class PlaceMemory:
             pose = (float(observation["pose_x_cm"]), float(observation["pose_y_cm"]), float(observation["heading_deg"]))
             estimate = observation["estimate"] or {}
             sigma = estimate.get("pose_sigma", (0.0, 0.0))
-            self._add_stop(node, run_id, pose, observation["scan"], (float(sigma[0]), float(sigma[1])))
+            sightings = [Sighting.from_json(item) for item in estimate.get("detections") or ()]
+            self._add_stop(node, run_id, pose, observation["scan"], (float(sigma[0]), float(sigma[1])), sightings)
             edge = estimate.get("edge")
             previous = previous_by_run.get(run_id)
             if edge and int(edge["from"]) in self.graph.nodes:
@@ -548,10 +551,18 @@ class PlaceMemory:
         for component in self.graph.components():
             self._settle(component)
 
-    def _add_stop(self, node: int, run_id: str, pose: Pose, scan: list[dict[str, object]], pose_sigma: tuple[float, float]) -> None:
+    def _add_stop(
+        self,
+        node: int,
+        run_id: str,
+        pose: Pose,
+        scan: list[dict[str, object]],
+        pose_sigma: tuple[float, float],
+        sightings: Sequence[Sighting] = (),
+    ) -> None:
         sequence = self._run_lengths.get(run_id, 0)
         self._run_lengths[run_id] = sequence + 1
-        self._stops[node] = _Stop(run_id, sequence, scan, pose_sigma)
+        self._stops[node] = _Stop(run_id, sequence, static_scan(scan), pose_sigma, list(sightings))
         self.graph.add_node(node, pose, run_id)
 
     def add_stop(
@@ -563,9 +574,10 @@ class PlaceMemory:
         pose_sigma: tuple[float, float],
         keyframe: Keyframe | None,
         edge: tuple[int, Pose, Sequence[float]] | None,
+        sightings: Sequence[Sighting] = (),
     ) -> StopUpdate:
         """Remember a stop, then localize it against every relevant past picture."""
-        self._add_stop(node, run_id, pose, scan, pose_sigma)
+        self._add_stop(node, run_id, pose, scan, pose_sigma, sightings)
         if edge is not None and edge[0] in self.graph.nodes:
             self.graph.add_edge(GraphEdge(edge[0], node, edge[1], information_from_sigma(edge[2]), "odometry"))
         self.last_event = None

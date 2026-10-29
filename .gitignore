@@ -8,3 +8,6 @@ build/
 dist/
 *.egg-info/
 .lgd-*
+
+# HailoRT writes this wherever it runs
+hailort.log

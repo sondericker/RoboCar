@@ -1,3 +1,4 @@
+import logging
 import math
 
 from flask import Flask, Response, jsonify, render_template, request
@@ -19,31 +20,51 @@ from robocar.mapping import MappingController, MappingStore
 from robocar.range_sensor import FreenoveRangeSensor, RangeSensorController
 
 
+logger = logging.getLogger(__name__)
+
+
+def _open_hardware(name: str, opener):
+    """Open a piece of the car's hardware; on failure log why and return the reason.
+
+    A car board that is switched off or unplugged must not take the whole
+    dashboard (and the camera with it) down: that part is reported as
+    unavailable instead."""
+    try:
+        return opener(), None
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        logger.error("%s unavailable: %s", name, reason)
+        return None, reason
+
+
 def create_app(config: Config | None = None) -> Flask:
     config = config or Config.from_env()
-    driver = (
-        FreenoveDriver(config.freenove_server_path)
-        if config.hardware_enabled
-        else SimulatedDriver()
+    drive_fault = pan_tilt_fault = range_fault = None
+    if config.hardware_enabled:
+        driver, drive_fault = _open_hardware("Motor board", lambda: FreenoveDriver(config.freenove_server_path))
+        pan_tilt_driver, pan_tilt_fault = _open_hardware(
+            "Pan/tilt servos", lambda: FreenovePanTilt(config.freenove_server_path)
+        )
+        range_sensor_driver, range_fault = _open_hardware(
+            "Ultrasonic sensor", lambda: FreenoveRangeSensor(config.freenove_server_path)
+        )
+    else:
+        driver, pan_tilt_driver, range_sensor_driver = SimulatedDriver(), SimulatedPanTilt(), None
+    drive = DriveController(
+        driver or SimulatedDriver(),
+        config.max_motor_duty,
+        config.command_timeout,
+        config.hardware_enabled,
+        fault=drive_fault,
     )
-    pan_tilt_driver = (
-        FreenovePanTilt(config.freenove_server_path)
-        if config.hardware_enabled
-        else SimulatedPanTilt()
-    )
-    range_sensor_driver = (
-        FreenoveRangeSensor(config.freenove_server_path)
-        if config.hardware_enabled
-        else None
-    )
-    drive = DriveController(driver, config.max_motor_duty, config.command_timeout, config.hardware_enabled)
-    pan_tilt = PanTiltController(pan_tilt_driver, config.hardware_enabled)
-    range_sensor = RangeSensorController(range_sensor_driver, config.hardware_enabled)
+    pan_tilt = PanTiltController(pan_tilt_driver or SimulatedPanTilt(), config.hardware_enabled, fault=pan_tilt_fault)
+    range_sensor = RangeSensorController(range_sensor_driver, config.hardware_enabled, fault=range_fault)
     detector = ObjectDetector(
         config.model_path,
         config.labels_path,
         config.confidence,
         config.nms_threshold,
+        hailo_model=config.hailo_model_path,
     )
     camera = CameraService(
         config.camera_backend,
@@ -59,6 +80,7 @@ def create_app(config: Config | None = None) -> Flask:
         pan_tilt=pan_tilt,
         range_sensor=range_sensor,
         store=MappingStore(config.mapping_database),
+        detector=detector,
     )
 
     app = Flask(__name__)

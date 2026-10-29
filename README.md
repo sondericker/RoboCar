@@ -29,11 +29,24 @@ drive commands are simulated and cannot move the car. To stop it, press
 Ctrl+C in the terminal. Camera processing starts paused; press **Start camera
 processing** when you want the live feed and detections.
 
-The dashboard loads a small COCO-pretrained YOLO11 ONNX model by default and
-draws labeled boxes, including the `person` and `cat` classes. On first launch
-the application downloads the official `yolo11n.onnx` asset to
-`~/.cache/robocar/`. Set `ROBOCAR_MODEL_PATH` to another YOLO ONNX model to
-change it. Inference uses ONNX Runtime CPU providers.
+The dashboard detects the 80 everyday COCO object classes (people, pets,
+furniture, appliances…) and draws labelled boxes on the live feed.
+
+- **On the Raspberry Pi AI HAT+** (Hailo-8 or 8L) it runs YOLOv8s from the
+  `hailo-models` package, with non-maximum suppression done on the chip.
+  That takes about 12 ms a frame (the chip alone manages 300 frames a second)
+  and leaves the CPU free. Install it with `sudo apt install hailo-all`.
+- **Otherwise** it runs YOLO11n on the CPU through ONNX Runtime. On first
+  launch it downloads the official `yolo11n.onnx` to `~/.cache/robocar/`;
+  set `ROBOCAR_MODEL_PATH` to use another YOLO ONNX model.
+- `ROBOCAR_DETECTOR` chooses: `auto` (the default) uses the HAT when it is
+  there and the CPU model otherwise. If the HAT fails mid-run, the CPU model
+  takes over and the HAT is retried every 30 seconds. `hailo` and `cpu` use
+  only that one; `off` turns detection off. `ROBOCAR_HAILO_MODEL` picks a
+  different `.hef` file.
+- HailoRT lets one program use the HAT at a time. While RoboCar runs, other
+  Hailo tools (and RoboCar's hardware test) report it busy; a second RoboCar
+  started meanwhile uses the CPU.
 
 ## Raspberry Pi setup
 
@@ -62,8 +75,15 @@ controls are a convenience, not a safety-rated emergency stop. Do not expose
 the unauthenticated control server to an untrusted network; its default
 loopback binding is intentional.
 
-If hardware startup reports that the PCA9685 at I²C address `0x40` did not
-respond, make sure the car battery is connected so the kit board is powered,
+If the car's board cannot be reached at startup (switched off, flat
+batteries, unplugged), the dashboard and camera still start. The motors,
+pan/tilt head or range sensor that could not be reached show as
+**unavailable**, with the reason, and refuse commands (stop always works).
+Mapping and calibration say why they cannot start. Fix the board and restart
+the service.
+
+If the motor board is reported unavailable because the PCA9685 at I²C
+address `0x40` did not respond, make sure the car battery is connected so the kit board is powered,
 then check its I²C connection. On this kit the motor controller communicates
 over I²C (not SPI). With the car powered, run `i2cdetect -y 1`; the board
 should appear at address `40`. The YOLO/ONNX schema messages printed during
@@ -267,6 +287,30 @@ becomes one persistent house map built from every joined session, and
 exploration prefers ground no session has covered yet. The dashboard draws
 earlier sessions faintly and recognized places as purple dashed links. The
 whole graph is rebuilt from the database when RoboCar restarts.
+
+**What the camera recognizes (AI HAT+ or CPU):** each stop's picture goes
+through the object detector. A detection's direction comes from where it sits
+in the picture and where the head was pointing; its distance comes from the
+sonar readings in that direction. Several things follow from that:
+
+- **People and pets** move, so sonar readings that hit them are flagged and
+  kept out of the walls, the coverage map, scan matching and place memory.
+  They still count for safety: the explorer will not drive at a person or
+  animal within 25° of ahead and closer than 150 cm (or at an unknown
+  distance). A stop's sighting of one is shown in orange in the dashboard's
+  "What the camera recognized" picture.
+- **Furniture and appliances** become landmarks on the map. These are chairs,
+  couches, beds, tables, the TV, fridge, oven, microwave, sink, toilet, plants
+  and so on. A sighting with a sonar range is a point. Without one, two
+  sightings from places at least 30 cm apart are triangulated. Repeated
+  sightings are merged, and a landmark appears once it has been seen twice
+  or once with high confidence.
+- **Rooms** are named from their landmarks: a bed means a bedroom, an oven or
+  fridge a kitchen, a couch or TV a living room, a toilet a bathroom.
+  Landmarks belong to one room when they are within 2.5 m of each other with
+  no confirmed wall between them.
+- **Corrections carry over:** the semantic map is rebuilt from the stored
+  sightings at the pose graph's optimized poses, so loop closures move it too.
 
 **Each run builds on the last:** starting a mapping run never clears the map.
 The run starts from the newest stop of any earlier run, with every earlier

@@ -720,6 +720,17 @@ class CoverageGrid:
             travelled = step
         return travelled
 
+    def wall_between(self, start: Sequence[float], end: Sequence[float]) -> bool:
+        """Whether a confirmed wall lies on the straight line between two points."""
+        if not self.log_odds.size:
+            return False
+        length = math.hypot(end[0] - start[0], end[1] - start[1])
+        for fraction in np.linspace(0.0, 1.0, max(2, int(length / (self.cell / 2)) + 1)):
+            cell = self.cell_of((start[0] + fraction * (end[0] - start[0]), start[1] + fraction * (end[1] - start[1])))
+            if self._inside(cell) and self.log_odds[cell] > CONFIRMED_ABOVE:
+                return True
+        return False
+
     def _inside(self, cell: tuple[int, int]) -> bool:
         return 0 <= cell[0] < self.log_odds.shape[0] and 0 <= cell[1] < self.log_odds.shape[1]
 

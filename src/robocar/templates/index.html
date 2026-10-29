@@ -264,6 +264,8 @@
       map.surfaces.forEach(surface => bounds.push(
         {x: surface.start[0], y: surface.start[1]}, {x: surface.end[0], y: surface.end[1]}));
       map.features.forEach(feature => bounds.push({x: feature.position[0], y: feature.position[1]}));
+      const landmarks = map.landmarks || [], rooms = map.rooms || [];
+      landmarks.forEach(landmark => bounds.push({x: landmark.x, y: landmark.y}));
       const minX = Math.min(...bounds.map(point => point.x));
       const maxX = Math.max(...bounds.map(point => point.x));
       const minY = Math.min(...bounds.map(point => point.y));
@@ -330,6 +332,27 @@
         mapContext.fill();
       }
 
+      // What the camera recognized: named rooms, then the objects in them.
+      mapContext.textAlign = "center";
+      for (const room of rooms) {
+        const point = toScreen([room.x, room.y]);
+        mapContext.font = "600 18px system-ui, sans-serif";
+        mapContext.fillStyle = "rgba(213, 140, 240, .45)";
+        mapContext.fillText(room.name, point.x, point.y - 18);
+      }
+      mapContext.font = "11px system-ui, sans-serif";
+      for (const landmark of landmarks) {
+        const point = toScreen([landmark.x, landmark.y]);
+        mapContext.fillStyle = "#d58cf0";
+        mapContext.beginPath();
+        mapContext.moveTo(point.x, point.y - 5); mapContext.lineTo(point.x + 5, point.y);
+        mapContext.lineTo(point.x, point.y + 5); mapContext.lineTo(point.x - 5, point.y);
+        mapContext.closePath(); mapContext.fill();
+        mapContext.fillStyle = "#ecd2f7";
+        mapContext.fillText(landmark.label, point.x, point.y - 8);
+      }
+      mapContext.textAlign = "start";
+
       // Earlier sessions joined to this one by a recognized place.
       mapContext.strokeStyle = "rgba(169, 232, 215, .3)";
       mapContext.lineWidth = 1;
@@ -391,8 +414,11 @@
         (map.history.length ? `${map.history.length} earlier session(s) joined · ` : "") +
         (map.links.length ? `${map.links.length} recognized place(s) · ` : "") +
         (map.grid ? `${(100 * map.grid.explored).toFixed(0)}% of the grid known · ` : "") +
+        (landmarks.length ? `${landmarks.length} object(s) recognized` +
+          (rooms.length ? ` (${rooms.map(room => room.name).join(", ")})` : "") + " · " : "") +
         "Solid = confirmed, dashed = seen once, dots = raw echoes, purple = recognized places, " +
-        "teal = swept free space, gold = unexplored edges, crosshair = where it is heading.";
+        "teal = swept free space, gold = unexplored edges, crosshair = where it is heading, " +
+        "violet = objects and rooms the camera recognized.";
     }
     function drawScan(observation) {
       const {width, height} = prepareMapCanvas();
@@ -633,6 +659,8 @@
         updateCameraControls(camera.enabled);
         driveStatus.textContent = controlError
           ? `Control error: ${controlError}`
+          : status.drive.fault
+          ? `Motor board unavailable: ${status.drive.fault}`
           : `Mode: ${status.drive.mode} · PWM cap ${status.drive.max_duty}/4095 · watchdog ${status.drive.watchdog_timeout_seconds.toFixed(1)} s · forward ${status.drive.throttle.toFixed(2)} · strafe ${status.drive.strafe.toFixed(2)} · rotate ${status.drive.steering.toFixed(2)}`;
         const headResponse = await fetch("/api/pan-tilt", {cache: "no-store"});
         const head = await headResponse.json();
