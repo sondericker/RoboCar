@@ -139,6 +139,16 @@ AUTO_STRIP_AGREEMENT_DEGREES = 4.0
 AUTO_ALIGN_PLAUSIBLE_RATIO = (0.5, 2.0)
 AUTO_ALIGN_MAX_CORRECTION_DEGREES = 20.0
 AUTO_ALIGN_FRAMES = 2
+# While exploring, the strip pictures for the first turn piece are taken
+# during the stop's sonar sweep (which passes every pan anyway) rather than in
+# a second pass of the head. They are only reused while the car and head are
+# still where they were: within this much movement.
+SWEEP_STRIP_MAX_MOVE_CM = 1.0
+SWEEP_STRIP_MAX_TURN_DEG = 1.0
+# Strip pictures are taken at the sweep's nearest step (it steps every 3
+# degrees) rather than adding stops of their own; the turn check uses each
+# picture's actual angle, so being off by up to this much costs nothing.
+SWEEP_STRIP_SNAP_DEG = 1.5
 AUTO_ALIGN_SETTLE_SECONDS = 0.15
 AUTO_VIEW_STEADY_TIMEOUT_SECONDS = 1.0
 PAN_LIMITS = (30, 150)
@@ -492,6 +502,16 @@ class SnapshotCamera(Protocol):
 
 class ObjectDetectorLike(Protocol):
     def detect(self, frame: np.ndarray) -> list[dict[str, object]]: ...
+
+
+@dataclass(frozen=True)
+class SweepStrip:
+    """Turn-measurement pictures taken during a stop's sweep, and where from."""
+
+    pictures: dict[int, tuple[bytes, ...]]  # by pan
+    centre_pan: int
+    tilt: int
+    odometry: Pose
 
 
 class PanTilt(Protocol):
@@ -1096,6 +1116,8 @@ class MappingController:
         self._semantic = SemanticMap()
         # People and animals seen at the latest stop, as (bearing, range).
         self._hazards: list[tuple[float, float | None]] = []
+        # Turn-strip pictures from the latest sweep, until a turn uses them.
+        self._sweep_strip: SweepStrip | None = None
         self._drive = drive
         self._pan_tilt = pan_tilt
         self._range_sensor = range_sensor
@@ -1662,7 +1684,9 @@ class MappingController:
             for step in range(0, AUTO_STRIP_REACH_DEGREES + 1, AUTO_STRIP_STEP_DEGREES)
             if PAN_LIMITS[0] <= centre_pan - sign * step <= PAN_LIMITS[1]
         ]
-        strip = self._capture_views(pans, tilt, centre_pan, frames=1)
+        strip = self._strip_from_sweep(pans, centre_pan, tilt)
+        if strip is None:
+            strip = self._capture_views(pans, tilt, centre_pan, frames=1)
         odometry_before = self._drive.odometry()[2]
         if not self._turn_by(degrees):
             return False
@@ -1826,17 +1850,22 @@ class MappingController:
         return False
 
     def _capture_best_picture(
-        self, steady_timeout: float = CAMERA_STEADY_TIMEOUT_SECONDS
+        self, steady_timeout: float = CAMERA_STEADY_TIMEOUT_SECONDS, *, already_steady: bool = False
     ) -> tuple[bytes | None, dict[str, object] | None]:
         """Take a picture, check its levels, and retake with adjusted exposure
-        until it is decent or the settings run out; keep the best one."""
+        until it is decent or the settings run out; keep the best one.
+
+        `already_steady` skips the wait for matching frames first (the caller
+        has held everything still long enough); a blurred picture is still
+        retaken after waiting for steadiness."""
         set_exposure = getattr(self._camera, "set_exposure", None)
         if set_exposure is None:
             return self._camera.capture_snapshot(), None
         with self._lock:
             index = self._exposure_index
         set_exposure(EXPOSURE_LADDER[index])
-        self._wait_until_steady(steady_timeout)
+        if not already_steady:
+            self._wait_until_steady(steady_timeout)
         tried: dict[int, PictureQuality] = {}
         retook_blurred = False
         best: tuple[int, bytes, PictureQuality] | None = None
@@ -2094,7 +2123,12 @@ class MappingController:
             )
         )
         side_pans = tuple(pan for pan in SIDE_VIEW_PANS if pan != original_pan) if need_side_views else ()
-        scan, side_views = self._sweep(original_tilt, original_pan, side_pans)
+        # Exploring, a turn may follow: take its strip pictures on the way past.
+        strip_pans = self._sweep_strip_pans(original_pan) if mode == "explore" else []
+        scan, side_views = self._sweep(original_tilt, original_pan, side_pans, strip_pans)
+        if self._sweep_strip is not None:
+            # The car stands still for a stop, so the odometry read for it holds.
+            self._sweep_strip = replace(self._sweep_strip, odometry=odometry)
         if scan is None:
             return []
         # What the camera recognizes: people and animals are kept out of the
@@ -2283,12 +2317,21 @@ class MappingController:
         tilt: int,
         original_pan: int,
         view_pans: Sequence[int],
+        strip_pans: Sequence[int] = (),
     ) -> tuple[list[dict[str, object]] | None, dict[ViewKey, tuple[bytes, ...]]]:
-        """Sweep the ultrasonic sensor, grabbing camera views at the requested pans."""
+        """Sweep the ultrasonic sensor, grabbing camera views at the requested
+        pans and turn-strip pictures at `strip_pans` (kept in self._sweep_strip)."""
         scan: list[dict[str, object]] = []
         views: dict[ViewKey, tuple[bytes, ...]] = {}
+        strip: dict[int, tuple[bytes, ...]] = {}
+        self._sweep_strip = None
         sensor_enabled = bool(self._range_sensor.status()["enabled"])
-        pans = sorted(set(view_pans) | (set(SCAN_ANGLES) if sensor_enabled else set()))
+        pans = sorted(set(view_pans) | set(strip_pans) | (set(SCAN_ANGLES) if sensor_enabled else set()))
+        # Side views are compared with the previous stop's, so they keep the
+        # stop's exposure even if a strip picture needed another one.
+        with self._lock:
+            stop_exposure = self._exposure_index
+        set_exposure = getattr(self._camera, "set_exposure", None)
         if not pans:
             return scan, views
         # A sensor that reports a running median needs time to forget the last
@@ -2307,7 +2350,20 @@ class MappingController:
                 self._pan_tilt.set_angles(pan, tilt, override=True)
                 if self._stop_event.wait(settle):
                     return None, views
+                if pan in strip_pans:
+                    # The same picture checks as a strip taken in a pass of
+                    # its own, so turns are measured as well. The head has
+                    # only stepped 3 degrees and been held still at least as
+                    # long as that pass would, so the up-front wait for
+                    # matching frames is skipped (blur still forces a retake).
+                    if self._stop_event.wait(max(0.0, AUTO_ALIGN_SETTLE_SECONDS - settle)):
+                        return None, views
+                    picture, _ = self._capture_best_picture(AUTO_VIEW_STEADY_TIMEOUT_SECONDS, already_steady=True)
+                    if picture is not None:
+                        strip[pan] = (picture,)
                 if pan in view_pans:
+                    if strip and set_exposure is not None:
+                        set_exposure(EXPOSURE_LADDER[stop_exposure])
                     frame = self._camera.capture_snapshot()
                     if frame is not None:
                         views[(pan, tilt)] = (frame,)
@@ -2342,7 +2398,41 @@ class MappingController:
                 self._pan_tilt.set_angles(original_pan, tilt, override=True)
             finally:
                 self._pan_tilt.set_inhibited(False)
+        if strip:
+            # Where the car stood is filled in by the caller, which has read it.
+            self._sweep_strip = SweepStrip(strip, original_pan, tilt, (math.nan, math.nan, math.nan))
         return scan, views
+
+    def _sweep_strip_pans(self, centre_pan: int) -> list[int]:
+        """Pans for turn-strip pictures during a sweep: the strip's every 10
+        degrees both sides, moved to the sweep's nearest step."""
+        stops = set(SCAN_ANGLES) | {SCAN_LEAD_IN_PAN} if self._range_sensor.status()["enabled"] else set()
+        pans = set()
+        for offset in range(-AUTO_STRIP_REACH_DEGREES, AUTO_STRIP_REACH_DEGREES + 1, AUTO_STRIP_STEP_DEGREES):
+            wanted = centre_pan + offset
+            if not PAN_LIMITS[0] <= wanted <= PAN_LIMITS[1]:
+                continue
+            nearest = min(stops, key=lambda pan: abs(pan - wanted), default=wanted)
+            pans.add(nearest if abs(nearest - wanted) <= SWEEP_STRIP_SNAP_DEG else wanted)
+        return sorted(pans)
+
+    def _strip_from_sweep(self, pans: Sequence[int], centre_pan: int, tilt: int) -> dict[int, tuple[bytes, ...]] | None:
+        """The sweep's pictures nearest each of `pans`, if every one was taken
+        and the car and head have not moved since. Used once: the turn moves
+        the car."""
+        sweep_strip, self._sweep_strip = self._sweep_strip, None
+        if sweep_strip is None or sweep_strip.centre_pan != centre_pan or sweep_strip.tilt != tilt:
+            return None
+        moved = relative(sweep_strip.odometry, self._drive.odometry())
+        if math.hypot(moved[0], moved[1]) > SWEEP_STRIP_MAX_MOVE_CM or abs(moved[2]) > SWEEP_STRIP_MAX_TURN_DEG:
+            return None
+        strip: dict[int, tuple[bytes, ...]] = {}
+        for wanted in pans:
+            nearest = min(sweep_strip.pictures, key=lambda pan: abs(pan - wanted))
+            if abs(nearest - wanted) > SWEEP_STRIP_SNAP_DEG:
+                return None
+            strip[nearest] = sweep_strip.pictures[nearest]
+        return strip
 
     def _learned_odometry_scale(
         self,

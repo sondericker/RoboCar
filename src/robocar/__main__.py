@@ -20,6 +20,9 @@ def main() -> None:
         app.extensions["robocar_pan_tilt"].close()
         app.extensions["robocar_range_sensor"].close()
         app.extensions["robocar_camera"].close()
+        # Last, once nothing uses it: HailoRT crashes the process at exit if
+        # its session is left for the interpreter to tear down.
+        app.extensions["robocar_detector"].close()
 
     def stop_on_signal(signum: int, frame: object) -> None:
         raise SystemExit(128 + signum)

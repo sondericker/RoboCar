@@ -166,8 +166,14 @@ After each sweep it decides where to go by **what it could learn there**:
   and before the car would come within its radius of any mapped wall.
   Walls met at a glancing angle never echo, so the sonar alone cannot be
   trusted for this. Paths keep away from walls where there is room.
-- **Camera-measured turns:** before each turn piece, the camera photographs a strip
-  every 10° across the pan on the turn side (0–60°). The car then turns
+- **Camera-measured turns:** before each turn piece the car needs a strip of
+  pictures every 10° across the pan on the turn side (0–60°). While exploring,
+  the first piece's strip is taken during the stop's sonar sweep, which
+  passes those angles anyway. Pictures go at the sweep's nearest 3° step, with
+  the same exposure and blur checks, so the head makes one pass instead of
+  two. That saves 0.4–1.2 s a stop with realistic camera timing. The strip is
+  only reused if the car and head have not moved since the sweep; later
+  pieces of a big turn, and anything else, take a strip of their own. The car then turns
   closed-loop on wheel odometry. Afterwards its new forward view is matched
   against every strip picture, and at least two must agree on how far it
   really turned. If the turn is off by more than 3° and the measurement

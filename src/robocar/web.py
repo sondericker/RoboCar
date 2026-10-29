@@ -85,6 +85,7 @@ def create_app(config: Config | None = None) -> Flask:
 
     app = Flask(__name__)
     app.extensions["robocar_camera"] = camera
+    app.extensions["robocar_detector"] = detector
     app.extensions["robocar_drive"] = drive
     app.extensions["robocar_pan_tilt"] = pan_tilt
     app.extensions["robocar_range_sensor"] = range_sensor

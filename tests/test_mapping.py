@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 import math
 import tempfile
 import time
@@ -268,31 +269,26 @@ class MappingTests(unittest.TestCase):
         _, current_jpeg = cv2.imencode(".jpg", current_image)
 
         class ImageSequenceCamera:
+            """The previous view at the first stop, the turned view at the second."""
+
             def __init__(self) -> None:
-                self.images = iter(
-                    (
-                        previous_jpeg.tobytes(),
-                        previous_jpeg.tobytes(),
-                        previous_jpeg.tobytes(),
-                        current_jpeg.tobytes(),
-                        current_jpeg.tobytes(),
-                        current_jpeg.tobytes(),
-                    )
-                )
+                self.view = previous_jpeg.tobytes()
 
             def capture_snapshot(self) -> bytes:
-                return next(self.images)
+                return self.view
 
         drive = DriveController(SimulatedDriver(), max_duty=1000, command_timeout=1, physical=True)
         pan_tilt = PanTiltController(SimulatedPanTilt(), physical=True)
         range_sensor = RangeSensorController(None, physical=False)
         store = MappingStore(Path(":memory:"))
-        mapping = MappingController(ImageSequenceCamera(), drive, pan_tilt, range_sensor, store)
+        camera = ImageSequenceCamera()
+        mapping = MappingController(camera, drive, pan_tilt, range_sensor, store)
         mapping._run_id = "visual-run"
         odometry = iter([(0.0, 0.0, 0.0), (0.0, 0.0, 12.0)])
         try:
             with patch.object(drive, "odometry", side_effect=lambda: next(odometry)):
                 mapping._capture_observation(mode="explore")
+                camera.view = current_jpeg.tobytes()
                 mapping._capture_observation(mode="explore")
 
             observations = mapping.observations()
@@ -692,6 +688,75 @@ class MappingTests(unittest.TestCase):
             drive.close()
             pan_tilt.close()
             range_sensor.close()
+
+    def turning_rig(self):
+        """A car over a panorama whose real turns run 1.6 times what odometry
+        says, with every head position recorded."""
+        scene = PanoramaScene()
+        drive = DriveController(SimulatedDriver(), max_duty=4095, command_timeout=1, physical=True)
+
+        class RecordingPanTilt(SimulatedPanTilt):
+            def __init__(self) -> None:
+                super().__init__()
+                self.visited: list[int] = []
+
+            def set_angles(self, pan: int, tilt: int) -> None:
+                super().set_angles(pan, tilt)
+                self.visited.append(pan)
+
+        pan_driver = RecordingPanTilt()
+        pan_tilt = PanTiltController(pan_driver, physical=True)
+
+        def true_heading() -> float:
+            return 1.6 * drive.odometry()[2]
+
+        class SceneCamera:
+            def capture_snapshot(self) -> bytes:
+                return scene.view(true_heading() + 90 - pan_driver.pan)
+
+        range_sensor = RangeSensorController(None, physical=False)
+        mapping = MappingController(SceneCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")))
+        for resource in (range_sensor, pan_tilt, drive, mapping):
+            self.addCleanup(resource.close)
+        return mapping, drive, pan_driver, true_heading
+
+    def strip_pans(self):
+        return [90 + offset for offset in range(-60, 61, 10)]
+
+    def test_a_turn_reuses_the_strip_taken_during_the_sweep(self):
+        mapping, drive, pan_driver, true_heading = self.turning_rig()
+        with patch("robocar.mapping.AUTO_ALIGN_SETTLE_SECONDS", 0.001):
+            mapping._sweep(100, 90, (), self.strip_pans())
+            mapping._sweep_strip = replace(mapping._sweep_strip, odometry=drive.odometry())
+            self.assertEqual(sorted(mapping._sweep_strip.pictures), self.strip_pans())
+            pan_driver.visited.clear()
+            self.assertTrue(mapping._turn_and_align(25.0))
+        # No second pass of the head: only the forward view after the turn.
+        self.assertEqual(set(pan_driver.visited), {90, 84})
+        # Measured and corrected just as well as with a strip of its own.
+        self.assertAlmostEqual(true_heading(), 25.0, delta=4.0)
+        self.assertAlmostEqual(mapping._verified_turn, true_heading(), delta=1.5)
+        self.assertIsNone(mapping._sweep_strip)  # used once: the car has turned
+
+    def test_after_moving_the_sweep_strip_is_not_trusted(self):
+        mapping, drive, pan_driver, true_heading = self.turning_rig()
+        with patch("robocar.mapping.AUTO_ALIGN_SETTLE_SECONDS", 0.001):
+            mapping._sweep(100, 90, (), self.strip_pans())
+            mapping._sweep_strip = replace(mapping._sweep_strip, odometry=drive.odometry())
+            self.assertTrue(mapping._move_burst(1.0, 0.2))
+            pan_driver.visited.clear()
+            self.assertTrue(mapping._turn_and_align(25.0))
+        self.assertIn(40, pan_driver.visited)  # it took a fresh strip
+        self.assertAlmostEqual(mapping._verified_turn, true_heading(), delta=1.5)
+
+    def test_only_exploring_takes_strip_pictures_during_the_sweep(self):
+        mapping, drive, pan_driver, true_heading = self.turning_rig()
+        mapping._run_id = "survey"
+        mapping._capture_observation(mode="survey")
+        self.assertIsNone(mapping._sweep_strip)
+        mapping._capture_observation(mode="explore")
+        self.assertEqual(sorted(mapping._sweep_strip.pictures), self.strip_pans())
+        self.assertEqual(mapping._sweep_strip.odometry, drive.odometry())
 
     def test_turn_without_usable_camera_views_relies_on_odometry(self):
         drive = DriveController(SimulatedDriver(), max_duty=4095, command_timeout=1, physical=True)
