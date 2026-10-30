@@ -84,6 +84,18 @@ REST_SECONDS = (45.0, 75.0)
 REST_FIDGET_SECONDS = (8.0, 20.0)
 LOST_AFTER_LOOKS = 3
 HEAD_TRACK_LIMIT_DEG = 35.0  # turn the body once the head is this far off
+# A person seen close in front blocks every forward motion (play moves'
+# forward parts included) for this long, unless the car turns away this far
+# or a fresh look straight ahead shows nobody there.
+PERSON_BLOCK_SECONDS = 20.0
+# "In front" for a person: a little wider than the car's path, since the
+# camera sits ahead of the wheels' centre.
+PERSON_AHEAD_DEG = 30.0
+PERSON_BLOCK_TURNED_DEG = 40.0
+# Before driving forward the camera must have looked ahead this recently,
+# and since then the car not turned further than this; otherwise it looks again.
+FRONT_LOOK_SECONDS = 6.0
+FRONT_LOOK_TURNED_DEG = 25.0
 SIDE_MARGIN_CM = 20.0  # sideways clearance kept, from the sonar on the head
 BACK_LIMIT_CM = 25.0
 MOVE_SECONDS_PER_CM = 1 / 60.0
@@ -178,7 +190,7 @@ def cat_view_from(detections: Sequence[Mapping[str, object]], pan: int, frame_wi
         bearing = pan_bearing(pan) + pixel_bearing(x + width / 2, frame_width)
         if label in CAT_LABELS and (cat is None or float(detection["confidence"]) > cat.confidence):
             cat = CatView(bearing, float(height), float(detection["confidence"]), (x, y, width, height), frame_width)
-        elif label == "person" and abs(bearing) <= 25.0 and height >= 0.45 * frame_height:
+        elif label == "person" and abs(bearing) <= PERSON_AHEAD_DEG and height >= 0.45 * frame_height:
             person_ahead = True
     return Look(cat, person_ahead)
 
@@ -442,6 +454,8 @@ class HuntEngine:
         self.head = 90
         self.belief: CatBelief | None = None
         self.last_cat_position: tuple[float, float] | None = None
+        self.person_seen: tuple[float, float] | None = None  # when, and the car's heading then
+        self.front_looked: tuple[float, float] | None = None  # the last look ahead: when, heading
         self.end_reason: str | None = None
         self.unreachable: list[tuple[float, float, float]] = []  # x, y, until
         self.performed = ""  # the move that actually ran (moves fall back when there is no room)
@@ -545,6 +559,12 @@ class HuntEngine:
             self.head = pan
             look = self.body.look(pan)
         self.stats["looks"] += 1
+        if abs(pan_bearing(pan)) <= 10.0:
+            self.front_looked = (self.body.now(), self.body.pose()[2])
+        if look.person_ahead:
+            self.person_seen = (self.body.now(), self.body.pose()[2])
+        elif abs(pan_bearing(pan)) <= 10.0:
+            self.person_seen = None
         if look.cat is not None:
             self._see(look.cat)
         elif self.track is not None and abs(pan_bearing(pan) - self.track.bearing) <= CAMERA_HFOV_DEG / 2 - 5.0:
@@ -686,6 +706,10 @@ class HuntEngine:
                 room = min(room, ahead - SEEK_STANDOFF_CM)
             if room < 8.0:
                 return False
+            if self._person_in_the_way():
+                self._say(action="someone is standing in the way; waiting for them to move")
+                self._check(self.body.wait(2.0))
+                return False
             self._check(self.body.move(room, 0.0))
             if self._look(90).cat is not None:
                 return self._found()
@@ -778,8 +802,26 @@ class HuntEngine:
             and (track.distance is None or track.distance >= MIN_CAT_DISTANCE_CM)
         )
 
+    def _turned_since(self, heading: float) -> float:
+        return abs((self.body.pose()[2] - heading + 180.0) % 360.0 - 180.0)
+
+    def _person_in_the_way(self) -> bool:
+        """Whether a person may be close in front, looking ahead again first
+        when the last look ahead is old or the car has turned since."""
+        looked = self.front_looked
+        if (
+            looked is None
+            or self.body.now() - looked[0] > FRONT_LOOK_SECONDS
+            or self._turned_since(looked[1]) > FRONT_LOOK_TURNED_DEG
+        ):
+            self._look(90)
+        if self.person_seen is None:
+            return False
+        seen_at, heading = self.person_seen
+        return self.body.now() - seen_at <= PERSON_BLOCK_SECONDS and self._turned_since(heading) <= PERSON_BLOCK_TURNED_DEG
+
     def _safe_forward(self, wanted: float, speed: float = 1.0) -> float:
-        if not self._cat_clear_to_move():
+        if not self._cat_clear_to_move() or self._person_in_the_way():
             return 0.0
         distance = min(wanted, self._forward_room())
         if distance < 3.0:
@@ -800,7 +842,7 @@ class HuntEngine:
     def _slide(self, forward: float, sideways: float) -> bool:
         """A sideways or diagonal move inside a play move, checked against
         the cat first. Room was measured by the move itself."""
-        if not self._cat_clear_to_move():
+        if not self._cat_clear_to_move() or (forward > 0 and self._person_in_the_way()):
             return False
         self._check(self.body.move(forward, sideways))
         return True

@@ -15,7 +15,7 @@ import numpy as np
 
 from explore_sim import FloorPlan, NO_ECHO_CM, ROOM_A, CORRIDOR, ROOM_B
 from robocar.exploration import CoverageGrid
-from robocar.hunt import CAMERA_HFOV_DEG, DEFAULT_SIZE_SCALE, CatView, Look, pan_bearing
+from robocar.hunt import CAMERA_HFOV_DEG, DEFAULT_SIZE_SCALE, PERSON_AHEAD_DEG, CatView, Look, pan_bearing
 from robocar.surfaces import SONAR_BEAM_WIDTH_DEGREES, direction, sonar_origin
 
 CAT_RADIUS_CM = 10.0
@@ -153,7 +153,7 @@ class SimHuntBody:
         if self.person is not None:
             offset = np.array(self.person) - camera
             bearing = math.degrees(math.atan2(-offset[0], offset[1]))
-            person_ahead = abs((bearing - self.truth[2] + 180) % 360 - 180) <= 25 and np.linalg.norm(offset) < 150
+            person_ahead = abs((bearing - self.truth[2] + 180) % 360 - 180) <= PERSON_AHEAD_DEG and np.linalg.norm(offset) < 150
         return Look(cat, person_ahead)
 
     def ping(self, pan: int) -> float | None:

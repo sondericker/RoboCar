@@ -92,18 +92,19 @@ AUTO_STEP_CM = 25.0
 # of whatever the sonar sees ahead.
 AUTO_LONG_STEP_CM = 60.0
 AUTO_MIN_STEP_CM = 10.0
-# The car believes it knows where it is on the map while: the map has walls
-# to match against; a sweep matched them (or it recognized a place) within
-# the last few stops; its pose estimate is this certain; and it has not since
-# moved further than this on wheel counts alone.
+# The car believes it knows where it is on the map while: there is a map to
+# match against; a sweep has matched it (or it recognized a place) since the
+# service started; its pose estimate, which grows less certain with every
+# move on wheel counts, is this certain; and it has driven no further than
+# this on wheel counts since that last match. (Matches are rare with the
+# real sonar, so recency is judged by distance, not by stops.)
 LOCALIZED_MIN_WALLS = 2
 # ...or this many obstacle cells on the coverage map.
 LOCALIZED_MIN_OCCUPIED_CELLS = 40
-LOCALIZED_MAX_STOPS_SINCE_FIX = 2
 LOCALIZED_MAX_SIGMA_CM = 30.0
 LOCALIZED_MAX_HEADING_SIGMA_DEG = 12.0
-LOCALIZED_MAX_DEAD_RECKONING_CM = 200.0
-LOCALIZED_MAX_DEAD_RECKONING_DEG = 180.0
+LOCALIZED_MAX_DEAD_RECKONING_CM = 400.0
+LOCALIZED_MAX_DEAD_RECKONING_DEG = 540.0
 # The hunt waits this long after pointing the head before a picture or
 # ping, plus a little per degree turned (the servo takes about 0.2 s for 60).
 HUNT_HEAD_SETTLE_SECONDS = 0.08
@@ -204,6 +205,11 @@ MAP_REBUILD_MOVE_CM = 4.0
 # tied to the last stop only this loosely; its first sweep against the known
 # walls (or a recognized place) pins it down.
 CONTINUE_POSITION_SIGMA_CM = 25.0
+# A run started while the service has kept tracking the wheels since the
+# last stop keeps its pose and certainty, but at least this uncertain: the
+# car may have been lifted and set down a little way off.
+CONTINUE_SAME_SESSION_SIGMA_CM = 10.0
+CONTINUE_SAME_SESSION_HEADING_SIGMA_DEG = 5.0
 # Fitting a sweep to the coverage map when wall registration fails: how far
 # to search (twice the pose's uncertainty, within these bounds) and how sure
 # a good fit leaves the pose.
@@ -211,8 +217,8 @@ GRID_MATCH_MIN_REACH_CM = 12.0
 GRID_MATCH_MAX_REACH_CM = 32.0
 GRID_MATCH_MIN_REACH_DEG = 8.0
 GRID_MATCH_MAX_REACH_DEG = 24.0
-GRID_MATCH_SIGMA_CM = 8.0
-GRID_MATCH_HEADING_SIGMA_DEG = 3.0
+GRID_MATCH_SIGMA_CM = 12.0
+GRID_MATCH_HEADING_SIGMA_DEG = 5.0
 CONTINUE_HEADING_SIGMA_DEG = 20.0
 MAP_REBUILD_TURN_DEG = 2.0
 VIEW_HEADING_SIGMA_AFTER_MATCH = 3.0
@@ -1518,6 +1524,8 @@ class MappingController:
         # Stops since the pose was last pinned to the map (a sonar sweep
         # matched to mapped walls, or a recognized place); None if never.
         self._stops_since_fix: int | None = None
+        # Wheel travel (cm, degrees) between the last fix and the last stop.
+        self._travel_since_fix = (0.0, 0.0)
 
     def start(self) -> None:
         self._start("survey", self._run_survey)
@@ -1750,12 +1758,27 @@ class MappingController:
         with self._lock:
             # Wheel odometry since that stop, the previous views and the
             # learned scales carry over when the service has kept running.
+            tracked = self._last_node == last and self._last_odometry is not None
             self._pose = pose
-            self._pose_covariance = np.diag(
-                [CONTINUE_POSITION_SIGMA_CM**2, CONTINUE_POSITION_SIGMA_CM**2, math.radians(CONTINUE_HEADING_SIGMA_DEG) ** 2]
-            )
+            if tracked:
+                # The wheels have been counted since that stop: the next stop
+                # adds whatever they saw, so the estimate stays as sure as it was.
+                floor = np.diag(
+                    [
+                        CONTINUE_SAME_SESSION_SIGMA_CM**2,
+                        CONTINUE_SAME_SESSION_SIGMA_CM**2,
+                        math.radians(CONTINUE_SAME_SESSION_HEADING_SIGMA_DEG) ** 2,
+                    ]
+                )
+                self._pose_covariance = np.maximum(self._pose_covariance, floor)
+            else:
+                self._pose_covariance = np.diag(
+                    [CONTINUE_POSITION_SIGMA_CM**2, CONTINUE_POSITION_SIGMA_CM**2, math.radians(CONTINUE_HEADING_SIGMA_DEG) ** 2]
+                )
+                self._stops_since_fix = None
+                self._travel_since_fix = (0.0, 0.0)
             self._last_node = last
-            self._joining_run = True
+            self._joining_run = not tracked
             self._last_localization = None
             self._verified_turn = None
 
@@ -1833,33 +1856,37 @@ class MappingController:
         with self._lock:
             position_sigma, heading_sigma = pose_sigma(self._pose_covariance)
             since = self._stops_since_fix
+            travelled, rotated = self._travel_since_fix
             last_odometry = self._last_odometry
         with self._map_lock:
             walls = len(self._surface_map.walls())
             mapped = walls >= LOCALIZED_MIN_WALLS or int(self._grid.occupied().sum()) >= LOCALIZED_MIN_OCCUPIED_CELLS
-        moved = turned = 0.0
+        moved, turned = travelled, rotated
         if last_odometry is not None:
             change = relative(last_odometry, self._drive.odometry())
-            moved, turned = math.hypot(change[0], change[1]), abs(wrap_degrees(change[2]))
+            moved += math.hypot(change[0], change[1])
+            turned += abs(wrap_degrees(change[2]))
         reasons = []
         if not mapped:
             reasons.append("no map to match against yet")
         elif since is None:
             reasons.append("has not matched itself to the map yet")
-        elif since > LOCALIZED_MAX_STOPS_SINCE_FIX:
-            reasons.append(f"no map match at the last {since} stops")
         if position_sigma > LOCALIZED_MAX_SIGMA_CM:
             reasons.append(f"position uncertain (±{position_sigma:.0f} cm)")
         if heading_sigma > LOCALIZED_MAX_HEADING_SIGMA_DEG:
             reasons.append(f"heading uncertain (±{heading_sigma:.0f}°)")
         if moved > LOCALIZED_MAX_DEAD_RECKONING_CM:
-            reasons.append(f"drove {moved / 100:.1f} m on wheel counts since its last check")
+            reasons.append(f"drove {moved / 100:.1f} m on wheel counts since it last matched the map")
         if turned > LOCALIZED_MAX_DEAD_RECKONING_DEG:
-            reasons.append(f"turned {turned:.0f}° on wheel counts since its last check")
+            reasons.append(f"turned {turned:.0f}° on wheel counts since it last matched the map")
         if reasons:
             detail = "; ".join(reasons)
         else:
-            when = "at the last stop" if since == 0 else f"{since} stops ago"
+            when = (
+                "at the last stop"
+                if since == 0
+                else f"{since} stops ago, {moved / 100:.1f} m of wheel counts since"
+            )
             detail = f"matched to the map {when}: ±{position_sigma:.0f} cm, ±{heading_sigma:.0f}°"
         return {
             "known": not reasons,
@@ -2801,8 +2828,13 @@ class MappingController:
             self._pose, self._pose_covariance = pose, covariance
             if fixed or event is not None:
                 self._stops_since_fix = 0
+                self._travel_since_fix = (0.0, 0.0)
             elif self._stops_since_fix is not None:
                 self._stops_since_fix += 1
+                self._travel_since_fix = (
+                    self._travel_since_fix[0] + math.hypot(raw_odometry[0], raw_odometry[1]),
+                    self._travel_since_fix[1] + abs(raw_odometry[2]),
+                )
             self._hazards = hazards_from(sightings)
             self._last_node = observation_id
             self._last_odometry = odometry

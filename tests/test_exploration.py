@@ -1,4 +1,5 @@
 import math
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ from robocar.exploration import (
     save_learner,
 )
 from explore_sim import CORRIDOR, ROOM_A, ROOM_B, FloorPlan, explore
+from robocar.surfaces import SONAR_BEAM_WIDTH_DEGREES, SONAR_FORWARD_OFFSET_CM
 
 
 def sweep_into(grid: CoverageGrid, floor: FloorPlan, pose) -> None:
@@ -70,6 +72,59 @@ class GridTests(unittest.TestCase):
         # angled away from it, free to go.
         self.assertLess(grid.clear_run((-250.0, 55.0, 110.0), 60.0), 5.0)
         self.assertGreater(grid.clear_run((-250.0, 55.0, 70.0), 60.0), 30.0)
+
+
+class ScanMatchTests(unittest.TestCase):
+    """Fitting a sweep to the coverage map when walls won't register."""
+
+    @classmethod
+    def setUpClass(cls):
+        from hunt_sim import build_map  # the house as a mapping run leaves it
+
+        cls.floor = FloorPlan()
+        cls.grid = build_map(cls.floor)
+
+    def test_a_trusted_match_puts_the_car_roughly_where_it_is(self):
+        rng = random.Random(5)
+        trusted = 0
+        cases = 0
+        while cases < 30:
+            truth = (rng.uniform(-120, 120), rng.uniform(-70, 120), rng.uniform(0, 360))
+            if self.floor.clearance(truth[:2]) < 25:
+                continue
+            cases += 1
+            guess = (truth[0] + rng.uniform(-20, 20), truth[1] + rng.uniform(-20, 20), truth[2] + rng.uniform(-15, 15))
+            match = self.grid.match_scan(self.floor.scan(truth), guess, 24.0, 20.0)
+            self.assertIsNotNone(match)
+            self.assertGreaterEqual(match.score, match.prior_score - 0.05)
+            if match.good:
+                trusted += 1
+                self.assertLess(math.hypot(match.pose[0] - truth[0], match.pose[1] - truth[1]), 20.0, match.summary())
+                self.assertLess(abs((match.pose[2] - truth[2] + 180) % 360 - 180), 8.0, match.summary())
+        self.assertGreaterEqual(trusted, 5)
+
+    def test_a_sweep_of_one_long_wall_is_not_trusted(self):
+        # A single wall pins how far away it is, not where along it the car stands.
+        grid = CoverageGrid()
+
+        def wall_scan(pose):
+            readings = []
+            for angle in range(-90, 91, 5):
+                bearing = math.radians(pose[2] + angle)
+                forward = math.cos(bearing)
+                origin_y = pose[1] + math.cos(math.radians(pose[2])) * SONAR_FORWARD_OFFSET_CM
+                distance = (150.0 - origin_y) / forward if forward > 0.2 else None
+                readings.append({"angle_deg": float(angle), "distance_cm": distance if distance and distance < 250 else 300.0})
+            return readings
+
+        for x in range(-150, 151, 30):
+            pose = (float(x), 0.0, 0.0)
+            grid.integrate(wall_scan(pose), pose, SONAR_BEAM_WIDTH_DEGREES)
+        match = grid.match_scan(wall_scan((0.0, 0.0, 0.0)), (18.0, 0.0, 0.0), 24.0, 10.0)
+        self.assertTrue(match is None or not match.good, match and match.summary())
+
+    def test_no_map_no_match(self):
+        self.assertIsNone(CoverageGrid().match_scan(self.floor.scan((0.0, 0.0, 0.0)), (0.0, 0.0, 0.0), 20.0, 10.0))
 
 
 class LearnerTests(unittest.TestCase):

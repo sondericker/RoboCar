@@ -136,9 +136,12 @@ The map marks where the cat was last seen and its favourite spots.
   - **Cats move:** it drifts back toward the prior as time passes.
   - **Where next:** the car goes where it could see the most of it per
     centimetre of travel, routed on the map and checked with the sonar.
-  - **On arrival:** a full sweep (re-checking the map and its position),
-    then it pans the camera across the room. It also glances ahead after
-    every leg. Detection runs on the AI HAT+, in about 12 ms a picture.
+  - **On arrival:** with the head facing ahead, a full sweep re-checks the
+    map and its position, taking pictures every 10° from 60° left to 60°
+    right on the way (shown as the panorama). Those pictures are checked for
+    the cat, so the camera only pans again when the car has moved since. It
+    also glances ahead after every leg. Detection runs on the AI HAT+, in
+    about 12 ms a picture.
 - **Sharp pictures:** every hunt picture waits until the car and head have
   been still a moment, then until two frames in a row match. Its sharpness
   is then compared with recent pictures. A soft one is retaken after a
@@ -181,7 +184,10 @@ The map marks where the cat was last seen and its favourite spots.
     - sideways moves by a glance that way and floor the map *knows* is
       clear;
     - reversing (never more than 25 cm) only through known-clear floor.
-  - **People:** nothing drives at a person close ahead.
+  - **People:** nothing drives at a person close ahead (within 30° of
+    straight ahead). That covers the forward part of every play move too.
+    After the car has turned, or a few seconds have passed, it takes a
+    fresh look ahead before driving forward.
   - **Stopping:** the hunt stops after 20 minutes, on a critically low
     battery, or on **STOP**.
 
@@ -279,10 +285,33 @@ After each sweep it decides where to go by **what it could learn there**:
   and before the car would come within its radius of any mapped wall.
   Walls met at a glancing angle never echo, so the sonar alone cannot be
   trusted for this. Paths keep away from walls where there is room.
-- **Sweep panorama:** at each survey or explore stop, pictures taken every
-  10° during the sonar sweep are joined into a panorama about 130° wide. It
-  is shown in the dashboard's "What the camera sees" panels. Each picture
-  contributes the slice between its neighbours, so the joins line up.
+- **Sweep panorama:** at each survey, explore or hunt stop, pictures taken
+  every 10° during the sonar sweep, from 60° left to 60° right of straight
+  ahead, are joined into a panorama about 170° wide. It is shown in the
+  dashboard's "What the camera sees" panels. Each picture contributes the
+  slice between its neighbours, so the joins line up.
+- **Knows where it is:** the green/red light in the mapping and hunt
+  sections. Green needs four things:
+  - a map;
+  - a match of a sweep to the map (or a recognized place) at some point
+    since the service started;
+  - a pose estimate within ±30 cm and ±12°;
+  - no more than 4 m of driving on wheel counts since that match.
+
+  The estimate grows less certain with every move on wheel counts, so it
+  goes red on its own after too much driving without a match. A new run
+  (mapping or hunt) started while the service has kept counting the wheels
+  keeps the estimate it had, allowing ±10 cm and ±5° in case the car was
+  lifted. After a restart it must match the map again first.
+  - **Matching:** a sweep is matched to the mapped walls. In clutter, where
+    walls don't line up, it is fitted to the coverage map instead. Every
+    echo should end on a confirmed obstacle somewhere across the 25° beam,
+    and none on floor the map knows is clear. That fit is trusted only when
+    it is a clear winner (in simulation every trusted fit was within 20 cm
+    and 8°). It then fixes the pose to ±12 cm and ±5°.
+  - **Limit:** in the workshop, sweeps from almost the same spot agree on
+    only about 40% of their ranges, so fits to a thin map are rarely
+    trusted. More mapping runs over the same floor firm the map up.
 - **Camera-measured turns:** before each turn piece the car needs a strip of
   pictures every 10° across the pan on the turn side (0–60°). While exploring,
   the first piece's strip is taken during the stop's sonar sweep, which

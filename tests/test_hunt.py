@@ -151,9 +151,16 @@ class PlayingTests(HouseHunt):
         self.assertEqual(body.bumps, 0)
 
     def test_it_never_drives_at_a_person_close_ahead(self):
-        engine, body, *_ = self.hunt((0.0, 0.0, 0.0), (80.0, 100.0), 61, 240, person=(10.0, 80.0))
-        self.assertEqual(body.moves_toward_person, 0)
-        self.assertEqual(body.touches, 0)
+        # Several runs: play moves turn the car about, and any forward part
+        # of a move must first look where it is going.
+        for seed, person in ((61, (10.0, 80.0)), (62, (60.0, 40.0)), (63, (-20.0, 90.0))):
+            engine, body, *_ = self.hunt((0.0, 0.0, 0.0), (80.0, 100.0), seed, 240, person=person)
+            self.assertEqual(body.moves_toward_person, 0, f"seed {seed}")
+            self.assertEqual(body.touches, 0, f"seed {seed}")
+
+    def test_looking_around_after_a_stop_uses_the_sweep_pictures(self):
+        engine, body, *_ = self.hunt((0.0, -40.0, 0.0), (-520.0, 150.0), 31, 120)
+        self.assertGreater(body.sweep_looks_used, 0)
 
 
 class PartsTests(unittest.TestCase):
@@ -279,6 +286,37 @@ class HuntPictureTests(unittest.TestCase):
         first_picture = min(t for kind, t in self.events if kind == "picture")
         self.assertGreaterEqual(first_picture - moved, HUNT_STILL_SECONDS - 0.02)
         self.assertIsNotNone(self.mapping.hunt_frame())
+
+    def test_a_hunt_stop_faces_ahead_and_its_sweep_pictures_are_checked_for_the_cat(self):
+        from robocar.hunt import pan_bearing
+        from robocar.mapping import SweepStrip, _HuntBody
+
+        body = _HuntBody(self.mapping)
+        body._point_head(150)
+        mapping = self.mapping
+        picture = mapping._camera.capture_snapshot()
+        pans_at_stop = []
+
+        def stop(mode):
+            pans_at_stop.append(mapping._pan_tilt.status()["pan"])
+            mapping._sweep_strip = SweepStrip(
+                {pan: (picture,) for pan in range(30, 151, 10)}, 90, 100, mapping._drive.odometry()
+            )
+
+        with patch.object(mapping, "_capture_observation", side_effect=stop):
+            body.observe()
+        self.assertEqual(pans_at_stop, [90])
+        looks = body.sweep_looks((30, 60, 90, 120, 150))
+        self.assertEqual(sorted(looks), [30, 60, 90, 120, 150])
+        for pan, look in looks.items():
+            self.assertIsNotNone(look.cat)
+            self.assertAlmostEqual(look.cat.bearing_deg, pan_bearing(pan), delta=5.0)
+        self.assertEqual(body.sweep_looks((90,)), {})  # used once
+        # Not after the car has moved since.
+        with patch.object(mapping, "_capture_observation", side_effect=stop):
+            body.observe()
+        with patch.object(mapping._drive, "odometry", return_value=(0.0, 30.0, 0.0)):
+            self.assertEqual(body.sweep_looks((90,)), {})
 
     def test_the_preview_only_shoots_when_the_car_is_idle_and_still(self):
         from robocar.mapping import HUNT_STILL_SECONDS, _HuntBody

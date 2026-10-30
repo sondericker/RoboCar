@@ -7,6 +7,7 @@ import stat
 import sqlite3
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import cv2
@@ -35,7 +36,7 @@ from robocar.mapping import (
     forward_clearance,
 )
 from robocar.exploration import CoverageGrid, Frontier, Waypoint
-from robocar.localization import compose, relative
+from robocar.localization import RegistrationResult, compose, relative
 from robocar.vision_debug import render_matches
 from robocar.range_sensor import RangeSensorController
 from camera_scene import PanoramaScene
@@ -753,8 +754,12 @@ class MappingTests(unittest.TestCase):
     def test_mapping_stops_take_a_strip_and_show_it_as_a_panorama(self):
         mapping, drive, pan_driver, true_heading = self.turning_rig()
         mapping._run_id = "survey"
+        # Centred on straight ahead even with the head left looking right.
+        mapping._pan_tilt.set_angles(150, 100)
         mapping._capture_observation(mode="hunt")
-        self.assertIsNone(mapping._sweep_strip)  # the hunt pans for itself
+        self.assertEqual(sorted(mapping._sweep_strip.pictures), self.strip_pans())
+        self.assertEqual(min(mapping._sweep_strip.pictures), 30)
+        self.assertEqual(max(mapping._sweep_strip.pictures), 150)
         mapping._capture_observation(mode="survey")
         self.assertEqual(sorted(mapping._sweep_strip.pictures), self.strip_pans())
         self.assertEqual(mapping._sweep_strip.odometry, drive.odometry())
@@ -857,10 +862,90 @@ class LocalizedTests(unittest.TestCase):
         self.assertTrue(here["known"], here)
         self.assertEqual(mapping.status()["localized"]["known"], True)
         # Driving off on wheel counts alone, it is no longer sure.
-        with patch.object(drive, "odometry", return_value=(0.0, 250.0, 0.0)):
+        with patch.object(drive, "odometry", return_value=(0.0, 450.0, 0.0)):
             away = mapping.localized()
         self.assertFalse(away["known"])
-        self.assertIn("since its last check", away["detail"])
+        self.assertIn("since it last matched the map", away["detail"])
+
+    def room_rig(self, offset=(0.0, 0.0, 0.0)):
+        """A car in the sonar room, whose true pose is its odometry moved by `offset`."""
+        room = SonarRoom()
+        drive = DriveController(SimulatedDriver(), max_duty=4095, command_timeout=1, physical=True)
+        pan_driver = SimulatedPanTilt()
+        pan_tilt = PanTiltController(pan_driver, physical=True)
+
+        class RoomSensor(FakeRangeSensor):
+            def get_distance(self) -> float | None:
+                return room.distance(compose(offset, drive.odometry()), 90 - pan_driver.pan)
+
+        range_sensor = RangeSensorController(RoomSensor(), physical=True, sample_interval=0.5)
+        mapping = MappingController(FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")))
+        for resource in (range_sensor, pan_tilt, drive, mapping):
+            self.addCleanup(resource.close)
+        return mapping, drive, pan_driver
+
+    def test_a_hunt_started_after_mapping_still_knows_where_it_is(self):
+        mapping, drive, pan_driver = self.room_rig()
+        mapping._run_id = "map"
+        mapping._capture_observation(mode="explore")
+        for _ in range(2):
+            self.assertTrue(mapping._move_burst(1.0, 0.15))
+            mapping._capture_observation(mode="explore")
+        self.assertTrue(mapping.localized()["known"])
+        before = mapping.localized()["sigma_cm"]
+        # A new run in the same session: the wheels have been counted all along.
+        mapping._continue_map("hunt")
+        self.assertTrue(mapping.localized()["known"], mapping.localized())
+        self.assertLessEqual(mapping.localized()["sigma_cm"], max(before, 10.0) + 0.5)
+        # A hunt stop where the walls will not register still keeps it, on wheel counts.
+        rejected = lambda echoes, pose, covariance, surface_map: RegistrationResult(
+            tuple(pose), covariance, False, 0, 0.0, (0.0, 0.0, 0.0), "test: walls too cluttered"
+        )
+        with patch("robocar.mapping.register_scan", side_effect=rejected):
+            mapping._capture_observation(mode="hunt")
+        here = mapping.localized()
+        self.assertTrue(here["known"], here)
+        self.assertIn("stops ago", here["detail"])
+
+    def test_after_a_restart_it_must_match_the_map_again(self):
+        mapping, drive, pan_driver = self.room_rig()
+        mapping._run_id = "map"
+        mapping._capture_observation(mode="explore")
+        self.assertTrue(mapping._move_burst(1.0, 0.15))
+        mapping._capture_observation(mode="explore")
+        # As if the service restarted: the wheels were not tracked since the last stop.
+        with mapping._lock:
+            mapping._last_odometry = None
+        mapping._continue_map("hunt")
+        here = mapping.localized()
+        self.assertFalse(here["known"])
+        self.assertIn("has not matched", here["detail"])
+
+    def test_a_grid_match_can_fix_the_pose_when_walls_will_not_register(self):
+        mapping, drive, pan_driver = self.room_rig()
+        mapping._run_id = "map"
+        mapping._capture_observation(mode="explore")
+        self.assertTrue(mapping._move_burst(1.0, 0.15))
+        mapping._capture_observation(mode="explore")
+        good = SimpleNamespace(
+            good=True,
+            pose=(1.0, 2.0, 3.0),
+            summary=lambda: {"good": True},
+        )
+        rejected = lambda echoes, pose, covariance, surface_map: RegistrationResult(
+            tuple(pose), covariance, False, 0, 0.0, (0.0, 0.0, 0.0), "test: walls too cluttered"
+        )
+        with mapping._lock:
+            mapping._stops_since_fix = None
+        with patch("robocar.mapping.register_scan", side_effect=rejected), patch.object(
+            mapping, "_match_to_grid", return_value=good
+        ):
+            mapping._capture_observation(mode="hunt")
+        here = mapping.localized()
+        self.assertEqual(here["stops_since_fix"], 0)
+        self.assertLessEqual(here["sigma_cm"], 12.5)
+        latest = mapping.observations()[-1]
+        self.assertEqual(latest["estimate"]["grid_match"], {"good": True})
 
 
 class SlippingRoomTests(unittest.TestCase):

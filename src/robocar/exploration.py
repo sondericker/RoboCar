@@ -29,7 +29,13 @@ from typing import Mapping, Sequence
 import cv2
 import numpy as np
 
-from robocar.surfaces import SONAR_FORWARD_OFFSET_CM, SONAR_MAX_RANGE_CM, direction, sonar_origin
+from robocar.surfaces import (
+    SONAR_BEAM_WIDTH_DEGREES,
+    SONAR_FORWARD_OFFSET_CM,
+    SONAR_MAX_RANGE_CM,
+    direction,
+    sonar_origin,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,23 +119,33 @@ TRIP_OVERHEAD_CM = 60.0
 # the new floor per centimetre that moves have been buying on average.
 STOP_FRACTION_OF_RATE = 0.05
 KINDS = ("open", "doorway", "edge", "lead")
-# Matching a sweep to the coverage map: echoes within MATCH_HIT_CM of mapped
-# obstacles count as hits. A match is good when at least MATCH_GOOD_SCORE of
-# the echoes landing on mapped ground are hits, and at least MATCH_MIN_HITS.
+# Matching a sweep to the coverage map: an echo ending within MATCH_HIT_CM of
+# a confirmed obstacle is a hit, its agreement falling off over
+# MATCH_SPREAD_CM. Searched in MATCH_SEARCH_STEP steps, then MATCH_STEP ones
+# around the best. A match is good with at least MATCH_GOOD_SCORE agreement
+# and MATCH_MIN_HITS hits, and only when nothing farther than
+# MATCH_UNIQUE_CM / MATCH_UNIQUE_DEG from it scores within MATCH_MIN_MARGIN
+# of it (chosen on simulated sweeps so every match passing it was right).
 MATCH_HIT_CM = 10.0
 MATCH_SPREAD_CM = 5.0
-# Rays across the sonar's beam (it answers with the nearest thing anywhere in it).
-MATCH_BEAM_RAYS_DEG = (-9.0, -4.5, 0.0, 4.5, 9.0)
-MATCH_STEP_CM = 4.0
-MATCH_STEP_DEG = 2.0
+MATCH_SEARCH_STEP_CM = 4.0
+MATCH_SEARCH_STEP_DEG = 2.0
+MATCH_STEP_CM = 2.0
+MATCH_STEP_DEG = 1.0
 MATCH_MIN_POINTS = 10
 MATCH_MIN_HITS = 12
 MATCH_GOOD_SCORE = 0.6
-# ...and only when nothing farther than MATCH_UNIQUE_CM / MATCH_UNIQUE_DEG
-# from it scores within MATCH_MIN_MARGIN of it.
-MATCH_UNIQUE_CM = 10.0
+MATCH_UNIQUE_CM = 12.0
 MATCH_UNIQUE_DEG = 6.0
-MATCH_MIN_MARGIN = 0.015
+MATCH_MIN_MARGIN = 0.035
+# Tries across the sonar's beam for where each echo came from.
+MATCH_BEAM_RAYS = 5
+MATCH_BEAM_HALF_DEG = SONAR_BEAM_WIDTH_DEGREES / 2
+MATCH_CHUNK_POSES = 48
+# Obstacles count for matching once confirmed: one echo marks an arc across
+# the whole beam, and until other views clear it that smear stands in open
+# floor where nothing would answer.
+MATCH_OBSTACLE_LOG_ODDS = CONFIRMED_ABOVE
 # Leads: openings seen directly in a sweep, where readings run at least
 # LEAD_DEEPER_CM deeper than on both sides (or do not echo) for at least
 # LEAD_MIN_DEGREES. Each is worth going to until the floor LEAD_BEHIND_CM
@@ -159,6 +175,10 @@ class Frontier:
     kind: str = "edge"  # "open", "doorway" or "edge"
     width_cm: float | None = None  # across a doorway or corridor
     middle: tuple[float, float] | None = None  # the part of the frontier to look at
+
+
+def wrap_degrees_array(values: np.ndarray) -> np.ndarray:
+    return (values + 180.0) % 360.0 - 180.0
 
 
 @dataclass(frozen=True)
@@ -777,14 +797,16 @@ class CoverageGrid:
     ) -> "ScanMatch | None":
         """Where a sweep fits the map best, near `pose`.
 
-        Tries shifts within search_cm and turns within search_deg. An echo
-        landing within MATCH_HIT_CM of something already mapped is a hit, one
-        landing on floor the map knows is empty a miss, and one ending in
-        unexplored space says nothing. The score is the share of hits among
-        hits and misses, each hit weighted by how close it lands (so the exact
-        fit beats one merely near). Unlike line registration this needs no
-        flat walls: clutter, furniture and corners all count. None when too
-        few echoes land on mapped ground to judge."""
+        From each candidate pose, every echo should end on a confirmed
+        obstacle somewhere across its beam (the sonar answers from all of
+        it); one ending on floor the map knows is clear counts against, and
+        one ending in unexplored space says nothing. Unlike wall registration
+        this needs no straight walls: furniture, clutter and corners all
+        count. Searched in steps, then finer around the best. None without
+        confirmed obstacles or when too few echoes can be judged.
+
+        Tested on simulated sweeps, about four in five best fits land within
+        20 cm and 8 degrees; `good` (a clear winner) picks out ones that do."""
         if not self.log_odds.size:
             return None
         readings = [
@@ -799,62 +821,89 @@ class CoverageGrid:
             return None
         angles = np.radians([angle for angle, _ in readings])
         ranges = np.array([distance for _, distance in readings])
-        occupied = self.occupied()
-        gap = cv2.distanceTransform((~occupied).astype(np.uint8), cv2.DIST_L2, 5) * self.cell
-        near = gap <= MATCH_HIT_CM
-        closeness = np.exp(-0.5 * (gap / MATCH_SPREAD_CM) ** 2) * near
-        free = self.free()
-        rows, columns = occupied.shape
-        offsets = np.arange(-search_cm, search_cm + 1e-9, MATCH_STEP_CM)
-        shift_x, shift_y = (grid.ravel() for grid in np.meshgrid(offsets, offsets))
-        turns = np.arange(-search_deg, search_deg + 1e-9, MATCH_STEP_DEG)
-        beam = np.radians(MATCH_BEAM_RAYS_DEG)
-        scores = np.zeros((len(turns), len(shift_x)))
-        hit_counts = np.zeros_like(scores, dtype=int)
-        judged_counts = np.zeros_like(scores, dtype=int)
-        for row, turn in enumerate(turns):
-            heading = math.radians(float(pose[2]) + turn)
-            forward = np.array([-math.sin(heading), math.cos(heading)])
-            origin = np.array(pose[:2], dtype=float) + forward * SONAR_FORWARD_OFFSET_CM
-            # The echo came from somewhere across the beam: try rays spanning it.
-            rays = heading + angles[None, :] + beam[:, None]  # B x N
-            ends_x = origin[0] - np.sin(rays) * ranges[None, :]
-            ends_y = origin[1] + np.cos(rays) * ranges[None, :]
-            xs = ends_x[None] + shift_x[:, None, None]  # S x B x N
-            ys = ends_y[None] + shift_y[:, None, None]
-            cols = np.floor((xs - self.origin[0]) / self.cell).astype(int)
-            rws = np.floor((ys - self.origin[1]) / self.cell).astype(int)
-            inside = (rws >= 0) & (rws < rows) & (cols >= 0) & (cols < columns)
-            rws_c, cols_c = np.clip(rws, 0, rows - 1), np.clip(cols, 0, columns - 1)
-            hit = (near[rws_c, cols_c] & inside).any(axis=1)  # S x N
-            miss = (free[rws_c, cols_c] & inside).all(axis=1) & ~hit
-            hits = hit.sum(axis=1)
-            judged = hits + miss.sum(axis=1)
-            weight = (closeness[rws_c, cols_c] * inside).max(axis=1).sum(axis=1)
-            scores[row] = np.where(judged >= MATCH_MIN_POINTS, weight / np.maximum(judged, 1), 0.0)
-            hit_counts[row], judged_counts[row] = hits, judged
-        # Prefer the smallest correction among equally good fits.
-        shift = np.hypot(shift_x, shift_y)[None, :]
-        penalty = 0.002 * (shift / MATCH_STEP_CM + np.abs(turns)[:, None] / MATCH_STEP_DEG)
-        row, column = np.unravel_index(int(np.argmax(scores - penalty)), scores.shape)
-        if judged_counts[row, column] < MATCH_MIN_POINTS:
+        obstacles = self.log_odds > MATCH_OBSTACLE_LOG_ODDS
+        if not obstacles.any():
             return None
-        score = float(scores[row, column])
+        gap = cv2.distanceTransform((~obstacles).astype(np.uint8), cv2.DIST_L2, 5) * self.cell
+        closeness = np.where(gap <= MATCH_HIT_CM, np.exp(-0.5 * (gap / MATCH_SPREAD_CM) ** 2), 0.0)
+        context = (angles, ranges, closeness, self.free())
+
+        searched = self._match_poses(pose, search_cm, search_deg, MATCH_SEARCH_STEP_CM, MATCH_SEARCH_STEP_DEG)
+        searched_scores, _, _ = self._score_poses(searched, *context)
+        centre = searched[int(np.argmax(searched_scores - self._correction_penalty(searched, pose)))]
+        fine = self._match_poses(centre, MATCH_SEARCH_STEP_CM, MATCH_SEARCH_STEP_DEG, MATCH_STEP_CM, MATCH_STEP_DEG)
+        fine_scores, hits, judged = self._score_poses(fine, *context)
+        best = int(np.argmax(fine_scores - self._correction_penalty(fine, pose)))
+        if judged[best] < MATCH_MIN_POINTS:
+            return None
+        score = float(fine_scores[best])
         # Ambiguous when a pose well away from the best fits nearly as well:
         # a sweep of one long wall pins the distance to it, not where along it.
-        far = (
-            np.hypot(shift_x[None, :] - shift_x[column], shift_y[None, :] - shift_y[column]) > MATCH_UNIQUE_CM
-        ) | (np.abs(turns - turns[row])[:, None] > MATCH_UNIQUE_DEG)
-        centre = int(np.argmin(shift[0]))
-        zero_turn = int(np.argmin(np.abs(turns)))
-        return ScanMatch(
-            (float(pose[0]) + float(shift_x[column]), float(pose[1]) + float(shift_y[column]), float(pose[2]) + float(turns[row])),
-            score,
-            int(hit_counts[row, column]),
-            int(judged_counts[row, column]),
-            float(scores[zero_turn, centre]),
-            score - float(scores[far].max(initial=0.0)),
+        far = (np.hypot(searched[:, 0] - fine[best, 0], searched[:, 1] - fine[best, 1]) > MATCH_UNIQUE_CM) | (
+            np.abs(wrap_degrees_array(searched[:, 2] - fine[best, 2])) > MATCH_UNIQUE_DEG
         )
+        prior_score, _, _ = self._score_poses(np.array([pose[:3]], dtype=float), *context)
+        return ScanMatch(
+            (float(fine[best, 0]), float(fine[best, 1]), float(fine[best, 2])),
+            score,
+            int(hits[best]),
+            int(judged[best]),
+            float(prior_score[0]),
+            score - float(searched_scores[far].max(initial=0.0)),
+        )
+
+    @staticmethod
+    def _match_poses(pose: Sequence[float], reach_cm: float, reach_deg: float, step_cm: float, step_deg: float) -> np.ndarray:
+        offsets = np.arange(-reach_cm, reach_cm + 1e-9, step_cm)
+        turns = np.arange(-reach_deg, reach_deg + 1e-9, step_deg)
+        dx, dy, dt = (grid.ravel() for grid in np.meshgrid(offsets, offsets, turns, indexing="ij"))
+        return np.stack([float(pose[0]) + dx, float(pose[1]) + dy, float(pose[2]) + dt], axis=1)
+
+    @staticmethod
+    def _correction_penalty(poses: np.ndarray, prior: Sequence[float]) -> np.ndarray:
+        """Prefers the smallest correction among equally good fits."""
+        shift = np.hypot(poses[:, 0] - float(prior[0]), poses[:, 1] - float(prior[1]))
+        turn = np.abs(wrap_degrees_array(poses[:, 2] - float(prior[2])))
+        return 0.002 * (shift / MATCH_STEP_CM + turn / MATCH_STEP_DEG)
+
+    def _score_poses(
+        self,
+        poses: np.ndarray,
+        angles: np.ndarray,
+        ranges: np.ndarray,
+        closeness: np.ndarray,
+        free: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(score, hits, judged) for each pose. Each echo's end is tried
+        across the middle of the beam and scored by how close the best try
+        lands to a mapped obstacle; an echo whose every try lands on clear
+        floor is a miss, and one ending in unexplored space is not judged."""
+        rows, columns = free.shape
+        beam = np.radians(np.linspace(-1.0, 1.0, MATCH_BEAM_RAYS) * MATCH_BEAM_HALF_DEG)  # B
+        scores = np.zeros(len(poses))
+        hits = np.zeros(len(poses), dtype=int)
+        judged = np.zeros(len(poses), dtype=int)
+        for start in range(0, len(poses), MATCH_CHUNK_POSES):
+            chunk = poses[start : start + MATCH_CHUNK_POSES]
+            heading = np.radians(chunk[:, 2])  # P
+            origin_x = chunk[:, 0] - np.sin(heading) * SONAR_FORWARD_OFFSET_CM
+            origin_y = chunk[:, 1] + np.cos(heading) * SONAR_FORWARD_OFFSET_CM
+            rays = heading[:, None, None] + beam[None, :, None] + angles[None, None, :]  # P x B x N
+            cols = np.floor((origin_x[:, None, None] - np.sin(rays) * ranges - self.origin[0]) / self.cell).astype(np.int32)
+            rws = np.floor((origin_y[:, None, None] + np.cos(rays) * ranges - self.origin[1]) / self.cell).astype(np.int32)
+            inside = (rws >= 0) & (rws < rows) & (cols >= 0) & (cols < columns)
+            np.clip(rws, 0, rows - 1, out=rws)
+            np.clip(cols, 0, columns - 1, out=cols)
+            agreement = (closeness[rws, cols] * inside).max(axis=1)  # P x N
+            hit = agreement > 0.0
+            miss = (free[rws, cols] & inside).all(axis=1) & ~hit
+            count = hit.sum(axis=1) + miss.sum(axis=1)
+            judged[start : start + len(chunk)] = count
+            hits[start : start + len(chunk)] = hit.sum(axis=1)
+            scores[start : start + len(chunk)] = np.where(
+                count >= MATCH_MIN_POINTS, agreement.sum(axis=1) / np.maximum(count, 1), 0.0
+            )
+        return scores, hits, judged
 
     def wall_between(self, start: Sequence[float], end: Sequence[float]) -> bool:
         """Whether a confirmed wall lies on the straight line between two points."""
