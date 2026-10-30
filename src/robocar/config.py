@@ -30,6 +30,8 @@ class Config:
     max_motor_duty: int = 4095
     command_timeout: float = 1.0
     mapping_database: Path = _default_mapping_database()
+    # Lithium cells in series in the car's battery (the Freenove kit: two).
+    battery_cells: int = 2
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -66,6 +68,9 @@ class Config:
             raise ValueError("ROBOCAR_MAX_MOTOR_DUTY must be between 1 and 4095")
         if timeout <= 0:
             raise ValueError("ROBOCAR_COMMAND_TIMEOUT must be greater than 0")
+        battery_cells = int(os.getenv("ROBOCAR_BATTERY_CELLS", "2"))
+        if not 1 <= battery_cells <= 6:
+            raise ValueError("ROBOCAR_BATTERY_CELLS must be between 1 and 6")
 
         return cls(
             host=os.getenv("ROBOCAR_HOST", "127.0.0.1"),
@@ -89,4 +94,5 @@ class Config:
             mapping_database=Path(mapping_database).expanduser()
             if mapping_database
             else _default_mapping_database(),
+            battery_cells=battery_cells,
         )

@@ -18,6 +18,7 @@ class WebTests(unittest.TestCase):
         self.app.extensions["robocar_pan_tilt"].close()
         self.app.extensions["robocar_range_sensor"].close()
         self.app.extensions["robocar_camera"].close()
+        self.app.extensions["robocar_power"].close()
 
     def test_dashboard_and_status_are_available(self):
         dashboard = self.client.get("/").get_data(as_text=True)
@@ -103,7 +104,8 @@ class WebTests(unittest.TestCase):
         with patch.object(camera, "capture_snapshot", return_value=b"jpeg-data"):
             response = self.client.post("/api/mapping", json={"enabled": True})
             self.assertEqual(response.status_code, 200)
-            deadline = time.monotonic() + 2
+            # A survey stop sweeps the sonar and photographs a strip for its panorama.
+            deadline = time.monotonic() + 6
             while (
                 self.client.get("/api/status").get_json()["mapping"]["observation_count"] == 0
                 and time.monotonic() < deadline
@@ -196,7 +198,7 @@ class MissingCarBoardTests(unittest.TestCase):
             self.assertEqual(explore.status_code, 409)
             self.assertIn("Motor board unavailable", explore.get_json()["error"])
         finally:
-            for name in ("robocar_mapping", "robocar_drive", "robocar_pan_tilt", "robocar_range_sensor", "robocar_camera"):
+            for name in ("robocar_mapping", "robocar_drive", "robocar_pan_tilt", "robocar_range_sensor", "robocar_camera", "robocar_power"):
                 app.extensions[name].close()
 
 

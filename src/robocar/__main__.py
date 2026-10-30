@@ -16,6 +16,7 @@ def main() -> None:
 
     def close_resources() -> None:
         app.extensions["robocar_mapping"].close()
+        app.extensions["robocar_power"].close()
         app.extensions["robocar_drive"].close()
         app.extensions["robocar_pan_tilt"].close()
         app.extensions["robocar_range_sensor"].close()

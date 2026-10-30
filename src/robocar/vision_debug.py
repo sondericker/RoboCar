@@ -112,3 +112,61 @@ def render_detections(jpeg: bytes, detections: list[dict[str, object]], title: s
             cv2.LINE_AA,
         )
     return _with_caption(image, title, lines)
+
+
+PANORAMA_HEIGHT = 200
+
+
+def render_panorama(views: list[tuple[float, bytes]], hfov_deg: float, title: str, lines: list[str]) -> bytes | None:
+    """Pictures taken at different head angles joined into one panorama.
+
+    `views` are (bearing, jpeg): bearing in degrees counterclockwise from the
+    car's heading. The pictures overlap, so each contributes the slice of
+    view between the midpoints to its neighbours: columns found from the
+    camera's field of view, so the joins line up."""
+    decoded = []
+    for bearing, jpeg in views:
+        image = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is not None:
+            decoded.append((float(bearing), image))
+    if not decoded:
+        return None
+    decoded.sort(key=lambda item: -item[0])  # leftmost first
+    bearings = [bearing for bearing, _ in decoded]
+    slices = []
+    edges: list[tuple[float, int]] = []  # (bearing at a slice's left edge, x in the panorama)
+    x_offset = 0
+    for index, (bearing, image) in enumerate(decoded):
+        height, width = image.shape[:2]
+        focal = (width / 2) / np.tan(np.radians(hfov_deg / 2))
+        half = hfov_deg / 2
+        left = (bearings[index - 1] + bearing) / 2 if index > 0 else bearing + half
+        right = (bearing + bearings[index + 1]) / 2 if index + 1 < len(bearings) else bearing - half
+        left, right = min(left, bearing + half), max(right, bearing - half)
+
+        def column(at: float) -> int:
+            return int(round(width / 2 - focal * np.tan(np.radians(at - bearing))))
+
+        first, last = max(0, column(left)), min(width, column(right))
+        if last - first < 2:
+            continue
+        piece = image[:, first:last]
+        scale = PANORAMA_HEIGHT / height
+        piece = cv2.resize(piece, (max(1, round(piece.shape[1] * scale)), PANORAMA_HEIGHT), interpolation=cv2.INTER_AREA)
+        edges.append((left, x_offset))
+        slices.append(piece)
+        x_offset += piece.shape[1]
+    if not slices:
+        return None
+    panorama = np.hstack(slices)
+    # Angle marks every 30 degrees along the bottom.
+    marks = np.full((22, panorama.shape[1], 3), 24, dtype=np.uint8)
+    for target in range(-180, 181, 30):
+        for (left, start), (right, end) in zip(edges, edges[1:] + [(bearings[-1] - hfov_deg / 2, panorama.shape[1])]):
+            if right <= target <= left and left > right:
+                x = int(start + (left - target) / (left - right) * (end - start))
+                cv2.line(panorama, (x, PANORAMA_HEIGHT - 10), (x, PANORAMA_HEIGHT - 1), (93, 179, 242), 2)
+                label = "ahead" if target == 0 else f"{abs(target)} {'L' if target > 0 else 'R'}"
+                cv2.putText(marks, label, (max(0, x - 18), 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (169, 232, 215), 1, cv2.LINE_AA)
+                break
+    return _with_caption(np.vstack([panorama, marks]), title, lines)

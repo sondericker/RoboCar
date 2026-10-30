@@ -34,11 +34,63 @@
     .vision-panels figure { margin: 0; }
     .vision-panels img { width: 100%; height: auto; display: block; border-radius: 6px; background: #111a20; }
     .vision-panels figcaption { font-size: .85rem; color: #a9c7d3; margin-top: .3rem; }
+    .title-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .5rem 1rem; }
+    .battery-badge { display: flex; align-items: center; gap: .5rem; color: #b8d0dc; font-size: .95rem; }
+    .battery-meter { position: relative; height: 22px; border: 2px solid #5b7480; border-radius: 6px; background: #0b1218; overflow: hidden; }
+    .battery-meter.small { width: 110px; height: 16px; }
+    .battery-meter::after { content: ""; position: absolute; right: -2px; top: 25%; width: 4px; height: 50%; background: #5b7480; }
+    .battery-fill { height: 100%; width: 0; background: #3fbf7f; transition: width .6s ease, background-color .6s ease; }
+    .battery-mark { position: absolute; top: 0; bottom: 0; width: 2px; background: rgba(236, 243, 247, .35); }
+    .battery-meter[data-level="getting_low"] .battery-fill { background: #f2b35d; }
+    .battery-meter[data-level="low"] .battery-fill, .battery-meter[data-level="critical"] .battery-fill { background: #e0565b; }
+    .battery-meter[data-level="low"], .battery-meter[data-level="critical"] { animation: battery-pulse 1.2s ease-in-out infinite; }
+    .battery-meter[data-level="unknown"] .battery-fill { background: #5b7480; }
+    @keyframes battery-pulse { 50% { border-color: #e0565b; box-shadow: 0 0 10px rgba(224, 86, 91, .7); } }
+    @media (prefers-reduced-motion: reduce) { .battery-meter { animation: none !important; } }
+    .battery-warning { margin: .4rem 0; font-weight: 600; }
+    .battery-warning[data-level="getting_low"] { color: #f2b35d; }
+    .battery-warning[data-level="low"], .battery-warning[data-level="critical"] { color: #ff8a8f; }
+    .where { display: inline-flex; align-items: center; gap: .45rem; font-size: .9rem; color: #b8d0dc; }
+    .where-dot { width: 14px; height: 14px; border-radius: 50%; background: #e0565b; box-shadow: 0 0 8px rgba(224, 86, 91, .8); flex: none; }
+    .where[data-known="true"] .where-dot { background: #3fbf7f; box-shadow: 0 0 8px rgba(63, 191, 127, .8); }
+    .where-label { font-weight: 700; }
+    .where[data-known="true"] .where-label { color: #6fdca4; }
+    .where[data-known="false"] .where-label { color: #ff8a8f; }
+    .hunt-section { grid-column: 1 / -1; }
+    .hunt-header { display: flex; align-items: center; gap: .75rem; flex-wrap: wrap; }
+    .hunt-header h2 { margin: 0; }
+    .phase-badge { padding: .2rem .7rem; border-radius: 999px; font-weight: 700; font-size: .9rem; background: #334955; color: #ecf3f7; }
+    .phase-badge[data-phase="seeking"] { background: #24577d; }
+    .phase-badge[data-phase="approaching"] { background: #8a5a12; }
+    .phase-badge[data-phase="playing"] { background: #2e7d4f; }
+    .phase-badge[data-phase="resting"] { background: #5b3f86; }
+    .phase-badge[data-phase="searching"] { background: #8a4a1a; }
+    .hunt-layout { display: grid; grid-template-columns: minmax(0, 3fr) minmax(240px, 2fr); gap: 1rem; margin-top: .75rem; }
+    .hunt-feed, .feed-placeholder { width: 100%; aspect-ratio: 4 / 3; border-radius: 8px; background: #080d11; border: 1px solid #334955; }
+    .feed-placeholder { display: grid; place-items: center; color: #6f8a96; text-align: center; padding: 1rem; box-sizing: border-box; }
+    #hunt-toggle { width: 100%; background: #b0612c; font-weight: 700; }
+    #hunt-toggle:hover { background: #c8743a; }
+    #hunt-toggle[data-running="true"] { background: #b23b42; }
+    .hunt-action { font-size: 1.25rem; font-weight: 600; margin: .8rem 0 .3rem; min-height: 1.6em; }
+    .hunt-section h3 { font-size: .95rem; margin: 1rem 0 .3rem; color: #a9c7d3; }
+    .hunt-log { margin: 0; padding-left: 1.2rem; font-size: .9rem; color: #b8d0dc; max-height: 220px; overflow-y: auto; }
+    .hunt-log li { margin: .15rem 0; }
+    .hunt-log .when { color: #6f8a96; font-variant-numeric: tabular-nums; }
+    .hunt-favourites { margin: 0; padding-left: 1.2rem; color: #b8d0dc; font-size: .9rem; }
+    @media (max-width: 720px) { .hunt-layout { grid-template-columns: 1fr; } }
     @media (max-width: 720px) { .grid, .mapping-layout { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
-  <h1>RoboCar</h1>
+  <div class="title-bar">
+    <h1>RoboCar</h1>
+    <div class="battery-badge" title="Car battery">
+      <div id="battery-meter-small" class="battery-meter small" data-level="unknown" role="meter" aria-label="Car battery" aria-valuemin="0" aria-valuemax="100">
+        <div class="battery-fill"></div>
+      </div>
+      <span id="battery-badge-text">Battery …</span>
+    </div>
+  </div>
   <p class="status">Manual control is active only while a drive button is held.</p>
   <div class="grid">
     <section>
@@ -78,11 +130,47 @@
       </label>
       <button id="center-head" class="center-button" type="button">Center head</button>
     </section>
+    <section class="hunt-section" aria-labelledby="hunt-title">
+      <div class="hunt-header">
+        <h2 id="hunt-title">🐾 Cat hunt</h2>
+        <span id="hunt-phase" class="phase-badge" data-phase="idle">Idle</span>
+        <span class="where" data-known="false" title="Whether the car believes it knows where it is on the map">
+          <span class="where-dot" aria-hidden="true"></span>
+          <span class="where-label">Not sure where it is</span>
+          <span class="where-detail"></span>
+        </span>
+      </div>
+      <p class="status">Map the room first, then start the hunt. The car searches the map for the cat,
+        then plays with it: pounces, zig-zags, circles, spins and rests, learning what your cat likes.
+        It keeps at least 30 cm from the cat. Stay nearby.</p>
+      <div class="hunt-layout">
+        <div>
+          <img id="hunt-feed" class="hunt-feed" alt="What the car sees during the hunt" hidden>
+          <p id="hunt-feed-age" class="status"></p>
+          <div id="hunt-feed-placeholder" class="feed-placeholder">The hunt's camera view appears here once it starts.</div>
+        </div>
+        <div>
+          <button id="hunt-toggle" type="button" data-running="false">Start the hunt</button>
+          <p id="hunt-action" class="hunt-action" aria-live="polite">Not hunting.</p>
+          <p id="hunt-cat" class="status"></p>
+          <p id="hunt-stats" class="status"></p>
+          <h3>What it has been doing</h3>
+          <ol id="hunt-log" class="hunt-log"></ol>
+          <h3>Moves the cat likes best (learned)</h3>
+          <ul id="hunt-favourites" class="hunt-favourites"><li>Nothing learned yet.</li></ul>
+        </div>
+      </div>
+    </section>
     <section class="mapping-section">
       <h2>Mapping &amp; exploration</h2>
       <button id="mapping-toggle" type="button" aria-pressed="false">Start mapping &amp; auto explore</button>
       <button id="calibrate-motion" type="button">Calibrate turns &amp; steps</button>
       <button id="reset-mapping" type="button">Reset mapping database</button>
+      <p class="status"><span class="where" data-known="false" title="Whether the car believes it knows where it is on the map">
+          <span class="where-dot" aria-hidden="true"></span>
+          <span class="where-label">Not sure where it is</span>
+          <span class="where-detail"></span>
+        </span></p>
       <p id="mapping-status" class="status" aria-live="polite">Mapping is off.</p>
       <p id="calibration-status" class="status">Motion not calibrated yet.</p>
       <div class="mapping-layout">
@@ -98,6 +186,17 @@
     <section>
       <h2>Ultrasonic range</h2>
       <p id="range-status" class="status" aria-live="polite">Loading range finder status…</p>
+    </section>
+    <section>
+      <h2>Power</h2>
+      <div id="battery-meter" class="battery-meter" data-level="unknown" role="meter" aria-label="Car battery" aria-valuemin="0" aria-valuemax="100">
+        <div class="battery-fill"></div>
+        <div id="battery-mark-getting-low" class="battery-mark" title="Getting low"></div>
+        <div id="battery-mark-low" class="battery-mark" title="Low"></div>
+      </div>
+      <p id="battery-status" class="status">Reading the battery…</p>
+      <p id="battery-warning" class="battery-warning" data-level="ok" aria-live="assertive" hidden></p>
+      <p id="pi-power-status" class="status">Reading the Pi's supply…</p>
     </section>
   </div>
   <script>
@@ -266,6 +365,8 @@
       map.features.forEach(feature => bounds.push({x: feature.position[0], y: feature.position[1]}));
       const landmarks = map.landmarks || [], rooms = map.rooms || [];
       landmarks.forEach(landmark => bounds.push({x: landmark.x, y: landmark.y}));
+      const cat = map.cat || {spots: [], last_seen: null};
+      if (cat.last_seen) bounds.push({x: cat.last_seen[0], y: cat.last_seen[1]});
       const minX = Math.min(...bounds.map(point => point.x));
       const maxX = Math.max(...bounds.map(point => point.x));
       const minY = Math.min(...bounds.map(point => point.y));
@@ -350,6 +451,17 @@
         mapContext.closePath(); mapContext.fill();
         mapContext.fillStyle = "#ecd2f7";
         mapContext.fillText(landmark.label, point.x, point.y - 8);
+      }
+      // Where the cat likes to be (learned), and where it was last seen.
+      for (const [x, y, weight] of cat.spots || []) {
+        const point = toScreen([x, y]);
+        mapContext.fillStyle = `rgba(242, 140, 60, ${Math.min(0.5, 0.12 + 0.05 * weight)})`;
+        mapContext.beginPath(); mapContext.arc(point.x, point.y, Math.max(10, 50 * scale), 0, Math.PI * 2); mapContext.fill();
+      }
+      if (cat.last_seen) {
+        const point = toScreen(cat.last_seen);
+        mapContext.font = "20px system-ui, sans-serif";
+        mapContext.fillText("🐈", point.x, point.y + 7);
       }
       mapContext.textAlign = "start";
 
@@ -516,7 +628,7 @@
     }
     function updateMappingControls(mapping) {
       mappingToggle.textContent = mapping.enabled
-        ? "Stop mapping & auto explore" : "Start mapping & auto explore";
+        ? (mapping.mode === "hunt" ? "Stop the hunt" : "Stop mapping & auto explore") : "Start mapping & auto explore";
       mappingToggle.setAttribute("aria-pressed", String(mapping.enabled));
       const calibrating = mapping.enabled && mapping.mode === "calibrate";
       document.getElementById("calibrate-motion").dataset.running = String(calibrating);
@@ -524,6 +636,8 @@
       resetMappingButton.disabled = mapping.enabled;
       document.getElementById("mapping-status").textContent = mapping.error
         ? `Mapping stopped: ${mapping.error}`
+        : mapping.enabled && mapping.mode === "hunt"
+          ? `Cat hunt running: ${mapping.plan || "starting"}`
         : mapping.enabled
           ? (mapping.mode === "calibrate"
             ? `Calibrating: ${mapping.plan || "starting"}`
@@ -680,11 +794,166 @@
             range.error ? `Range finder error: ${range.error}` :
             range.distance_cm === null ? "Waiting for range reading…" :
             `Distance: ${range.distance_cm.toFixed(1)} cm`;
+        updatePower(status.power);
+        updateWhere(status.mapping.localized);
         updateMappingControls(status.mapping);
       } catch (_) {
         document.getElementById("camera-status").textContent = "Could not read application status";
       }
     }
+    function updateWhere(localized) {
+      if (!localized) return;
+      for (const indicator of document.querySelectorAll(".where")) {
+        indicator.dataset.known = String(localized.known);
+        indicator.querySelector(".where-label").textContent = localized.known ? "Knows where it is" : "Not sure where it is";
+        indicator.querySelector(".where-detail").textContent = `(${localized.detail})`;
+      }
+    }
+    const BATTERY_WARNINGS = {
+      getting_low: "Battery getting low: charge it soon.",
+      low: "Battery low: charge it now.",
+      critical: "Battery critically low: auto explore and calibration will not start until it is charged.",
+    };
+    function updatePower(power) {
+      if (!power) return;
+      const battery = power.battery;
+      const level = battery.level || "unknown";
+      const percent = battery.percent;
+      for (const id of ["battery-meter", "battery-meter-small"]) {
+        const meter = document.getElementById(id);
+        meter.dataset.level = level;
+        meter.querySelector(".battery-fill").style.width = percent === null ? "0" : `${percent}%`;
+        if (percent === null) meter.removeAttribute("aria-valuenow");
+        else meter.setAttribute("aria-valuenow", String(percent));
+      }
+      document.getElementById("battery-mark-getting-low").style.left = `${battery.getting_low_percent}%`;
+      document.getElementById("battery-mark-low").style.left = `${battery.low_percent}%`;
+      const volts = battery.resting_volts;
+      document.getElementById("battery-badge-text").textContent =
+        !battery.available ? "Battery n/a" : volts === null ? "Battery …" : `${volts.toFixed(1)} V · ${percent}%`;
+      document.getElementById("battery-status").textContent =
+        !battery.available ? `Car battery not readable${battery.error ? `: ${battery.error}` : " (hardware not enabled)"}`
+          : battery.error ? `Battery reading failed: ${battery.error}`
+          : volts === null ? "Waiting for a reading with the motors idle…"
+          : `Car battery ${volts.toFixed(2)} V (${battery.cells} cells), about ${percent}% charged` +
+            (battery.under_load ? ` · now ${battery.volts.toFixed(2)} V while driving` : "");
+      const warning = document.getElementById("battery-warning");
+      warning.hidden = !BATTERY_WARNINGS[level];
+      warning.dataset.level = level;
+      warning.textContent = BATTERY_WARNINGS[level] || "";
+      const pi = power.pi || {}, rails = pi.rails || {}, flags = pi.flags || {};
+      const parts = [];
+      if (rails.EXT5V !== undefined) parts.push(`input ${rails.EXT5V.toFixed(2)} V`);
+      if (rails["3V3_SYS"] !== undefined) parts.push(`3.3 V rail ${rails["3V3_SYS"].toFixed(2)} V`);
+      if (rails["1V8_SYS"] !== undefined) parts.push(`1.8 V rail ${rails["1V8_SYS"].toFixed(2)} V`);
+      if (rails.VDD_CORE !== undefined) parts.push(`CPU core ${rails.VDD_CORE.toFixed(3)} V`);
+      if (pi.board_watts !== undefined) parts.push(`board ${pi.board_watts.toFixed(1)} W`);
+      if (pi.cpu_celsius !== undefined) parts.push(`CPU ${pi.cpu_celsius.toFixed(0)} °C`);
+      const troubles = [];
+      if (flags.under_voltage_now) troubles.push("supply too low NOW");
+      else if (flags.under_voltage_since_boot) troubles.push("supply dipped too low since boot");
+      if (flags.throttled_now) troubles.push("CPU throttled now");
+      else if (flags.throttled_since_boot) troubles.push("CPU was throttled since boot");
+      if (flags.temperature_limit_now) troubles.push("at temperature limit");
+      document.getElementById("pi-power-status").textContent =
+        (parts.length ? `Raspberry Pi: ${parts.join(" · ")}` : `Raspberry Pi supply not readable${pi.rails_error ? `: ${pi.rails_error}` : ""}`) +
+        (troubles.length ? ` · ⚠ ${troubles.join(", ")}` : flags.under_voltage_now === false ? " · supply OK" : "");
+    }
+    const huntToggle = document.getElementById("hunt-toggle");
+    const huntFeed = document.getElementById("hunt-feed");
+    const PHASE_NAMES = {
+      seeking: "Seeking 🔎", approaching: "Approaching 👀", playing: "Playing 🐾", resting: "Resting 💤",
+      searching: "Searching nearby 🔍", finished: "Finished", starting: "Starting",
+    };
+    const END_REASONS = { stopped: "Stopped.", time_limit: "Playtime is over for now.", battery_low: "Stopped: battery low." };
+    let huntFrameAt = null;
+    let huntRunning = false;
+    function minutes(seconds) {
+      const whole = Math.round(seconds);
+      return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, "0")}`;
+    }
+    function updateHunt(data) {
+      const running = data.running;
+      const status = data.status || {};
+      huntToggle.dataset.running = String(running);
+      huntToggle.textContent = running ? "Stop the hunt" : "Start the hunt";
+      const phase = running ? (status.phase || "starting") : (status.phase === "finished" ? "finished" : "idle");
+      const badge = document.getElementById("hunt-phase");
+      badge.dataset.phase = phase;
+      badge.textContent = phase === "idle" ? "Idle" : (PHASE_NAMES[phase] || phase);
+      document.getElementById("hunt-action").textContent = running
+        ? (status.action || "starting…")
+        : status.end_reason ? `${END_REASONS[status.end_reason] || status.end_reason} ${status.action ? "(" + status.action + ")" : ""}` : "Not hunting.";
+      const cat = status.cat;
+      document.getElementById("hunt-cat").textContent = !cat ? (running ? "Cat not in sight." : "")
+        : `Cat ${cat.distance_cm === null ? "at an unknown distance" : `about ${cat.distance_cm} cm away`}, ` +
+          `${Math.abs(cat.bearing_deg) < 5 ? "straight ahead" : `${Math.abs(cat.bearing_deg).toFixed(0)}° ${cat.bearing_deg > 0 ? "left" : "right"}`}` +
+          ` · seen ${cat.seen_seconds_ago < 1.5 ? "just now" : `${cat.seen_seconds_ago.toFixed(0)} s ago`}`;
+      const stats = status.stats;
+      document.getElementById("hunt-stats").textContent = stats
+        ? `${minutes(status.elapsed_seconds || 0)} elapsed · found the cat ${stats.finds}× · ${stats.moves} play moves · ` +
+          `${minutes(stats.play_seconds)} playing · ${stats.rests} rest(s) · mood ${status.mood >= 0.66 ? "frisky" : status.mood <= 0.33 ? "mellow" : "playful"}`
+        : `Hunts so far: ${data.learned.hunts}, cat found ${data.learned.finds} time(s).`;
+      const log = document.getElementById("hunt-log");
+      log.replaceChildren(...(status.log || []).map(entry => {
+        const item = document.createElement("li");
+        const when = document.createElement("span");
+        when.className = "when";
+        when.textContent = `${minutes(entry.t)} `;
+        item.append(when, entry.text);
+        return item;
+      }));
+      const favourites = (status.favourites && status.favourites.length ? status.favourites : data.learned.favourites) || [];
+      const list = document.getElementById("hunt-favourites");
+      list.replaceChildren(...(favourites.length ? favourites.map(item => {
+        const entry = document.createElement("li");
+        entry.textContent = `${item.move.replaceAll("_", " ")}: ${Math.round(item.score * 100)}% reaction (${item.tries} tries)`;
+        return entry;
+      }) : [Object.assign(document.createElement("li"), {textContent: "Nothing learned yet."})]));
+      // The picture: fetched whenever the hunt has taken a new one.
+      huntRunning = running;
+      if (data.frame_at && data.frame_at !== huntFrameAt) {
+        huntFrameAt = data.frame_at;
+        huntFeed.src = `/api/hunt/frame.jpg?t=${data.frame_at}`;
+      }
+      const hasPicture = Boolean(huntFrameAt);
+      const age = data.frame_age_seconds;
+      document.getElementById("hunt-feed-age").textContent = !hasPicture ? ""
+        : !running ? "Last picture from the hunt."
+        : age < 2 ? "Live picture."
+        : `Picture from ${age.toFixed(0)} s ago (the car is sweeping or moving; a new one comes once it is still).`;
+      huntFeed.hidden = !hasPicture;
+      document.getElementById("hunt-feed-placeholder").hidden = hasPicture;
+    }
+    async function refreshHunt() {
+      try {
+        updateHunt(await (await fetch("/api/hunt", {cache: "no-store"})).json());
+      } catch (_) { /* the next poll will try again */ }
+      // Twice a second while hunting, for a lively picture; once a second otherwise.
+      setTimeout(refreshHunt, huntRunning ? 500 : 1000);
+    }
+    huntToggle.addEventListener("click", async () => {
+      const starting = huntToggle.dataset.running !== "true";
+      if (starting && !window.confirm(
+        "The car will drive around on its own to find the cat and play with it. " +
+        "Stay nearby to supervise, and keep the floor clear of things it could get tangled in. Start the hunt?")) return;
+      huntToggle.disabled = true;
+      try {
+        const response = await fetch("/api/hunt", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({enabled: starting, attended: true})
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+        updateHunt(result);
+      } catch (error) {
+        document.getElementById("hunt-action").textContent = `Could not ${starting ? "start" : "stop"} the hunt: ${error.message}`;
+      } finally {
+        huntToggle.disabled = false;
+      }
+    });
+    refreshHunt();
     refreshStatus();
     setInterval(refreshStatus, 1000);
     refreshMapping();

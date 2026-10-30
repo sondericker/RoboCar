@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+from contextlib import contextmanager
 import os
 import shutil
 import sqlite3
@@ -25,10 +26,12 @@ from robocar.drive import (
     DriveController,
 )
 from robocar.exploration import CELL_CM, CoverageGrid, ExplorationLearner, load_learner, save_learner
+from robocar.hunt import HuntEngine, Look, cat_view_from, load_memory, save_memory
 from robocar.localization import (
     MotionPrediction,
     Pose,
     VisualMotion,
+    compose,
     pose_sigma,
     predict_motion,
     propagate,
@@ -46,7 +49,7 @@ from robocar.places import (
 from robocar.range_sensor import RangeSensorController
 from robocar.semantics import SemanticMap, Sighting, hazards_from, mark_dynamic, sightings_from, static_scan
 from robocar.surfaces import SONAR_MAX_RANGE_CM, IntegrationReport, SurfaceMap, direction, extract_echoes, pose_rotation
-from robocar.vision_debug import render_detections, render_features, render_matches
+from robocar.vision_debug import render_detections, render_features, render_matches, render_panorama
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +92,36 @@ AUTO_STEP_CM = 25.0
 # of whatever the sonar sees ahead.
 AUTO_LONG_STEP_CM = 60.0
 AUTO_MIN_STEP_CM = 10.0
+# The car believes it knows where it is on the map while: the map has walls
+# to match against; a sweep matched them (or it recognized a place) within
+# the last few stops; its pose estimate is this certain; and it has not since
+# moved further than this on wheel counts alone.
+LOCALIZED_MIN_WALLS = 2
+LOCALIZED_MAX_STOPS_SINCE_FIX = 2
+LOCALIZED_MAX_SIGMA_CM = 30.0
+LOCALIZED_MAX_HEADING_SIGMA_DEG = 12.0
+LOCALIZED_MAX_DEAD_RECKONING_CM = 200.0
+LOCALIZED_MAX_DEAD_RECKONING_DEG = 180.0
+# The hunt waits this long after pointing the head before a picture or
+# ping, plus a little per degree turned (the servo takes about 0.2 s for 60).
+HUNT_HEAD_SETTLE_SECONDS = 0.08
+HUNT_HEAD_SECONDS_PER_DEGREE = 0.0025
+# A hunt picture waits until the car and head have been still this long after
+# their last move, then for the camera to see two matching frames in a row
+# (giving up after the timeout): pictures taken sooner came out blurred.
+HUNT_STILL_SECONDS = 0.4
+HUNT_STEADY_TIMEOUT_SECONDS = 0.8
+# Each hunt picture's sharpness is compared with recent good ones. A soft one
+# is retaken after a further wait (up to HUNT_MAX_SHOTS shots, keeping the
+# sharpest). If the retake was clearly sharper, that was motion blur and the
+# settle delay grows; first shots that keep coming out sharp shrink it again.
+HUNT_SOFT_FRACTION = 0.7
+HUNT_BLUR_CONFIRM_RATIO = 1.25
+HUNT_MAX_SHOTS = 3
+HUNT_STILL_LIMITS_SECONDS = (0.25, 1.5)
+# While hunting, a fresh picture for the dashboard this often whenever the
+# car is still and not using the camera itself.
+HUNT_PREVIEW_SECONDS = 0.5
 # A person or animal the camera sees within AUTO_BLOCKED_CONE_DEGREES of
 # where the car would drive, nearer than this (or at an unknown distance),
 # blocks the way.
@@ -149,6 +182,7 @@ SWEEP_STRIP_MAX_TURN_DEG = 1.0
 # degrees) rather than adding stops of their own; the turn check uses each
 # picture's actual angle, so being off by up to this much costs nothing.
 SWEEP_STRIP_SNAP_DEG = 1.5
+PANORAMA_HFOV_DEGREES = CAMERA_HORIZONTAL_FOV_DEGREES
 AUTO_ALIGN_SETTLE_SECONDS = 0.15
 AUTO_VIEW_STEADY_TIMEOUT_SECONDS = 1.0
 PAN_LIMITS = (30, 150)
@@ -464,6 +498,14 @@ def assess_picture(jpeg: bytes) -> PictureQuality | None:
         len(cv2.ORB_create(nfeatures=500).detect(image, None)),
         float(cv2.Laplacian(image, cv2.CV_64F).var()),
     )
+
+
+def picture_sharpness(frame: np.ndarray) -> float:
+    """Fine detail in a picture (variance of the Laplacian, at half size):
+    motion blur drops it sharply, while a plain scene is just low throughout."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    small = cv2.resize(gray, (gray.shape[1] // 2, gray.shape[0] // 2), interpolation=cv2.INTER_AREA)
+    return float(cv2.Laplacian(small, cv2.CV_64F).var())
 
 
 def _steadiness_frame(jpeg: bytes | None) -> np.ndarray | None:
@@ -1043,6 +1085,234 @@ def _guess_step_seconds(distance_cm: float) -> float:
     return max(0.05, min(0.8, 2 * distance_cm / speed - MOTOR_RAMP_SECONDS))
 
 
+class _HuntBody:
+    """The car as the cat hunt sees it (robocar.hunt.HuntBody)."""
+
+    def __init__(self, controller: "MappingController") -> None:
+        self._controller = controller
+        status = controller._pan_tilt.status()
+        self._tilt = int(status["tilt"])
+        self._pan = int(status["pan"])
+        self.status: dict[str, object] = {}
+        # When the car or head last moved, and whether the hunt is mid-action
+        # (moving, sweeping, taking its own picture): the dashboard preview
+        # only takes pictures while neither.
+        self._lock = threading.Lock()
+        self._still_since = time.monotonic()
+        self._busy = 0
+        # Settle delay before pictures, learned from how often they blur, and
+        # a running reference for how sharp a still picture here looks.
+        self.still_seconds = HUNT_STILL_SECONDS
+        self._sharp_reference: float | None = None
+        self.retakes = 0
+
+    def now(self) -> float:
+        return time.monotonic()
+
+    @contextmanager
+    def _acting(self, moves: bool = True):
+        with self._lock:
+            self._busy += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._busy -= 1
+                if moves:
+                    self._still_since = time.monotonic()
+
+    def idle_and_still(self, seconds: float) -> bool:
+        with self._lock:
+            return self._busy == 0 and time.monotonic() - self._still_since >= seconds
+
+    def _wait_until_still(self) -> bool:
+        """Let the car and head come to rest before a picture."""
+        with self._lock:
+            remaining = self.still_seconds - (time.monotonic() - self._still_since)
+        if remaining > 0 and self._controller._stop_event.wait(remaining):
+            return False
+        self._controller._wait_until_steady(HUNT_STEADY_TIMEOUT_SECONDS)
+        return not self._controller._stop_event.is_set()
+
+    def wait(self, seconds: float) -> bool:
+        return not self._controller._stop_event.wait(max(0.0, seconds))
+
+    def stopped(self) -> bool:
+        return self._controller._stop_event.is_set()
+
+    def _point_head(self, pan: int) -> bool:
+        controller = self._controller
+        pan = max(PAN_LIMITS[0], min(PAN_LIMITS[1], int(pan)))
+        if pan == self._pan:
+            return True
+        with self._acting():
+            controller._pan_tilt.set_inhibited(True)
+            try:
+                controller._pan_tilt.set_angles(pan, self._tilt, override=True)
+            finally:
+                controller._pan_tilt.set_inhibited(False)
+            turned = abs(pan - self._pan)
+            self._pan = pan
+            return not controller._stop_event.wait(HUNT_HEAD_SETTLE_SECONDS + HUNT_HEAD_SECONDS_PER_DEGREE * turned)
+
+    def look(self, pan: int) -> Look:
+        controller = self._controller
+        if not self._point_head(pan):
+            return Look(None)
+        with self._acting(moves=False):
+            if not self._wait_until_still():
+                return Look(None)
+            return self._look_now()
+
+    def _sharp_picture(self, check: bool) -> np.ndarray | None:
+        """A picture, retaken after a further wait while it looks blurred
+        compared with recent ones; the sharpest one is kept."""
+        controller = self._controller
+        best: tuple[float, np.ndarray] | None = None
+        first: float | None = None
+        for shot in range(HUNT_MAX_SHOTS if check else 1):
+            jpeg = controller._camera.capture_snapshot()
+            frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR) if jpeg else None
+            if frame is None:
+                break
+            sharpness = picture_sharpness(frame)
+            first = sharpness if first is None else first
+            if best is None or sharpness > best[0]:
+                best = (sharpness, frame)
+            reference = self._sharp_reference
+            if not check or reference is None or sharpness >= HUNT_SOFT_FRACTION * reference:
+                break
+            # Soft: give the car longer to settle, then try again.
+            self.retakes += 1
+            if controller._stop_event.wait(0.5 * self.still_seconds + 0.1 * (shot + 1)):
+                break
+        if best is None:
+            return None
+        sharpness, frame = best
+        if check and first is not None:
+            if sharpness >= HUNT_BLUR_CONFIRM_RATIO * first:
+                # The retake was clearly sharper: the first one was motion blur.
+                self.still_seconds = min(HUNT_STILL_LIMITS_SECONDS[1], self.still_seconds * 1.25 + 0.05)
+            elif sharpness == first:
+                self.still_seconds = max(HUNT_STILL_LIMITS_SECONDS[0], self.still_seconds * 0.97)
+            # Follow the scene: the reference drifts toward what still pictures here look like.
+            self._sharp_reference = sharpness if self._sharp_reference is None else 0.8 * self._sharp_reference + 0.2 * sharpness
+        return frame
+
+    def _look_now(self, check: bool = True) -> Look:
+        controller = self._controller
+        frame = self._sharp_picture(check)
+        if frame is None:
+            return Look(None)
+        try:
+            detections = controller._detector.detect(frame) if controller._detector is not None else []
+        except Exception:
+            logger.exception("Detection failed during the hunt")
+            detections = []
+        look = cat_view_from(detections, self._pan, frame.shape[1], frame.shape[0])
+        controller._publish_hunt_frame(frame, detections, self.status)
+        return look
+
+    def ping(self, pan: int) -> float | None:
+        controller = self._controller
+        if not self._point_head(pan):
+            return None
+        with self._acting(moves=False):
+            return self._ping_now()
+
+    def _ping_now(self) -> float | None:
+        controller = self._controller
+        if controller._stop_event.wait(max(0.0, controller._range_sensor.settle_seconds - HUNT_HEAD_SETTLE_SECONDS)):
+            return None
+        readings = []
+        for _ in range(3):
+            reading = controller._range_sensor.sample_now()
+            if reading is not None:
+                readings.append(reading)
+            if controller._stop_event.wait(SCAN_SAMPLE_INTERVAL_SECONDS):
+                return None
+        return statistics.median(readings) if readings else None
+
+    def observe(self) -> None:
+        controller = self._controller
+        if not controller._drive.set_inhibited(True):
+            raise RuntimeError("Drive was not stopped before a range scan")
+        try:
+            with self._acting():
+                controller._capture_observation(mode="hunt")
+        finally:
+            controller._drive.set_inhibited(False)
+        self._pan = int(controller._pan_tilt.status()["pan"])
+
+    def pose(self) -> Pose:
+        controller = self._controller
+        with controller._lock:
+            pose, last = controller._pose, controller._last_odometry
+        return compose(pose, relative(last, controller._drive.odometry())) if last else pose
+
+    def odometry(self) -> Pose:
+        return self._controller._drive.odometry()
+
+    def grid(self) -> CoverageGrid:
+        return self._controller._grid
+
+    def landmarks(self) -> list[tuple[str, float, float]]:
+        with self._controller._map_lock:
+            return [(landmark.label, landmark.x, landmark.y) for landmark in self._controller._semantic.confirmed()]
+
+    def turn(self, degrees: float, precise: bool) -> bool:
+        controller = self._controller
+        if abs(degrees) < 1.0:
+            return not self.stopped()
+        with self._acting():
+            if precise:
+                pieces = max(1, math.ceil(abs(degrees) / AUTO_TURN_PIECE_DEGREES - 1e-9))
+                return all(controller._turn_and_align(degrees / pieces) for _ in range(pieces))
+            return controller._turn_by(degrees)
+
+    def move(self, forward_cm: float, sideways_cm: float, speed: float = 1.0) -> bool:
+        distance = math.hypot(forward_cm, sideways_cm)
+        if distance < 1.0:
+            return not self.stopped()
+        controller = self._controller
+        speed = max(0.3, min(1.0, speed))
+        if abs(sideways_cm) <= abs(forward_cm) * 0.05:
+            seconds = controller._step_seconds(distance)
+        else:
+            # Sideways travel is slower and has no calibration of its own.
+            seconds = AUTO_FORWARD_SECONDS * distance / AUTO_STEP_CM * (1.0 + 0.3 * abs(sideways_cm) / distance)
+        throttle = AUTO_FORWARD_COMMAND * speed * forward_cm / distance
+        strafe = AUTO_FORWARD_COMMAND * speed * sideways_cm / distance
+        with self._acting():
+            return controller._move_burst(throttle, seconds / speed, strafe=strafe)
+
+    def arc(self, strafe: float, steering: float, seconds: float) -> bool:
+        with self._acting():
+            return self._controller._move_burst(0.0, seconds, steering=steering, strafe=strafe)
+
+    def preview(self) -> None:
+        """A picture just for the dashboard, taken only while the car is
+        still and the hunt is not using the camera."""
+        if not self.idle_and_still(HUNT_STILL_SECONDS):
+            return
+        with self._acting(moves=False):
+            self._look_now(check=False)
+
+    def battery_ok(self) -> bool:
+        level = self._controller.battery_level() if self._controller.battery_level else None
+        return level != "critical"
+
+    def report(self, status: dict[str, object]) -> None:
+        self.status = status
+        controller = self._controller
+        with controller._lock:
+            controller._hunt_status = status
+            controller._hunt_camera = {"settle_seconds": round(self.still_seconds, 2), "retakes": self.retakes}
+            controller._plan = str(status.get("action") or "")
+            if controller._enabled:
+                controller._state = f"hunt_{status.get('phase')}"
+
+
 class _CalibrationRig:
     """The car as calibration sees it: turns, bursts, pictures and ranges."""
 
@@ -1147,6 +1417,18 @@ class MappingController:
             store_path.parent / "exploration.json" if store_path is not None and str(store_path) != ":memory:" else None
         )
         self._learner = load_learner(self._learner_path)
+        # The cat hunt: what it has learned, its latest status and camera frame.
+        self._hunt_memory_path = (
+            store_path.parent / "hunt.json" if store_path is not None and str(store_path) != ":memory:" else None
+        )
+        self._hunt_memory = load_memory(self._hunt_memory_path)
+        self._hunt_status: dict[str, object] | None = None
+        self._hunt_frame: bytes | None = None
+        self._hunt_frame_at: float = 0.0
+        # The hunt camera's learned settle delay and how many pictures it retook.
+        self._hunt_camera: dict[str, float] = {}
+        # Set by the web app: "ok", "getting_low", "low", "critical" or None.
+        self.battery_level: Callable[[], str | None] | None = None
         self._reset_localization()
         self._surface_map = SurfaceMap()
         self._grid = CoverageGrid()
@@ -1184,6 +1466,9 @@ class MappingController:
         self._verified_turn: float | None = None
         self._last_node: int | None = None
         self._joining_run = False
+        # Stops since the pose was last pinned to the map (a sonar sweep
+        # matched to mapped walls, or a recognized place); None if never.
+        self._stops_since_fix: int | None = None
 
     def start(self) -> None:
         self._start("survey", self._run_survey)
@@ -1204,6 +1489,115 @@ class MappingController:
         if not self._range_sensor.status()["enabled"]:
             raise RuntimeError("Autonomous exploration requires an enabled ultrasonic sensor")
         self._start("explore", self._run_autonomous)
+
+    def start_hunt(self, attended: bool) -> None:
+        """Hunt for the cat in the mapped room and play with it (attended)."""
+        if attended is not True:
+            raise ValueError("Attended supervision must be confirmed before the hunt")
+        drive_status = self._drive.status()
+        if drive_status.get("fault"):
+            raise RuntimeError(f"Motor board unavailable: {drive_status['fault']}")
+        if drive_status["mode"] != "hardware":
+            raise RuntimeError("The hunt requires hardware mode")
+        if any(abs(float(drive_status[axis])) > 0.01 for axis in ("throttle", "strafe", "steering")):
+            raise RuntimeError("Stop the car before starting the hunt")
+        if not self._range_sensor.status()["enabled"]:
+            raise RuntimeError("The hunt requires an enabled ultrasonic sensor")
+        if self._detector is None or not getattr(self._detector, "available", True):
+            raise RuntimeError("The hunt needs object detection to spot the cat")
+        if self._store.count() == 0:
+            raise RuntimeError("Map the room first: the hunt plans its search on the map")
+        self._start("hunt", self._run_hunt)
+
+    def _run_hunt(self) -> None:
+        self._hold_camera(True)
+        body = _HuntBody(self)
+        preview_done = threading.Event()
+
+        def preview() -> None:
+            # Keep the dashboard's picture fresh between the hunt's own looks.
+            while not preview_done.wait(HUNT_PREVIEW_SECONDS):
+                with self._lock:
+                    fresh = time.time() - self._hunt_frame_at < HUNT_PREVIEW_SECONDS
+                if fresh:
+                    continue
+                try:
+                    body.preview()
+                except Exception:
+                    logger.debug("Hunt preview picture failed", exc_info=True)
+
+        previewer = threading.Thread(target=preview, name="hunt-preview", daemon=True)
+        previewer.start()
+        try:
+            self._drive.set_inhibited(False)
+            engine = HuntEngine(body, self._hunt_memory)
+            reason = engine.run()
+            with self._lock:
+                self._state = f"hunt_{reason}"
+        except Exception as exc:
+            if not self._stop_event.is_set():
+                logger.exception("The hunt stopped after an error")
+                with self._lock:
+                    self._state = "error"
+                    self._error = f"{type(exc).__name__}: {exc}"
+        finally:
+            preview_done.set()
+            previewer.join(timeout=5)
+            self._drive.stop()
+            try:
+                save_memory(self._hunt_memory_path, self._hunt_memory)
+            except OSError as exc:
+                logger.warning("Could not save what the hunt learned: %s", exc)
+            self._set_enabled_false()
+            self._hold_camera(False)
+
+    def _publish_hunt_frame(self, frame: np.ndarray, detections: list[dict[str, object]], status: dict[str, object]) -> None:
+        """The hunt's latest picture for the dashboard: what it detected, and
+        what it is up to."""
+        try:
+            image = frame.copy()
+            for detection in detections:
+                x, y, width, height = (int(value) for value in detection["box"])
+                cat = detection.get("label") == "cat"
+                colour = (60, 170, 255) if cat else (45, 220, 90)
+                cv2.rectangle(image, (x, y), (x + width, y + height), colour, 3 if cat else 2)
+                cv2.putText(image, f"{detection['label']} {float(detection['confidence']):.0%}", (x, max(y - 8, 18)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2, cv2.LINE_AA)
+            phase = str(status.get("phase") or "").upper()
+            action = str(status.get("action") or "")[:70]
+            cv2.rectangle(image, (0, image.shape[0] - 44), (image.shape[1], image.shape[0]), (16, 24, 32), -1)
+            cv2.putText(image, phase, (8, image.shape[0] - 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (93, 179, 242), 2, cv2.LINE_AA)
+            cv2.putText(image, action, (8, image.shape[0] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (236, 243, 247), 1, cv2.LINE_AA)
+            encoded, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if encoded:
+                with self._lock:
+                    self._hunt_frame = jpeg.tobytes()
+                    self._hunt_frame_at = time.time()
+        except Exception:
+            logger.debug("Could not draw the hunt frame", exc_info=True)
+
+    def hunt_frame(self) -> bytes | None:
+        with self._lock:
+            return self._hunt_frame
+
+    def hunt_status(self) -> dict[str, object]:
+        with self._lock:
+            running = self._enabled and self._mode == "hunt"
+            status = dict(self._hunt_status or {})
+            frame_at = self._hunt_frame_at
+        return {
+            "running": running,
+            "status": status or None,
+            "frame_at": frame_at or None,
+            "frame_age_seconds": round(time.time() - frame_at, 1) if frame_at else None,
+            "camera": dict(self._hunt_camera),
+            "learned": {
+                "favourites": self._hunt_memory.favourites(5),
+                "hunts": self._hunt_memory.hunts,
+                "finds": self._hunt_memory.finds,
+                "cat_spots": [[round(v, 1) for v in spot] for spot in self._hunt_memory.cat_spots[:8]],
+            },
+        }
 
     def start_calibration(self, attended: bool) -> None:
         """Measure real turns and steps (car facing a flat wall about 1-1.5 m away)."""
@@ -1366,7 +1760,49 @@ class MappingController:
             status["landmark_count"] = len(self._semantic.confirmed())
         detector_info = getattr(self._detector, "info", None)
         status["detector"] = detector_info() if callable(detector_info) else None
+        status["localized"] = self.localized()
         return status
+
+    def localized(self) -> dict[str, object]:
+        """Whether the car believes it knows roughly where it is and which way
+        it faces on the map, and why (not)."""
+        with self._lock:
+            position_sigma, heading_sigma = pose_sigma(self._pose_covariance)
+            since = self._stops_since_fix
+            last_odometry = self._last_odometry
+        with self._map_lock:
+            walls = len(self._surface_map.walls())
+        moved = turned = 0.0
+        if last_odometry is not None:
+            change = relative(last_odometry, self._drive.odometry())
+            moved, turned = math.hypot(change[0], change[1]), abs(wrap_degrees(change[2]))
+        reasons = []
+        if walls < LOCALIZED_MIN_WALLS:
+            reasons.append("no map to match against yet")
+        elif since is None:
+            reasons.append("has not matched itself to the map yet")
+        elif since > LOCALIZED_MAX_STOPS_SINCE_FIX:
+            reasons.append(f"no map match at the last {since} stops")
+        if position_sigma > LOCALIZED_MAX_SIGMA_CM:
+            reasons.append(f"position uncertain (±{position_sigma:.0f} cm)")
+        if heading_sigma > LOCALIZED_MAX_HEADING_SIGMA_DEG:
+            reasons.append(f"heading uncertain (±{heading_sigma:.0f}°)")
+        if moved > LOCALIZED_MAX_DEAD_RECKONING_CM:
+            reasons.append(f"drove {moved / 100:.1f} m on wheel counts since its last check")
+        if turned > LOCALIZED_MAX_DEAD_RECKONING_DEG:
+            reasons.append(f"turned {turned:.0f}° on wheel counts since its last check")
+        if reasons:
+            detail = "; ".join(reasons)
+        else:
+            when = "at the last stop" if since == 0 else f"{since} stops ago"
+            detail = f"matched to the map {when}: ±{position_sigma:.0f} cm, ±{heading_sigma:.0f}°"
+        return {
+            "known": not reasons,
+            "detail": detail,
+            "sigma_cm": round(position_sigma, 1),
+            "heading_sigma_deg": round(heading_sigma, 1),
+            "stops_since_fix": since,
+        }
 
     def observations(self) -> list[dict[str, object]]:
         return self._store.recent()
@@ -1392,6 +1828,12 @@ class MappingController:
                 for start, end in self._links
             ]
             data.update(self._semantic.to_json(self._grid.wall_between))
+        with self._lock:
+            last_cat = (self._hunt_status or {}).get("last_cat_position")
+        data["cat"] = {
+            "last_seen": last_cat,
+            "spots": [[round(v, 1) for v in spot] for spot in self._hunt_memory.cat_spots[:8]],
+        }
         data["pose_sigma_cm"] = round(position_sigma, 1)
         data["heading_sigma_deg"] = round(heading_sigma, 1)
         return data
@@ -2123,12 +2565,15 @@ class MappingController:
             )
         )
         side_pans = tuple(pan for pan in SIDE_VIEW_PANS if pan != original_pan) if need_side_views else ()
-        # Exploring, a turn may follow: take its strip pictures on the way past.
-        strip_pans = self._sweep_strip_pans(original_pan) if mode == "explore" else []
+        # A strip of pictures across the head's range, taken on the way past
+        # during the sweep: a turn while exploring may reuse it, and the
+        # dashboard shows it as a panorama.
+        strip_pans = self._sweep_strip_pans(original_pan) if mode in ("explore", "survey") else []
         scan, side_views = self._sweep(original_tilt, original_pan, side_pans, strip_pans)
         if self._sweep_strip is not None:
             # The car stands still for a stop, so the odometry read for it holds.
             self._sweep_strip = replace(self._sweep_strip, odometry=odometry)
+            self._show_panorama(self._sweep_strip)
         if scan is None:
             return []
         # What the camera recognizes: people and animals are kept out of the
@@ -2277,6 +2722,10 @@ class MappingController:
         captured_at = datetime.now(timezone.utc).isoformat()
         with self._lock:
             self._pose, self._pose_covariance = pose, covariance
+            if registration.accepted or event is not None:
+                self._stops_since_fix = 0
+            elif self._stops_since_fix is not None:
+                self._stops_since_fix += 1
             self._hazards = hazards_from(sightings)
             self._last_node = observation_id
             self._last_odometry = odometry
@@ -2415,6 +2864,19 @@ class MappingController:
             nearest = min(stops, key=lambda pan: abs(pan - wanted), default=wanted)
             pans.add(nearest if abs(nearest - wanted) <= SWEEP_STRIP_SNAP_DEG else wanted)
         return sorted(pans)
+
+    def _show_panorama(self, strip: SweepStrip) -> None:
+        views = [(pan_bearing(pan), frames[0]) for pan, frames in strip.pictures.items() if frames]
+        if len(views) < 2:
+            return
+        widest = max(bearing for bearing, _ in views) + PANORAMA_HFOV_DEGREES / 2
+        lines = [f"{len(views)} pictures taken during the sonar sweep, joined: about {widest:.0f} deg each side of ahead"]
+        self._set_vision(
+            "panorama",
+            "Sweep panorama",
+            lines,
+            lambda: render_panorama(views, PANORAMA_HFOV_DEGREES, "Sweep panorama", lines),
+        )
 
     def _strip_from_sweep(self, pans: Sequence[int], centre_pan: int, tilt: int) -> dict[int, tuple[bytes, ...]] | None:
         """The sweep's pictures nearest each of `pans`, if every one was taken

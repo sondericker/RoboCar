@@ -31,12 +31,14 @@ import cv2
 import numpy as np
 
 from robocar.localization import Pose, compose, register_scan, relative, wrap_degrees
-from robocar.semantics import Sighting, static_scan
+from robocar.semantics import CAMERA_HFOV_DEG, Sighting, static_scan
 from robocar.surfaces import SurfaceMap, extract_echoes, pose_rotation
 
 logger = logging.getLogger(__name__)
 
-CAMERA_HORIZONTAL_FOV_DEGREES = 62.2
+# The OV5647's field of view in the mode RoboCar uses; one figure for all
+# the camera geometry (semantics.py explains it).
+CAMERA_HORIZONTAL_FOV_DEGREES = CAMERA_HFOV_DEG
 KEYFRAME_DETECT_FEATURES = 1000
 KEYFRAME_KEEP_FEATURES = 400
 KEYFRAME_MIN_FEATURES = 40

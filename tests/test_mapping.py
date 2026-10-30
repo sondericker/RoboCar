@@ -20,6 +20,7 @@ from robocar.drive import (
     SimulatedPanTilt,
 )
 from robocar.mapping import (
+    CAMERA_HORIZONTAL_FOV_DEGREES,
     AUTO_LOOK_AROUND_TURNS,
     AUTO_MAX_TURN_PER_STOP_DEGREES,
     AUTO_STEP_CM,
@@ -158,7 +159,7 @@ class MappingTests(unittest.TestCase):
         for y in range(20, 480, 40):
             for x in range(20, 640, 40):
                 cv2.circle(image, (x, y), 6, int((x * 3 + y * 7) % 256), 2)
-        focal_length = 640 / (2 * np.tan(np.radians(62.2) / 2))
+        focal_length = 640 / (2 * np.tan(np.radians(CAMERA_HORIZONTAL_FOV_DEGREES) / 2))
         camera_matrix = np.array(
             [[focal_length, 0, 320], [0, focal_length, 240], [0, 0, 1]],
             dtype=np.float64,
@@ -247,7 +248,7 @@ class MappingTests(unittest.TestCase):
     def test_consecutive_explore_snapshots_save_vision_corrected_pose(self):
         rng = np.random.default_rng(321)
         previous_image = rng.integers(0, 256, (480, 640), dtype=np.uint8)
-        focal_length = 640 / (2 * np.tan(np.radians(62.2) / 2))
+        focal_length = 640 / (2 * np.tan(np.radians(CAMERA_HORIZONTAL_FOV_DEGREES) / 2))
         camera_matrix = np.array(
             [[focal_length, 0, 320], [0, focal_length, 240], [0, 0, 1]],
             dtype=np.float64,
@@ -749,14 +750,18 @@ class MappingTests(unittest.TestCase):
         self.assertIn(40, pan_driver.visited)  # it took a fresh strip
         self.assertAlmostEqual(mapping._verified_turn, true_heading(), delta=1.5)
 
-    def test_only_exploring_takes_strip_pictures_during_the_sweep(self):
+    def test_mapping_stops_take_a_strip_and_show_it_as_a_panorama(self):
         mapping, drive, pan_driver, true_heading = self.turning_rig()
         mapping._run_id = "survey"
+        mapping._capture_observation(mode="hunt")
+        self.assertIsNone(mapping._sweep_strip)  # the hunt pans for itself
         mapping._capture_observation(mode="survey")
-        self.assertIsNone(mapping._sweep_strip)
-        mapping._capture_observation(mode="explore")
         self.assertEqual(sorted(mapping._sweep_strip.pictures), self.strip_pans())
         self.assertEqual(mapping._sweep_strip.odometry, drive.odometry())
+        panels = {panel["name"]: panel for panel in mapping.vision_panels()}
+        self.assertIn("panorama", panels)
+        image = cv2.imdecode(np.frombuffer(mapping.vision_image("panorama"), np.uint8), cv2.IMREAD_COLOR)
+        self.assertGreater(image.shape[1], 2 * image.shape[0])  # wide
 
     def test_turn_without_usable_camera_views_relies_on_odometry(self):
         drive = DriveController(SimulatedDriver(), max_duty=4095, command_timeout=1, physical=True)
@@ -820,6 +825,42 @@ class MappingTests(unittest.TestCase):
                 drive.close()
                 pan_tilt.close()
                 range_sensor.close()
+
+
+class LocalizedTests(unittest.TestCase):
+    def setUp(self):
+        fast_sweeps(self)
+
+    def test_the_car_knows_where_it_is_only_after_matching_the_map(self):
+        room = SonarRoom()
+        drive = DriveController(SimulatedDriver(), max_duty=4095, command_timeout=1, physical=True)
+        pan_driver = SimulatedPanTilt()
+        pan_tilt = PanTiltController(pan_driver, physical=True)
+
+        class RoomSensor(FakeRangeSensor):
+            def get_distance(self) -> float | None:
+                return room.distance(drive.odometry(), 90 - pan_driver.pan)
+
+        range_sensor = RangeSensorController(RoomSensor(), physical=True, sample_interval=0.5)
+        mapping = MappingController(FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")))
+        for resource in (range_sensor, pan_tilt, drive, mapping):
+            self.addCleanup(resource.close)
+        mapping._run_id = "where"
+        start = mapping.localized()
+        self.assertFalse(start["known"])
+        self.assertIn("no map", start["detail"])
+        mapping._capture_observation(mode="explore")
+        for _ in range(2):
+            self.assertTrue(mapping._move_burst(1.0, 0.15))
+            mapping._capture_observation(mode="explore")
+        here = mapping.localized()
+        self.assertTrue(here["known"], here)
+        self.assertEqual(mapping.status()["localized"]["known"], True)
+        # Driving off on wheel counts alone, it is no longer sure.
+        with patch.object(drive, "odometry", return_value=(0.0, 250.0, 0.0)):
+            away = mapping.localized()
+        self.assertFalse(away["known"])
+        self.assertIn("since its last check", away["detail"])
 
 
 class SlippingRoomTests(unittest.TestCase):

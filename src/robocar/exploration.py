@@ -699,15 +699,19 @@ class CoverageGrid:
             centre = -centre
         return Corridor(axis, centre, width)
 
-    def clear_run(self, pose: Sequence[float], limit_cm: float) -> float:
+    def clear_run(self, pose: Sequence[float], limit_cm: float, known_only: bool = False) -> float:
         """How far the car can drive straight ahead before coming within its
         radius of a mapped wall. Walls met at a glancing angle never echo, so
         the sonar alone cannot be trusted for this. Starting already inside
-        that margin, it may drive only where it gets no nearer to a wall."""
+        that margin, it may drive only where it gets no nearer to a wall.
+
+        With `known_only`, floor the map has never seen counts as a wall too:
+        for moves no sensor checks first (reversing, sliding sideways)."""
         if not self.log_odds.size:
-            return limit_cm
+            return 0.0 if known_only else limit_cm
         # Every mapped wall counts here, confirmed or not: safety first.
-        clearance = cv2.distanceTransform((~self.occupied()).astype(np.uint8), cv2.DIST_L2, 5) * self.cell
+        blocked = ~self.free() if known_only else self.occupied()
+        clearance = cv2.distanceTransform((~blocked).astype(np.uint8), cv2.DIST_L2, 5) * self.cell
         heading = direction(float(pose[2]))
         start = np.array(pose[:2], dtype=float)
         first = self.cell_of(start)
@@ -919,9 +923,15 @@ class CoverageGrid:
             # Already where it wanted to stand: face the frontier and go on into it.
             look = best.middle
             return Waypoint(turn_to(look), math.hypot(look[0] - here[0], look[1] - here[1]), best)
-        # Head for the furthest point along the path, within a leg, that can
-        # be reached in a straight line.
-        path = [self.cell_of(best.target)]
+        waypoint = self._waypoint_along(here, self.cell_of(best.target), parents, start)
+        return Waypoint(turn_to(waypoint), math.hypot(waypoint[0] - here[0], waypoint[1] - here[1]), best)
+
+    def _waypoint_along(
+        self, here: np.ndarray, goal: tuple[int, int], parents: dict, start: tuple[int, int]
+    ) -> tuple[float, float]:
+        """The furthest point along the path to `goal`, within a leg, that can
+        be reached in a straight line."""
+        path = [goal]
         while path[-1] != start and path[-1] in parents:
             path.append(parents[path[-1]])
         path.reverse()
@@ -936,7 +946,30 @@ class CoverageGrid:
             if not self.line_of_sight(here, point, traversable):
                 break
             waypoint = point
-        return Waypoint(turn_to(waypoint), math.hypot(waypoint[0] - here[0], waypoint[1] - here[1]), best)
+        return waypoint
+
+    def path_lengths(self, pose: Sequence[float]) -> tuple[np.ndarray, dict, tuple[int, int]]:
+        """Path cost (cm, inf where unreachable) to every cell from the car, with
+        the parents to follow a path back."""
+        start = self.cell_of(pose[:2])
+        distance, parents = self._distances(start)
+        return distance, parents, start
+
+    def route(self, pose: Sequence[float], goal: Sequence[float], routes=None) -> tuple[float, float] | None:
+        """Bearing (counterclockwise from the heading) and distance of the next
+        straight leg toward `goal`, or None when it cannot be reached.
+        `routes` is a path_lengths() result to reuse."""
+        if not self.log_odds.size:
+            return None
+        distance, parents, start = routes or self.path_lengths(pose)
+        cell = self.cell_of(goal)
+        if not self._inside(cell) or not math.isfinite(distance[cell]):
+            return None
+        here = np.array(pose[:2], dtype=float)
+        point = self._waypoint_along(here, cell, parents, start)
+        offset = np.array(point) - here
+        bearing = math.degrees(math.atan2(-offset[0], offset[1]))
+        return (bearing - float(pose[2]) + 180.0) % 360.0 - 180.0, float(np.hypot(*offset))
 
     def to_image(self) -> np.ndarray:
         """Free dark teal, occupied light, unknown transparent (BGRA, north up)."""

@@ -1,5 +1,6 @@
 import logging
 import math
+import time
 
 from flask import Flask, Response, jsonify, render_template, request
 
@@ -17,10 +18,14 @@ from robocar.drive import (
     SimulatedPanTilt,
 )
 from robocar.mapping import MappingController, MappingStore
+from robocar.power import BoardADC, PiPower, PowerMonitor, board_version
 from robocar.range_sensor import FreenoveRangeSensor, RangeSensorController
 
 
 logger = logging.getLogger(__name__)
+# The hunt's video: a frame this often, ending a while after the hunt stops.
+HUNT_STREAM_INTERVAL_SECONDS = 0.2
+HUNT_STREAM_IDLE_FRAMES = 25
 
 
 def _open_hardware(name: str, opener):
@@ -59,6 +64,18 @@ def create_app(config: Config | None = None) -> Flask:
     )
     pan_tilt = PanTiltController(pan_tilt_driver or SimulatedPanTilt(), config.hardware_enabled, fault=pan_tilt_fault)
     range_sensor = RangeSensorController(range_sensor_driver, config.hardware_enabled, fault=range_fault)
+    adc, adc_fault = (
+        _open_hardware("Battery monitor", lambda: BoardADC(board_version(config.freenove_server_path)))
+        if config.hardware_enabled
+        else (None, None)
+    )
+    power = PowerMonitor(
+        adc,
+        PiPower(),
+        lambda: any(abs(float(drive.status()[axis])) > 0.01 for axis in ("throttle", "strafe", "steering")),
+        cells=config.battery_cells,
+        adc_fault=adc_fault,
+    )
     detector = ObjectDetector(
         config.model_path,
         config.labels_path,
@@ -86,6 +103,14 @@ def create_app(config: Config | None = None) -> Flask:
     app = Flask(__name__)
     app.extensions["robocar_camera"] = camera
     app.extensions["robocar_detector"] = detector
+    app.extensions["robocar_power"] = power
+    mapping.battery_level = power.battery_level
+
+    def battery_too_low() -> str | None:
+        if power.battery_level() == "critical":
+            volts = power.status()["battery"]["resting_volts"]
+            return f"Battery critically low ({volts:.2f} V); charge it before driving on its own"
+        return None
     app.extensions["robocar_drive"] = drive
     app.extensions["robocar_pan_tilt"] = pan_tilt
     app.extensions["robocar_range_sensor"] = range_sensor
@@ -111,6 +136,7 @@ def create_app(config: Config | None = None) -> Flask:
                 "drive": drive.status(),
                 "range": range_sensor.status(),
                 "mapping": mapping.status(),
+                "power": power.status(),
             }
         )
 
@@ -135,6 +161,8 @@ def create_app(config: Config | None = None) -> Flask:
             return jsonify({"error": "enabled must be a boolean"}), 400
         if payload["enabled"] and not isinstance(payload.get("attended"), bool):
             return jsonify({"error": "attended must be a boolean"}), 400
+        if payload["enabled"] and (reason := battery_too_low()):
+            return jsonify({"error": reason}), 409
         try:
             if payload["enabled"]:
                 mapping.start_autonomous(payload["attended"])
@@ -143,6 +171,55 @@ def create_app(config: Config | None = None) -> Flask:
         except (RuntimeError, ValueError) as exc:
             return jsonify({"error": str(exc)}), 409
         return jsonify(mapping.status())
+
+    @app.post("/api/hunt")
+    def hunt_control():
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict) or not isinstance(payload.get("enabled"), bool):
+            return jsonify({"error": "enabled must be a boolean"}), 400
+        if payload["enabled"] and not isinstance(payload.get("attended"), bool):
+            return jsonify({"error": "attended must be a boolean"}), 400
+        if payload["enabled"] and (reason := battery_too_low()):
+            return jsonify({"error": reason}), 409
+        try:
+            if payload["enabled"]:
+                mapping.start_hunt(payload["attended"])
+            else:
+                mapping.stop()
+        except (RuntimeError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 409
+        return jsonify(mapping.hunt_status())
+
+    @app.get("/api/hunt")
+    def hunt_status():
+        return jsonify(mapping.hunt_status())
+
+    @app.get("/api/hunt/frame.jpg")
+    def hunt_frame():
+        frame = mapping.hunt_frame()
+        if frame is None:
+            return jsonify({"error": "No hunt picture yet"}), 404
+        return Response(frame, mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    @app.get("/hunt.mjpg")
+    def hunt_video():
+        def frames():
+            last = None
+            idle = 0
+            while idle < HUNT_STREAM_IDLE_FRAMES:
+                frame = mapping.hunt_frame()
+                running = mapping.hunt_status()["running"]
+                if frame is not None and (frame is not last or running):
+                    yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+                    last = frame
+                idle = 0 if running else idle + 1
+                time.sleep(HUNT_STREAM_INTERVAL_SECONDS)
+
+        return Response(
+            frames(),
+            mimetype="multipart/x-mixed-replace; boundary=frame",
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/api/calibration")
     def calibration_status():
@@ -155,6 +232,8 @@ def create_app(config: Config | None = None) -> Flask:
             return jsonify({"error": "enabled must be a boolean"}), 400
         if payload["enabled"] and not isinstance(payload.get("attended"), bool):
             return jsonify({"error": "attended must be a boolean"}), 400
+        if payload["enabled"] and (reason := battery_too_low()):
+            return jsonify({"error": reason}), 409
         try:
             if payload["enabled"]:
                 mapping.start_calibration(payload["attended"])

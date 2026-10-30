@@ -114,6 +114,119 @@ current. With hardware disabled, the UI identifies the range finder as
 disabled; it does not simulate a distance. The reading is informational and
 does not currently interlock or stop drive commands.
 
+## Cat hunt
+
+Once the room is mapped, **Start the hunt** in the dashboard's Cat hunt
+section sends the car to find the cat and play with it. It is attended,
+like auto explore. The section shows:
+- the car's camera view, with what it recognizes boxed and what it is doing
+  written underneath;
+- its phase (seeking, approaching, playing, resting), with the current move
+  in plain words;
+- the cat's distance, and recent moves;
+- the moves the cat has reacted to most.
+
+The map marks where the cat was last seen and its favourite spots.
+
+- **Seeking:** a belief map says where the cat might be. It covers the floor
+  the map knows, weighted toward couches, beds and chairs the camera
+  recognized and toward spots where the cat was found before.
+  - **Looking:** every look with the camera lowers it over what that look
+    could see, with walls blocking the view.
+  - **Cats move:** it drifts back toward the prior as time passes.
+  - **Where next:** the car goes where it could see the most of it per
+    centimetre of travel, routed on the map and checked with the sonar.
+  - **On arrival:** a full sweep (re-checking the map and its position),
+    then it pans the camera across the room. It also glances ahead after
+    every leg. Detection runs on the AI HAT+, in about 12 ms a picture.
+- **Sharp pictures:** every hunt picture waits until the car and head have
+  been still a moment, then until two frames in a row match. Its sharpness
+  is then compared with recent pictures. A soft one is retaken after a
+  further wait, and the sharpest is kept. When a retake comes out clearly
+  sharper (motion blur), the settle delay grows, and it shrinks again while
+  first shots keep coming out sharp (between 0.25 and 1.5 s).
+- **Live picture:** between its own looks, the dashboard's picture is
+  refreshed about twice a second whenever the car is still. While it sweeps
+  or drives, the page says how old the picture is.
+- **Approaching:** it turns to the cat, centres the head, measures the
+  distance with the sonar, and closes to about 75 cm.
+- **Playing:** nothing is scripted.
+  - **Moves:** each beat picks one of 14 moves, each with fresh random
+    sizes, speeds and directions: pounce, charge and retreat, zig-zag in or
+    out, sidestep, shimmy, wiggle, spin, orbit (circling while facing the
+    cat), stalk, freeze, peekaboo, head-bob, back-off tease and combos of
+    those.
+  - **Choosing:** the choice weighs what suits the distance, the car's
+    drifting mood (frisky or mellow), what it hasn't done lately, and what
+    has made the cat react.
+  - **Reactions:** how far the cat itself moved afterwards, with the car's
+    own movement taken out.
+  - **Distance:** if the cat drifts off, the car closes in, going round
+    obstacles with the map; if the cat comes very close, it eases back.
+  - **Rests:** every minute or two it backs off and waits about a minute,
+    with an occasional tiny wiggle, inch or glance, before going back to
+    bothering the cat.
+  - **Lost cat:** if the cat slips away, it looks around, then hunts for it
+    again starting near where it was last seen.
+- **Learning:** saved in `hunt.json` beside the map database: how much the
+  cat reacts to each move, the camera's distance-from-size scale (learned
+  from the sonar), and where the cat likes to be.
+- **Safety:**
+  - **Distance:** it never closes to less than 30 cm from the cat.
+  - **Seeing the cat:** it moves near the cat only after seeing it just now,
+    in front, because the camera and sonar can't see beside or behind the
+    car.
+  - **Each direction checked:**
+    - forward moves by the sonar and the map;
+    - sideways moves by a glance that way and floor the map *knows* is
+      clear;
+    - reversing (never more than 25 cm) only through known-clear floor.
+  - **People:** nothing drives at a person close ahead.
+  - **Stopping:** the hunt stops after 20 minutes, on a critically low
+    battery, or on **STOP**.
+
+In a simulated two-room house (`tests/hunt_sim.py`, `tests/test_hunt.py`):
+- **Finding:** the car found the cat in 15 of 15 runs, usually within 30
+  seconds to 2 minutes.
+- **Playing:** it played for about five minutes per run, resting two or
+  three times and using all 14 moves.
+- **Safety:** it never bumped a wall or touched the cat.
+- **Learning:** with a cat that only reacts to sideways motion, sidestep,
+  shimmy, orbit and zig-zag became its favourites.
+
+**Limit:** a doorway the sonar has drawn partly closed (echoes from its edges)
+can stop the car closing in through it. It then plays from where it is
+until the cat comes nearer or the map clears.
+
+## Power
+
+The dashboard shows the car's battery as a meter, both in the **Power**
+panel and as a small one beside the title, plus the Raspberry Pi's own supply.
+
+- **Car battery:** read from the Freenove board's ADS7830 converter
+  (I²C 0x48, channel 2, behind a voltage divider). The scaling follows the
+  board version in the kit's `params.json`: version 1 is ×3 with a 3.3 V
+  reference, version 2 ×2 with 5.2 V. It assumes two lithium cells
+  (`ROBOCAR_BATTERY_CELLS`). Charge is estimated from a resting discharge
+  curve, using readings taken with the motors idle for 3 seconds; while
+  driving, the sagging voltage is shown separately.
+- **Levels** (resting volts per cell):
+
+  | Level | When | Meter |
+  |---|---|---|
+  | Getting low | below 3.65 V (about 27%) | amber, "charge soon" |
+  | Low | below 3.5 V (about 10%) | red, pulsing, "charge now" |
+  | Critical | below 3.3 V | auto explore and calibration refuse to start |
+
+- **Raspberry Pi:** from the Pi 5's power chip (`vcgencmd pmic_read_adc`):
+  - the 5 V input, the 3.3 V, 1.8 V and core rails;
+  - the board's own draw (not USB devices or HATs);
+  - the CPU temperature;
+  - whether the supply has dipped too low or the CPU was throttled, now or
+    since boot (`vcgencmd get_throttled`).
+- **Readings that fail** are shown as unavailable, with the reason. The
+  battery reading needs the car's board powered and hardware enabled.
+
 ## Mapping survey and attended auto explore
 
 **Start mapping survey** records checkpoints while you drive manually.
@@ -166,6 +279,10 @@ After each sweep it decides where to go by **what it could learn there**:
   and before the car would come within its radius of any mapped wall.
   Walls met at a glancing angle never echo, so the sonar alone cannot be
   trusted for this. Paths keep away from walls where there is room.
+- **Sweep panorama:** at each survey or explore stop, pictures taken every
+  10° during the sonar sweep are joined into a panorama about 130° wide. It
+  is shown in the dashboard's "What the camera sees" panels. Each picture
+  contributes the slice between its neighbours, so the joins line up.
 - **Camera-measured turns:** before each turn piece the car needs a strip of
   pictures every 10° across the pan on the turn side (0–60°). While exploring,
   the first piece's strip is taken during the stop's sonar sweep, which
