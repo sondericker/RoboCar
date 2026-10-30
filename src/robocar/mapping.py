@@ -97,6 +97,8 @@ AUTO_MIN_STEP_CM = 10.0
 # the last few stops; its pose estimate is this certain; and it has not since
 # moved further than this on wheel counts alone.
 LOCALIZED_MIN_WALLS = 2
+# ...or this many obstacle cells on the coverage map.
+LOCALIZED_MIN_OCCUPIED_CELLS = 40
 LOCALIZED_MAX_STOPS_SINCE_FIX = 2
 LOCALIZED_MAX_SIGMA_CM = 30.0
 LOCALIZED_MAX_HEADING_SIGMA_DEG = 12.0
@@ -162,6 +164,8 @@ AUTO_MAX_TURN_SECONDS = 3.0
 AUTO_STRIP_STEP_DEGREES = 10
 # The full pan range on the turn side, so even a large overshoot is measured.
 AUTO_STRIP_REACH_DEGREES = 60
+# The strip and its panorama are centred on straight ahead.
+STRIP_CENTRE_PAN = 90
 AUTO_STRIP_MAX_YAW_DEGREES = 25.0
 AUTO_ALIGN_TOLERANCE_DEGREES = 3.0
 AUTO_ALIGN_MAX_CORRECTIONS = 2
@@ -200,6 +204,15 @@ MAP_REBUILD_MOVE_CM = 4.0
 # tied to the last stop only this loosely; its first sweep against the known
 # walls (or a recognized place) pins it down.
 CONTINUE_POSITION_SIGMA_CM = 25.0
+# Fitting a sweep to the coverage map when wall registration fails: how far
+# to search (twice the pose's uncertainty, within these bounds) and how sure
+# a good fit leaves the pose.
+GRID_MATCH_MIN_REACH_CM = 12.0
+GRID_MATCH_MAX_REACH_CM = 32.0
+GRID_MATCH_MIN_REACH_DEG = 8.0
+GRID_MATCH_MAX_REACH_DEG = 24.0
+GRID_MATCH_SIGMA_CM = 8.0
+GRID_MATCH_HEADING_SIGMA_DEG = 3.0
 CONTINUE_HEADING_SIGMA_DEG = 20.0
 MAP_REBUILD_TURN_DEG = 2.0
 VIEW_HEADING_SIGMA_AFTER_MATCH = 3.0
@@ -1235,6 +1248,9 @@ class _HuntBody:
 
     def observe(self) -> None:
         controller = self._controller
+        # Face ahead first: the stop's picture, the strip and its panorama
+        # are all taken relative to where the head starts.
+        self._point_head(STRIP_CENTRE_PAN)
         if not controller._drive.set_inhibited(True):
             raise RuntimeError("Drive was not stopped before a range scan")
         try:
@@ -1243,6 +1259,39 @@ class _HuntBody:
         finally:
             controller._drive.set_inhibited(False)
         self._pan = int(controller._pan_tilt.status()["pan"])
+
+    def sweep_looks(self, pans: Sequence[int]) -> dict[int, Look]:
+        """Cat detection on the pictures the last stop's sweep took nearest
+        each of `pans`, while the car has not moved since (the head pans
+        there anyway for the sonar, so looking again would only cost time)."""
+        controller = self._controller
+        strip = controller._sweep_strip
+        if strip is None or not strip.pictures or any(math.isnan(value) for value in strip.odometry):
+            return {}
+        moved = relative(strip.odometry, controller._drive.odometry())
+        if math.hypot(moved[0], moved[1]) > SWEEP_STRIP_MAX_MOVE_CM or abs(moved[2]) > SWEEP_STRIP_MAX_TURN_DEG:
+            return {}
+        looks: dict[int, Look] = {}
+        for wanted in pans:
+            pan = min(strip.pictures, key=lambda taken: abs(taken - wanted))
+            frames = strip.pictures[pan]
+            if abs(pan - wanted) > SWEEP_STRIP_SNAP_DEG or not frames:
+                continue
+            frame = cv2.imdecode(np.frombuffer(frames[0], dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                continue
+            try:
+                detections = controller._detector.detect(frame) if controller._detector is not None else []
+            except Exception:
+                logger.exception("Detection failed on a sweep picture during the hunt")
+                continue
+            look = cat_view_from(detections, pan, frame.shape[1], frame.shape[0])
+            if look.cat is not None:
+                controller._publish_hunt_frame(frame, detections, self.status)
+            looks[wanted] = look
+        # Used once: the next look-around after this must look for itself.
+        controller._sweep_strip = None
+        return looks
 
     def pose(self) -> Pose:
         controller = self._controller
@@ -1763,6 +1812,21 @@ class MappingController:
         status["localized"] = self.localized()
         return status
 
+    def _match_to_grid(self, scan: list[dict[str, object]], prior_pose: Pose, prior_covariance: np.ndarray):
+        """The sweep fitted to the coverage map near the predicted pose,
+        searching as far as the prediction is uncertain (None without a map)."""
+        position_sigma, heading_sigma = pose_sigma(prior_covariance)
+        reach_cm = min(GRID_MATCH_MAX_REACH_CM, max(GRID_MATCH_MIN_REACH_CM, 2.0 * position_sigma))
+        reach_deg = min(GRID_MATCH_MAX_REACH_DEG, max(GRID_MATCH_MIN_REACH_DEG, 2.0 * heading_sigma))
+        with self._map_lock:
+            if int(self._grid.occupied().sum()) < LOCALIZED_MIN_OCCUPIED_CELLS:
+                return None
+            try:
+                return self._grid.match_scan(scan, prior_pose, reach_cm, reach_deg)
+            except Exception:  # a failed match must never stop the stop
+                logger.warning("Matching the sweep to the coverage map failed", exc_info=True)
+                return None
+
     def localized(self) -> dict[str, object]:
         """Whether the car believes it knows roughly where it is and which way
         it faces on the map, and why (not)."""
@@ -1772,12 +1836,13 @@ class MappingController:
             last_odometry = self._last_odometry
         with self._map_lock:
             walls = len(self._surface_map.walls())
+            mapped = walls >= LOCALIZED_MIN_WALLS or int(self._grid.occupied().sum()) >= LOCALIZED_MIN_OCCUPIED_CELLS
         moved = turned = 0.0
         if last_odometry is not None:
             change = relative(last_odometry, self._drive.odometry())
             moved, turned = math.hypot(change[0], change[1]), abs(wrap_degrees(change[2]))
         reasons = []
-        if walls < LOCALIZED_MIN_WALLS:
+        if not mapped:
             reasons.append("no map to match against yet")
         elif since is None:
             reasons.append("has not matched itself to the map yet")
@@ -2568,7 +2633,7 @@ class MappingController:
         # A strip of pictures across the head's range, taken on the way past
         # during the sweep: a turn while exploring may reuse it, and the
         # dashboard shows it as a panorama.
-        strip_pans = self._sweep_strip_pans(original_pan) if mode in ("explore", "survey") else []
+        strip_pans = self._sweep_strip_pans() if mode in ("explore", "survey", "hunt") else []
         scan, side_views = self._sweep(original_tilt, original_pan, side_pans, strip_pans)
         if self._sweep_strip is not None:
             # The car stands still for a stop, so the odometry read for it holds.
@@ -2622,6 +2687,17 @@ class MappingController:
             echoes = [echo for run in extract_echoes(mapping_scan, self._surface_map.beam_width_deg) for echo in run]
             registration = register_scan(echoes, prior_pose, prior_covariance, self._surface_map)
         pose, covariance = registration.pose, registration.covariance
+        grid_match = None
+        if not registration.accepted:
+            # Walls too few or too cluttered to line up: fit the whole sweep
+            # to the coverage map instead (furniture and corners count too).
+            grid_match = self._match_to_grid(mapping_scan, prior_pose, prior_covariance)
+            if grid_match is not None and grid_match.good:
+                pose = grid_match.pose
+                covariance = np.diag(
+                    [GRID_MATCH_SIGMA_CM**2, GRID_MATCH_SIGMA_CM**2, math.radians(GRID_MATCH_HEADING_SIGMA_DEG) ** 2]
+                )
+        fixed = registration.accepted or (grid_match is not None and grid_match.good)
         position_sigma, heading_sigma = pose_sigma(covariance)
         scale = self._learned_odometry_scale(raw_odometry, previous_pose, pose, covariance, prediction, registration.accepted)
 
@@ -2648,6 +2724,7 @@ class MappingController:
             "side_views": sorted(key[0] for key in side_views),
             "predicted_pose": [round(value, 2) for value in prior_pose],
             "registration": registration.summary(),
+            "grid_match": None if grid_match is None else grid_match.summary(),
             "pose_sigma": [round(position_sigma, 2), round(heading_sigma, 2)],
             "surfaces_before": {"walls": counts[0], "features": counts[1]},
             "exposure": exposure,
@@ -2658,7 +2735,7 @@ class MappingController:
             joining, self._joining_run = self._joining_run, False
         edge = None
         if previous_node is not None:
-            sigma = self._edge_sigma(prediction, registration.accepted)
+            sigma = self._edge_sigma(prediction, fixed)
             if joining:
                 sigma = (
                     max(sigma[0], CONTINUE_POSITION_SIGMA_CM),
@@ -2722,7 +2799,7 @@ class MappingController:
         captured_at = datetime.now(timezone.utc).isoformat()
         with self._lock:
             self._pose, self._pose_covariance = pose, covariance
-            if registration.accepted or event is not None:
+            if fixed or event is not None:
                 self._stops_since_fix = 0
             elif self._stops_since_fix is not None:
                 self._stops_since_fix += 1
@@ -2739,6 +2816,7 @@ class MappingController:
                 "visual_rejected": prediction.visual_rejected,
                 "side_views": bool(side_views),
                 "registration": registration.summary(),
+                "grid_match": None if grid_match is None else grid_match.summary(),
                 "place": event.summary() if event is not None else None,
                 "views_matched": update.views,
                 "graph_adjusted_cm": round(update.moved_cm, 1),
@@ -2852,13 +2930,14 @@ class MappingController:
             self._sweep_strip = SweepStrip(strip, original_pan, tilt, (math.nan, math.nan, math.nan))
         return scan, views
 
-    def _sweep_strip_pans(self, centre_pan: int) -> list[int]:
-        """Pans for turn-strip pictures during a sweep: the strip's every 10
-        degrees both sides, moved to the sweep's nearest step."""
+    def _sweep_strip_pans(self) -> list[int]:
+        """Pans for strip pictures during a sweep: every 10 degrees out to 60
+        each side of straight ahead (wherever the head happened to point),
+        moved to the sweep's nearest step."""
         stops = set(SCAN_ANGLES) | {SCAN_LEAD_IN_PAN} if self._range_sensor.status()["enabled"] else set()
         pans = set()
         for offset in range(-AUTO_STRIP_REACH_DEGREES, AUTO_STRIP_REACH_DEGREES + 1, AUTO_STRIP_STEP_DEGREES):
-            wanted = centre_pan + offset
+            wanted = STRIP_CENTRE_PAN + offset
             if not PAN_LIMITS[0] <= wanted <= PAN_LIMITS[1]:
                 continue
             nearest = min(stops, key=lambda pan: abs(pan - wanted), default=wanted)

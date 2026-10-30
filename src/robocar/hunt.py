@@ -137,6 +137,8 @@ class HuntBody(Protocol):
 
     def observe(self) -> None: ...  # a full stop: sweep, localize, update the map
 
+    def sweep_looks(self, pans: Sequence[int]) -> dict[int, Look]: ...  # looks from the last stop's sweep pictures
+
     def pose(self) -> Pose: ...  # best estimate on the map, now
 
     def odometry(self) -> Pose: ...
@@ -536,9 +538,12 @@ class HuntEngine:
             self.belief = CatBelief(self.body.grid(), self.body.landmarks(), self.memory)
         return not self.body.stopped()
 
-    def _look(self, pan: int) -> Look:
-        self.head = pan
-        look = self.body.look(pan)
+    def _look(self, pan: int, look: Look | None = None) -> Look:
+        """Look toward `pan`: a picture taken now, or `look` from one taken
+        a moment ago (the head is then left where it is)."""
+        if look is None:
+            self.head = pan
+            look = self.body.look(pan)
         self.stats["looks"] += 1
         if look.cat is not None:
             self._see(look.cat)
@@ -642,9 +647,11 @@ class HuntEngine:
         assert self.belief is not None
         pose = self.body.pose()
         pans = LOOK_PANS if self.rng.random() < 0.5 else tuple(reversed(LOOK_PANS))
-        for pan in pans:
+        # Right after a stop, its sweep has already pictured these directions.
+        swept = self.body.sweep_looks(pans)
+        for pan in sorted(pans, key=lambda pan: pan not in swept):
             self._check(not self.body.stopped())
-            look = self._look(pan)
+            look = self._look(pan, swept.get(pan))
             if look.cat is not None:
                 return self._found()
             self.belief.looked(pose[:2], pose[2] + pan_bearing(pan))

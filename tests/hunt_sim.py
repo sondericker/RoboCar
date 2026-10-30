@@ -97,6 +97,8 @@ class SimHuntBody:
         self.observations = 0
         self.looks = 0
         self.stop_at = math.inf
+        self._swept_at = None
+        self.sweep_looks_used = 0
 
     # -- time -----------------------------------------------------------------
     def now(self) -> float:
@@ -133,6 +135,9 @@ class SimHuntBody:
         self.pan = pan
         self.looks += 1
         self._spend(0.25)
+        return self._view(pan)
+
+    def _view(self, pan: int) -> Look:
         camera = sonar_origin(self.truth)
         heading = self.truth[2] + pan_bearing(pan)
         offset = np.array([self.cat.x, self.cat.y]) - camera
@@ -173,6 +178,15 @@ class SimHuntBody:
         self.observations += 1
         self._spend(10.0)
         self._grid.integrate(self.floor.scan(self.truth), self.truth, SONAR_BEAM_WIDTH_DEGREES)
+        self._swept_at = (self.truth, self.t)
+
+    def sweep_looks(self, pans) -> dict:
+        """What the sweep's pictures showed, while the car stands where it took them."""
+        swept, self._swept_at = self._swept_at, None
+        if swept is None or swept[0] != self.truth:
+            return {}
+        self.sweep_looks_used += 1
+        return {pan: self._view(pan) for pan in pans}
 
     def pose(self):
         return self.truth
