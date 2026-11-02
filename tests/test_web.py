@@ -91,7 +91,7 @@ class WebTests(unittest.TestCase):
             "mode": "simulation",
             "fault": None,
             "pan": 90,
-            "tilt": 100,
+            "tilt": 90,
         })
         response = self.client.post("/api/pan-tilt", json={"pan": 45, "tilt": 125})
         self.assertEqual(response.status_code, 200)
@@ -140,6 +140,16 @@ class WebTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 409)
         self.assertIn("hardware mode", response.get_json()["error"])
+        # Spin & roam asks the same; an unknown way of exploring is refused.
+        spin = self.client.post("/api/mapping/explore", json={"enabled": True, "attended": True, "strategy": "spin"})
+        self.assertEqual(spin.status_code, 409)
+        self.assertIn("hardware mode", spin.get_json()["error"])
+        odd = self.client.post("/api/mapping/explore", json={"enabled": True, "attended": True, "strategy": "zoom"})
+        self.assertEqual(odd.status_code, 409)
+        self.assertIn("strategy", odd.get_json()["error"])
+        self.assertEqual(
+            self.client.post("/api/mapping/explore", json={"enabled": True, "attended": True, "strategy": 3}).status_code, 400
+        )
 
     def test_mapping_database_reset_requires_confirmation_and_clears_history(self):
         mapping = self.app.extensions["robocar_mapping"]

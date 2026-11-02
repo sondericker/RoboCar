@@ -10,7 +10,8 @@ from unittest.mock import patch
 from camera_scene import RoomScene
 from robocar.drive import DriveController, PanTiltController, SimulatedDriver, SimulatedPanTilt
 from robocar.localization import RegistrationResult, compose, relative
-from robocar.mapping import MappingController, MappingStore
+from robocar.mapping import MappingController
+from robocar.store import MappingStore
 from robocar.places import (
     GraphEdge,
     PlaceRecognizer,

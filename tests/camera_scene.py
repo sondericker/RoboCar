@@ -5,7 +5,7 @@ import math
 import cv2
 import numpy as np
 
-from robocar.mapping import CAMERA_HORIZONTAL_FOV_DEGREES
+from robocar.places import CAMERA_HORIZONTAL_FOV_DEGREES
 
 PIXELS_PER_DEGREE = 10
 WIDTH, HEIGHT = 640, 480

@@ -26,6 +26,8 @@
     .mapping-layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1rem; margin-top: 1rem; }
     .map-view { width: 100%; min-height: 540px; border: 1px solid #334955; border-radius: 8px; background: #101820; }
     #explore-toggle { background: #526b31; }
+    #spin-toggle { background: #2f5f73; }
+    #spin-toggle:hover { background: #3b7690; }
     #explore-toggle:hover { background: #68863d; }
     #reset-mapping { background: #8f3a3e; min-height: 40px; margin-bottom: .75rem; }
     #reset-mapping:hover { background: #b23b42; }
@@ -125,8 +127,8 @@
         <output id="pan-value">90°</output>
       </label>
       <label class="axis-control">Tilt
-        <input id="tilt" type="range" min="30" max="150" value="100">
-        <output id="tilt-value">100°</output>
+        <input id="tilt" type="range" min="30" max="150" value="90">
+        <output id="tilt-value">90°</output>
       </label>
       <button id="center-head" class="center-button" type="button">Center head</button>
     </section>
@@ -164,6 +166,8 @@
     <section class="mapping-section">
       <h2>Mapping &amp; exploration</h2>
       <button id="mapping-toggle" type="button" aria-pressed="false">Start mapping &amp; auto explore</button>
+      <button id="spin-toggle" type="button" aria-pressed="false"
+        title="Turn a full circle sweeping, drive to the open place with the most unmapped floor around it, and spin again">Spin &amp; roam explore</button>
       <button id="calibrate-motion" type="button">Calibrate turns &amp; steps</button>
       <button id="reset-mapping" type="button">Reset mapping database</button>
       <p class="status"><span class="where" data-known="false" title="Whether the car believes it knows where it is on the map">
@@ -208,6 +212,7 @@
     const cameraImage = document.getElementById("camera-feed");
     const cameraPaused = document.getElementById("camera-paused");
     const mappingToggle = document.getElementById("mapping-toggle");
+    const spinToggle = document.getElementById("spin-toggle");
     const resetMappingButton = document.getElementById("reset-mapping");
     const mapCanvas = document.getElementById("map-view");
     const mapContext = mapCanvas.getContext("2d");
@@ -317,7 +322,7 @@
     }
     document.getElementById("center-head").addEventListener("click", () => {
       panInput.value = "90";
-      tiltInput.value = "100";
+      tiltInput.value = "90";
       setHeadPosition();
     });
     function prepareMapCanvas() {
@@ -405,6 +410,15 @@
         const topLeft = toScreen([x0, y1]), bottomRight = toScreen([x1, y0]);
         mapContext.imageSmoothingEnabled = false;
         mapContext.drawImage(coverageImage, topLeft.x, topLeft.y, bottomRight.x - topLeft.x, bottomRight.y - topLeft.y);
+      }
+      // Where spin & roam turned full circles.
+      mapContext.strokeStyle = "rgba(120, 190, 230, .8)";
+      mapContext.lineWidth = 1.5;
+      for (const station of map.stations || []) {
+        const point = toScreen(station);
+        mapContext.beginPath(); mapContext.arc(point.x, point.y, 9, 0, Math.PI * 1.6); mapContext.stroke();
+        mapContext.beginPath(); mapContext.moveTo(point.x + 9, point.y - 3); mapContext.lineTo(point.x + 9, point.y + 3);
+        mapContext.lineTo(point.x + 5, point.y); mapContext.closePath(); mapContext.stroke();
       }
       if (map.frontier_target) {
         const target = toScreen(map.frontier_target);
@@ -558,6 +572,7 @@
         (map.cloud_points ? "White dots = lidar points, " : "Dots = raw sonar echoes, ") +
         "solid = confirmed, dashed = seen once, purple = recognized places, " +
         "teal = swept free space, gold = unexplored edges, crosshair = where it is heading, " +
+        ((map.stations || []).length ? "blue circling arrows = where it spun round, " : "") +
         "violet = objects and rooms the camera recognized.";
     }
     function drawScan(observation) {
@@ -675,9 +690,14 @@
         `${mapping.places.places} remembered places${recognized}`;
     }
     function updateMappingControls(mapping) {
-      mappingToggle.textContent = mapping.enabled
+      const spinning = mapping.enabled && mapping.mode === "explore" && mapping.strategy === "spin";
+      mappingToggle.textContent = mapping.enabled && !spinning
         ? (mapping.mode === "hunt" ? "Stop the hunt" : "Stop mapping & auto explore") : "Start mapping & auto explore";
-      mappingToggle.setAttribute("aria-pressed", String(mapping.enabled));
+      mappingToggle.setAttribute("aria-pressed", String(mapping.enabled && !spinning));
+      mappingToggle.disabled = spinning;
+      spinToggle.textContent = spinning ? "Stop spin & roam" : "Spin & roam explore";
+      spinToggle.setAttribute("aria-pressed", String(spinning));
+      spinToggle.disabled = mapping.enabled && !spinning;
       const calibrating = mapping.enabled && mapping.mode === "calibrate";
       document.getElementById("calibrate-motion").dataset.running = String(calibrating);
       document.getElementById("calibrate-motion").textContent = calibrating ? "Stop calibration" : "Calibrate turns & steps";
@@ -692,24 +712,29 @@
             : mapping.state === "capturing" || mapping.state === "scanning"
             ? "Stopped; capturing camera and range sweep…"
             : mapping.mode === "explore"
-              ? `Auto explore: ${mapping.state}${mapping.plan ? ` (${mapping.plan})` : ""} · ${mapping.move_count} moves · ${localizationSummary(mapping)}`
+              ? `${spinning ? `Spin & roam (station ${mapping.spin?.stations || 1})` : "Auto explore"}: ${mapping.state}` +
+                `${mapping.plan ? ` (${mapping.plan})` : ""} · ${mapping.move_count} moves · ${localizationSummary(mapping)}`
               : "Survey active · drive manually, then stop to record a checkpoint.")
           : mapping.state === "calibrated" ? "Calibration finished and saved."
           : mapping.state === "calibration_failed" ? `Calibration measured nothing usable: ${mapping.plan || ""}`
-          : mapping.state === "explored" ? "Auto explore finished: no unexplored edges left within reach."
+          : mapping.state === "explored" ? (mapping.strategy === "spin"
+            ? `Spin & roam finished after ${mapping.spin?.stations || 0} station(s): nowhere left a full turn would show much new.`
+            : "Auto explore finished: no unexplored edges left within reach.")
           : mapping.state === "blocked" ? "Auto explore stopped: no safe path visible in the forward scan."
-            : mapping.state === "time_limit" ? "Auto explore stopped at its 4-minute limit."
-              : mapping.state === "move_limit" ? "Auto explore stopped after 60 moves."
+            : mapping.state === "time_limit" ? (mapping.strategy === "spin"
+              ? "Spin & roam stopped at its 15-minute limit." : "Auto explore stopped at its 4-minute limit.")
+              : mapping.state === "move_limit" ? (mapping.strategy === "spin"
+                ? "Spin & roam stopped after 200 moves." : "Auto explore stopped after 60 moves.")
                 : "Mapping is off.";
     }
-    mappingToggle.addEventListener("click", async () => {
-      const enabled = mappingToggle.getAttribute("aria-pressed") !== "true";
-      mappingToggle.disabled = true;
+    async function toggleExplore(button, strategy) {
+      const enabled = button.getAttribute("aria-pressed") !== "true";
+      button.disabled = true;
       try {
         const response = await fetch("/api/mapping/explore", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({enabled, attended: true})
+          body: JSON.stringify({enabled, attended: true, strategy})
         });
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
@@ -717,9 +742,11 @@
       } catch (error) {
         document.getElementById("mapping-status").textContent = `Mapping control error: ${error.message}`;
       } finally {
-        mappingToggle.disabled = false;
+        button.disabled = false;
       }
-    });
+    }
+    mappingToggle.addEventListener("click", () => toggleExplore(mappingToggle, "frontier"));
+    spinToggle.addEventListener("click", () => toggleExplore(spinToggle, "spin"));
     const calibrateButton = document.getElementById("calibrate-motion");
     calibrateButton.addEventListener("click", async () => {
       const running = calibrateButton.dataset.running === "true";

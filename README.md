@@ -187,7 +187,7 @@ waits without sending frames. Press **Start camera processing** to resume.
 Pan/tilt sliders are also on the dashboard. Pan 30° looks to the car's left
 and 150° to its right (the Freenove servo turns clockwise as the angle
 rises). The head starts at pan 90° and
-tilt 100°, and **Center head** returns it there. The initial software travel
+tilt 90° (level, so the lidar shoots flat), and **Center head** returns it there. The initial software travel
 is limited to 30°–150° to avoid the servo end stops; calibrate the safe range
 on the actual camera head before widening it.
 
@@ -363,7 +363,27 @@ and the operator confirms the room is clear and attended. The car scans while
 stopped, moves in short bursts, then stops and scans again. Autonomous motion
 uses full normalized motor output and the default 4095/4095 motor duty cap.
 
-After each sweep it decides where to go by **what it could learn there**:
+**Spin & roam explore** is the other way to explore, and suits the lidar:
+- **Spin:** where it stands, it sweeps, turns a quarter, sweeps again, and so
+  on round the full circle (four sweeps, each 60° either side, so each
+  overlaps the last by 30° and can be fitted to it). A quarter the map
+  already knows is skipped, and it never turns where it is too tight to.
+- **Roam:** it then picks the next place to spin: reachable floor that is
+  open enough to turn on the spot (32 cm clear of walls, and of unknown floor
+  by a car's width), not within 80 cm of where it has spun already, and
+  worth the most new floor a full turn there would show, for the driving it
+  takes. It drives there along the map's route in legs of up to 60 cm, a
+  ping ahead before each one (and a sweep ahead every 1.2 m to stay placed).
+  A place it cannot reach is given up, and it never spins twice in the same
+  spot.
+- **Done:** it stops by itself when nowhere left would show much new, or
+  after 15 minutes or 200 moves.
+
+In the simulated two-room house it mapped 97–98% of both rooms and the
+corridor from each of three starting points with no bumps, in 22–26 sweeps at
+7–9 places. The map marks each place it spun with blue circling arrows.
+
+After each sweep, auto explore decides where to go by **what it could learn there**:
 
 - **Coverage map:** every sweep marks the space the sound crossed as free and
   the places it echoed as walls, in a 5 cm grid shared with earlier runs. The
@@ -644,6 +664,26 @@ application with:
 This stops RoboCar now but leaves automatic startup enabled. To stop it and
 prevent it from starting at the next boot, run `sudo systemctl disable --now
 robocar`.
+
+## Code layout
+
+All under `src/robocar/`:
+- `web.py`, `__main__.py`, `config.py`: the dashboard server and its settings.
+- `drive.py`, `range_sensor.py`, `camera.py`, `power.py`, `detector.py`: the
+  hardware (motors and pan/tilt head, sonar and lidar, cameras, battery, the
+  AI HAT+).
+- `mapping.py`: the controller that runs mapping, exploring, the hunt and
+  calibration, and keeps the map. It builds on:
+  - `ranging.py` (sonar and lidar together, sweep pacing),
+  - `pictures.py` (judging pictures, turns between views),
+  - `explore_plan.py` (the frontier explorer's next move),
+  - `exploration.py` (coverage grid, routes, spin stations, scan matching),
+  - `surfaces.py`, `localization.py`, `places.py`, `semantics.py` (walls,
+    poses, recognized places, recognized objects),
+  - `store.py` (the database) and `pointcloud.py` (lidar points to draw).
+- `hunt.py` (the hunt and play engine), `watch.py` (the hunt camera's
+  watcher), `calibration.py`, and `bodies.py` (the real car as those engines
+  see it; the tests use simulations instead).
 
 ## Kit review
 

@@ -2,7 +2,7 @@
 
 **Eyes always open.** The camera feed is watched continuously (see
 robocar.watch): every frame is checked for the cat. While seeking, the
-moment a cat appears whatever the car is doing (a turn, a drive, a sonar
+moment a cat appears whatever the car is doing (a turn, a drive, a range
 sweep) stops, and it goes after the cat.
 
 **Seeking.** A belief map says where the cat might be. It covers the floor
@@ -13,8 +13,8 @@ belief over that view (walls block the view), and the belief slowly
 drifts back toward its prior, because cats move. The next vantage point is
 the one that could show the most belief per centimetre of travel. The car
 drives there without stopping, steering along the map's route with the
-sonar watching ahead, glances across the room with the head on arrival,
-and moves on. It stops for a full sonar sweep only when it no longer knows
+range sensors watching ahead, glances across the room with the head on arrival,
+and moves on. It stops for a full sweep only when it no longer knows
 where it is on the map, and not more often than every couple of minutes.
 
 **Approaching.** The car steers straight at the cat while it watches it,
@@ -42,7 +42,7 @@ before going back to bothering the cat. The scores, the camera's distance
 calibration and the cat's favourite spots are kept between hunts.
 
 **Safety.** The car never closes to less than MIN_CAT_DISTANCE_CM.
-Forward moves are limited by the sonar and the map, sideways moves by a
+Forward moves are limited by the range ahead and the map, sideways moves by a
 glance to that side first, and reversing by space the map shows clear
 (and never far). Nothing drives toward a person close ahead. A session
 ends at its time limit, on a critically low battery, or on Stop.
@@ -62,14 +62,15 @@ from typing import Callable, Mapping, Protocol, Sequence
 
 import numpy as np
 
+from robocar.drive import pan_bearing
 from robocar.exploration import CONFIRMED_ABOVE, CoverageGrid
-from robocar.localization import Pose, compose, relative
+from robocar.localization import Pose
 from robocar.semantics import CAMERA_HFOV_DEG
 
 logger = logging.getLogger(__name__)
 
 CAT_LABELS = frozenset({"cat"})
-# Distances, in cm from the sonar, kept from the cat.
+# Distances, in cm from the range sensors on the head, kept from the cat.
 MIN_CAT_DISTANCE_CM = 30.0
 PLAY_NEAR_CM = 50.0
 PLAY_FAR_CM = 110.0
@@ -78,7 +79,7 @@ PLAY_TARGET_CM = 75.0
 # 43 high (4.71 mm of sensor height), in the 4:3 frames detection uses.
 CAMERA_VFOV_DEG = 42.9
 # Distance from a cat's box height: distance = scale / box height (pixels).
-# A sitting cat is about 25 cm tall; the scale is learned from the sonar.
+# A sitting cat is about 25 cm tall; the scale is learned from measured ranges.
 DEFAULT_SIZE_SCALE = 25.0 * 240.0 / math.tan(math.radians(CAMERA_VFOV_DEG / 2))
 SCALE_LIMITS = (0.5, 2.0)
 SCALE_SAMPLES = 9
@@ -130,14 +131,14 @@ PERSON_BLOCK_TURNED_DEG = 40.0
 # and since then the car not turned further than this; otherwise it looks again.
 FRONT_LOOK_SECONDS = 6.0
 FRONT_LOOK_TURNED_DEG = 25.0
-SIDE_MARGIN_CM = 20.0  # sideways clearance kept, from the sonar on the head
+SIDE_MARGIN_CM = 20.0  # sideways clearance kept, from the range sensors on the head
 BACK_LIMIT_CM = 25.0
 MOVE_SECONDS_PER_CM = 1 / 60.0
 REWARD_LEARNING_RATE = 0.25
 NOVELTY_MEMORY = 6
 SESSION_SECONDS = 20 * 60.0
 # Driving near the cat needs a sighting this fresh, with the cat within this
-# angle of ahead: the camera and sonar cannot see beside or behind the car.
+# angle of ahead: the camera and range sensors cannot see beside or behind the car.
 FRESH_SECONDS = 1.5
 CAT_AHEAD_DEG = 60.0
 # ...unless the cat is known to be further than this (and seen this recently):
@@ -181,7 +182,7 @@ MOUSE_DART_WAIT_SECONDS = (0.7, 2.0)
 MOUSE_WINDOW_SECONDS = 0.5
 MOUSE_MOVED_CM = 12.0
 MOUSE_FLEE_SPEED_CM_S = 40.0
-# A full sonar sweep (to find its place on the map again) at most this often.
+# A full sweep (to find its place on the map again) at most this often.
 RELOCALIZE_SECONDS = 120.0
 # With the camera fixed facing ahead, looking around is a spin on the spot,
 # watching all the way round.
@@ -276,10 +277,6 @@ class HuntBody(Protocol):
     def report(self, status: dict[str, object]) -> None: ...
 
 
-def pan_bearing(pan: float) -> float:
-    return 90.0 - pan
-
-
 def pixel_bearing(column: float, width: int) -> float:
     focal = (width / 2) / math.tan(math.radians(CAMERA_HFOV_DEG / 2))
     return -math.degrees(math.atan((column - width / 2) / focal))
@@ -311,7 +308,7 @@ class HuntMemory:
 
     move_scores: dict[str, list[float]] = field(default_factory=dict)  # name: [mean reward, count]
     size_scale: float = DEFAULT_SIZE_SCALE
-    # Recent box-height x sonar products; the scale is their median.
+    # Recent box-height x measured-range products; the scale is their median.
     scale_samples: list[float] = field(default_factory=list)
     cat_spots: list[list[float]] = field(default_factory=list)  # [x, y, weight]
     hunts: int = 0
@@ -326,11 +323,11 @@ class HuntMemory:
         rate = max(REWARD_LEARNING_RATE, 1.0 / (count + 1))
         self.move_scores[move] = [round(mean + rate * (value - mean), 4), count + 1]
 
-    def calibrate(self, box_height: float, sonar_cm: float) -> None:
-        """Learn the box-size distance scale from a sonar range to the cat:
+    def calibrate(self, box_height: float, range_cm: float) -> None:
+        """Learn the box-size distance scale from a measured range to the cat:
         the median of recent measurements, so a stray reading (the beam
         catching a wall first) cannot drag it about."""
-        measured = box_height * sonar_cm
+        measured = box_height * range_cm
         if not SCALE_LIMITS[0] * DEFAULT_SIZE_SCALE <= measured <= SCALE_LIMITS[1] * DEFAULT_SIZE_SCALE:
             return
         self.scale_samples = (self.scale_samples + [measured])[-SCALE_SAMPLES:]
@@ -851,7 +848,7 @@ class HuntEngine:
         self._spotted()
 
     def _unstick(self) -> None:
-        """Hemmed in: glance about with the sonar, turn to the clearest way
+        """Hemmed in: glance about with the range sensors, turn to the clearest way
         (clear on the map too) and move out a little."""
         best = None
         pose = self.body.pose()
@@ -941,7 +938,7 @@ class HuntEngine:
 
     def _cruise_to(self, goal: tuple[float, float], stop_for_cat: bool = True, standoff: float = SEEK_STANDOFF_CM) -> str:
         """Drive to a point without stopping, steering along the map's route
-        with the sonar watching ahead and the camera looking. Returns
+        with the range sensors watching ahead and the camera looking. Returns
         "arrived", "cat" (seen on the way), "blocked", "person" or "stuck"."""
         assert self.belief is not None or not stop_for_cat
         grid = self.body.grid()
@@ -1094,7 +1091,7 @@ class HuntEngine:
     # -- safety -------------------------------------------------------------
 
     def _forward_room(self) -> float:
-        """How far forward is safe: the sonar ahead, the map, and the cat."""
+        """How far forward is safe: the range ahead, the map, and the cat."""
         ahead = self.body.ping(90)
         room = self.body.grid().clear_run(self.body.pose(), SEEK_LEG_CM)
         if ahead is not None:

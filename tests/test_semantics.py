@@ -8,7 +8,9 @@ import numpy as np
 
 from robocar.drive import DriveController, PanTiltController, SimulatedDriver, SimulatedPanTilt
 from robocar.exploration import CoverageGrid
-from robocar.mapping import MappingController, MappingStore, plan_explore_step
+from robocar.explore_plan import plan_explore_step
+from robocar.mapping import MappingController
+from robocar.store import MappingStore
 from robocar.range_sensor import RangeSensorController
 from robocar.semantics import (
     CAMERA_HFOV_DEG,
@@ -20,7 +22,7 @@ from robocar.semantics import (
     sightings_from,
     static_scan,
 )
-from robocar.surfaces import direction, sonar_origin
+from robocar.surfaces import sonar_origin
 from sonar_room import SonarRoom
 
 

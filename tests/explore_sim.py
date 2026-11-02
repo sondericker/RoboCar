@@ -12,7 +12,7 @@ import math
 import numpy as np
 
 from robocar.exploration import CoverageGrid
-from robocar.mapping import AUTO_WALL_STANDOFF_CM, plan_explore_step
+from robocar.explore_plan import AUTO_WALL_STANDOFF_CM, plan_explore_step
 from robocar.surfaces import SONAR_BEAM_WIDTH_DEGREES, direction
 from sonar_room import SonarRoom
 

@@ -19,16 +19,11 @@ from sonar_room import SonarRoom
 from robocar.drive import DriveController, PanTiltController, SimulatedDriver, SimulatedPanTilt
 from robocar.exploration import CoverageGrid, ExplorationLearner
 from robocar.hunt import MIN_CAT_DISTANCE_CM, HuntEngine, HuntMemory, _cat_motion, move_mouse
-from robocar.mapping import (
-    LIDAR_SCAN_ANGLES,
-    MappingController,
-    MappingStore,
-    PointCloud,
-    direction_clearances,
-    forward_clearance,
-    lidar_points,
-    plan_explore_step,
-)
+from robocar.explore_plan import direction_clearances, forward_clearance, plan_explore_step
+from robocar.mapping import MappingController
+from robocar.pointcloud import PointCloud, lidar_points
+from robocar.ranging import LIDAR_SCAN_ANGLES
+from robocar.store import MappingStore
 from robocar.range_sensor import RangeSensorController, TFLunaRangeSensor, lidar_distance
 from robocar.semantics import sightings_from
 from robocar.surfaces import LIDAR, SONAR, SurfaceMap, extract_echoes, scan_model
@@ -273,9 +268,9 @@ class MappingTests(unittest.TestCase):
 
     def test_safety_takes_the_nearer_sensor_and_measuring_takes_the_lidar(self):
         self.pan_tilt.set_angles(90, 100)
-        self.assertEqual(self.mapping._range_now(precise=True), 190.0)
-        self.assertEqual(self.mapping._range_now(), 150.0)  # the sonar sees something nearer
-        self.assertTrue(self.mapping._ranging_enabled())
+        self.assertEqual(self.mapping._ranging.now(precise=True), 190.0)
+        self.assertEqual(self.mapping._ranging.now(), 150.0)  # the sonar sees something nearer
+        self.assertTrue(self.mapping._ranging.enabled())
 
     def test_the_map_keeps_the_lidar_points(self):
         scan = corridor_scan({0: 100.0, 10: 120.0})

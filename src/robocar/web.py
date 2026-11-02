@@ -12,12 +12,15 @@ from robocar.drive import (
     DriveInhibitedError,
     FreenoveDriver,
     FreenovePanTilt,
+    PAN_LIMITS,
+    TILT_LIMITS,
     PanTiltInhibitedError,
     PanTiltController,
     SimulatedDriver,
     SimulatedPanTilt,
 )
-from robocar.mapping import MappingController, MappingStore
+from robocar.mapping import MappingController
+from robocar.store import MappingStore
 from robocar.power import BoardADC, PiPower, PowerMonitor, board_version
 from robocar.range_sensor import FreenoveRangeSensor, RangeSensorController, TFLunaRangeSensor
 
@@ -212,11 +215,14 @@ def create_app(config: Config | None = None) -> Flask:
             return jsonify({"error": "enabled must be a boolean"}), 400
         if payload["enabled"] and not isinstance(payload.get("attended"), bool):
             return jsonify({"error": "attended must be a boolean"}), 400
+        strategy = payload.get("strategy", "frontier")
+        if not isinstance(strategy, str):
+            return jsonify({"error": "strategy must be a string"}), 400
         if payload["enabled"] and (reason := battery_too_low()):
             return jsonify({"error": reason}), 409
         try:
             if payload["enabled"]:
-                mapping.start_autonomous(payload["attended"])
+                mapping.start_autonomous(payload["attended"], strategy)
             else:
                 mapping.stop()
         except (RuntimeError, ValueError) as exc:
@@ -405,8 +411,8 @@ def create_app(config: Config | None = None) -> Flask:
             or not isinstance(pan, int)
             or isinstance(tilt, bool)
             or not isinstance(tilt, int)
-            or not 30 <= pan <= 150
-            or not 30 <= tilt <= 150
+            or not PAN_LIMITS[0] <= pan <= PAN_LIMITS[1]
+            or not TILT_LIMITS[0] <= tilt <= TILT_LIMITS[1]
         ):
             return jsonify({"error": "pan and tilt must be integers from 30 to 150"}), 400
         try:

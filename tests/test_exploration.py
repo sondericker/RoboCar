@@ -235,7 +235,7 @@ class FloorPlanTests(unittest.TestCase):
 
     def explores_both_rooms(self, start, sweeps: int) -> None:
         learner = ExplorationLearner()
-        from robocar.mapping import plan_explore_step
+        from robocar.explore_plan import plan_explore_step
 
         floor, grid, history, bumps = explore(
             sweeps, plan=lambda *args: plan_explore_step(*args, learner=learner), start=start

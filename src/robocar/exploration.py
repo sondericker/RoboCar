@@ -102,6 +102,17 @@ GAIN_HALF_VIEW_DEGREES = 72.0
 # Frontiers that could show less than this many cells (0.05 m2) are slivers
 # and blind spots, not worth a trip.
 GAIN_MIN_CELLS = 20.0
+# Spin-and-roam exploring: stations on a lattice this fine, open enough to
+# turn on the spot (the car is 16 cm in radius), at most this far by path,
+# not this close to a station already used, worth a full turn only if it
+# would show this many unknown cells. A spin (four sweeps, three turns)
+# costs about as much time as driving SPIN_OVERHEAD_CM.
+SPIN_LATTICE_CM = 20.0
+SPIN_CLEARANCE_CM = 32.0
+SPIN_MAX_PATH_CM = 600.0
+SPIN_AWAY_CM = 80.0
+SPIN_MIN_GAIN_CELLS = 60.0
+SPIN_OVERHEAD_CM = 200.0
 # A frontier this much could reveal counts as open space.
 OPEN_GAIN_CELLS = 300.0
 # Walls on both sides closer together than this make a doorway or corridor.
@@ -227,6 +238,16 @@ class Corridor:
     axis_deg: float  # heading along the corridor (either way along it)
     centre_offset_cm: float  # how far the centre line is to the left (+) of the car
     width_cm: float
+
+
+@dataclass(frozen=True)
+class SpinStation:
+    """A place to turn a full circle and sweep: where, how far to drive
+    there (cm of path), and how many unknown cells it should show."""
+
+    target: tuple[float, float]
+    path_cm: float
+    gain: float
 
 
 @dataclass(frozen=True)
@@ -709,6 +730,15 @@ class CoverageGrid:
         step = math.radians(GAIN_RAY_STEP_DEGREES)
         half = math.radians(GAIN_HALF_VIEW_DEGREES)
         angles = math.radians(heading_deg) + np.arange(-half, half + 1e-9, step)
+        return self._view_gain(point, angles, unknown, blocked)
+
+    def spin_gain(self, point: Sequence[float], unknown: np.ndarray, blocked: np.ndarray) -> float:
+        """Unknown cells a full turn on the spot at `point` would see."""
+        angles = np.arange(0.0, 2 * math.pi, math.radians(GAIN_RAY_STEP_DEGREES))
+        return self._view_gain(point, angles, unknown, blocked)
+
+    def _view_gain(self, point: Sequence[float], angles: np.ndarray, unknown: np.ndarray, blocked: np.ndarray) -> float:
+        step = math.radians(GAIN_RAY_STEP_DEGREES)
         steps = np.arange(self.cell, self.view_range_cm, self.cell)
         xs = point[0] + np.outer(-np.sin(angles), steps)
         ys = point[1] + np.outer(np.cos(angles), steps)
@@ -1219,6 +1249,77 @@ class CoverageGrid:
         offset = np.array(point) - here
         bearing = math.degrees(math.atan2(-offset[0], offset[1]))
         return (bearing - float(pose[2]) + 180.0) % 360.0 - 180.0, float(np.hypot(*offset))
+
+    def clear_all_round(self, pose: Sequence[float], radius_cm: float) -> bool:
+        """Whether the map has no confirmed obstacle within `radius_cm` of the
+        car's centre (it may turn on the spot). Unknown floor counts as clear:
+        the car has stood or driven there, or a sweep will see it first."""
+        if not self.log_odds.size:
+            return True
+        row, column = self.cell_of(pose[:2])
+        reach = int(math.ceil(radius_cm / self.cell))
+        rows = slice(max(row - reach, 0), max(row + reach + 1, 0))
+        columns = slice(max(column - reach, 0), max(column + reach + 1, 0))
+        window = self.log_odds[rows, columns] > CONFIRMED_ABOVE
+        if not window.any():
+            return True
+        cells = np.argwhere(window)
+        centres = np.column_stack(
+            [
+                self.origin[0] + (cells[:, 1] + columns.start + 0.5) * self.cell,
+                self.origin[1] + (cells[:, 0] + rows.start + 0.5) * self.cell,
+            ]
+        )
+        return bool((np.hypot(centres[:, 0] - pose[0], centres[:, 1] - pose[1]) > radius_cm).all())
+
+    def spin_station(
+        self,
+        pose: Sequence[float],
+        avoid: Sequence[Sequence[float]] = (),
+        min_gain_cells: float = SPIN_MIN_GAIN_CELLS,
+    ) -> "SpinStation | None":
+        """The best place to drive to and turn a full circle, sweeping.
+
+        Candidates are reachable floor, on a coarse lattice, open enough to
+        turn on the spot (clear of walls by SPIN_CLEARANCE_CM and of unknown
+        floor by a car's radius), and not within SPIN_AWAY_CM of `avoid`
+        (places already spun at, or that could not be reached). Each is worth
+        the unknown floor a full turn there would show, per centimetre of
+        driving plus SPIN_OVERHEAD_CM for the turning and sweeping. None when
+        nowhere would show at least `min_gain_cells`."""
+        if not self.log_odds.size:
+            return None
+        distance, _, _ = self.path_lengths(pose)
+        occupied, unknown = self.occupied(), self.unknown()
+        wall_clearance = cv2.distanceTransform((~occupied).astype(np.uint8), cv2.DIST_L2, 5) * self.cell
+        unknown_clearance = cv2.distanceTransform((~unknown).astype(np.uint8), cv2.DIST_L2, 5) * self.cell
+        spacing = max(1, int(round(SPIN_LATTICE_CM / self.cell)))
+        lattice = np.zeros(distance.shape, dtype=bool)
+        lattice[::spacing, ::spacing] = True
+        candidates = (
+            lattice
+            & np.isfinite(distance)
+            & (distance <= SPIN_MAX_PATH_CM)
+            & self.free()
+            & (wall_clearance >= SPIN_CLEARANCE_CM)
+            & (unknown_clearance >= ROBOT_RADIUS_CM + 5.0)
+        )
+        worth_seeing, blocked = self.worth_seeing(), self._blocked()
+        best: SpinStation | None = None
+        best_score = -math.inf
+        for row, column in np.argwhere(candidates):
+            point = self.centre_of((int(row), int(column)))
+            if any(math.hypot(point[0] - other[0], point[1] - other[1]) < SPIN_AWAY_CM for other in avoid):
+                continue
+            gain = self.spin_gain(point, worth_seeing, blocked)
+            if gain < min_gain_cells:
+                continue
+            path = float(distance[row, column])
+            score = gain / (path + SPIN_OVERHEAD_CM)
+            if score > best_score:
+                best_score = score
+                best = SpinStation(point, path, gain)
+        return best
 
     def to_image(self) -> np.ndarray:
         """Free dark teal, occupied light, unknown transparent (BGRA, north up)."""

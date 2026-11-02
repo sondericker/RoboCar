@@ -11,9 +11,21 @@ logger = logging.getLogger(__name__)
 MOTOR_RAMP_SECONDS = 0.25
 MOTOR_UPDATE_INTERVAL_SECONDS = 0.01
 # Head position at start-up and for "Center head": pan straight ahead, tilt
-# slightly raised.
+# level, so the lidar on the head shoots flat across the room.
 DEFAULT_PAN = 90
-DEFAULT_TILT = 100
+DEFAULT_TILT = 90
+# Software travel, kept clear of the servos' end stops.
+PAN_LIMITS = (30, 150)
+TILT_LIMITS = (30, 150)
+
+
+def pan_bearing(pan: float) -> float:
+    """Direction a pan angle looks, counterclockwise from straight ahead.
+
+    The Freenove pan servo turns the head clockwise as its angle rises: pan 30
+    looks left and 150 looks right (checked on the car, and how Freenove's own
+    avoidance code reads it)."""
+    return 90.0 - pan
 FULL_MOTOR_DUTY = 4095
 # Wheel odometry calibration. The forward speed is the earlier estimate of
 # 30.48 cm per 0.25 s at full duty; the deadband, strafe and turn rates are
@@ -159,10 +171,10 @@ class PanTiltController:
         *,
         override: bool = False,
     ) -> tuple[int, int]:
-        if isinstance(pan, bool) or not isinstance(pan, int) or not 30 <= pan <= 150:
-            raise ValueError("pan must be an integer between 30 and 150")
-        if isinstance(tilt, bool) or not isinstance(tilt, int) or not 30 <= tilt <= 150:
-            raise ValueError("tilt must be an integer between 30 and 150")
+        if isinstance(pan, bool) or not isinstance(pan, int) or not PAN_LIMITS[0] <= pan <= PAN_LIMITS[1]:
+            raise ValueError(f"pan must be an integer between {PAN_LIMITS[0]} and {PAN_LIMITS[1]}")
+        if isinstance(tilt, bool) or not isinstance(tilt, int) or not TILT_LIMITS[0] <= tilt <= TILT_LIMITS[1]:
+            raise ValueError(f"tilt must be an integer between {TILT_LIMITS[0]} and {TILT_LIMITS[1]}")
         with self._lock:
             if self._fault:
                 raise PanTiltInhibitedError(f"Pan/tilt unavailable: {self._fault}")

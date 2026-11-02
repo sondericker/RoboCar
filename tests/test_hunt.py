@@ -21,7 +21,8 @@ from robocar.hunt import (
     load_memory,
     save_memory,
 )
-from robocar.mapping import MappingController, MappingStore
+from robocar.mapping import MappingController
+from robocar.store import MappingStore
 from robocar.range_sensor import RangeSensorController
 from robocar.web import create_app
 
@@ -242,10 +243,10 @@ class ControllerTests(unittest.TestCase):
             self.controller(detector=None).start_hunt(True)
 
     def test_moves_become_mecanum_commands(self):
-        from robocar.mapping import _HuntBody
+        from robocar.bodies import CarHuntBody
 
         mapping = self.controller()
-        body = _HuntBody(mapping)
+        body = CarHuntBody(mapping)
         calls = []
         with patch.object(mapping, "_move_burst", side_effect=lambda *a, **k: calls.append((a, k)) or True):
             body.move(20.0, 0.0)
@@ -311,9 +312,9 @@ class HuntBodyTests(unittest.TestCase):
             self.addCleanup(resource.close)
 
     def body(self):
-        from robocar.mapping import _HuntBody
+        from robocar.bodies import CarHuntBody
 
-        body = _HuntBody(self.mapping)
+        body = CarHuntBody(self.mapping)
         body.start()
         self.addCleanup(body.close)
         return body
@@ -403,9 +404,9 @@ class HuntBodyTests(unittest.TestCase):
         )
         for resource in (pan_tilt, drive, mapping):
             self.addCleanup(resource.close)
-        from robocar.mapping import _HuntBody
+        from robocar.bodies import CarHuntBody
 
-        body = _HuntBody(mapping)
+        body = CarHuntBody(mapping)
         body.start()
         self.addCleanup(body.close)
         self.assertFalse(body.camera_pans())  # the forward camera does not turn with the head

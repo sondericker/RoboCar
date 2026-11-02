@@ -1,4 +1,3 @@
-import json
 from dataclasses import replace
 import math
 import tempfile
@@ -20,22 +19,18 @@ from robocar.drive import (
     SimulatedDriver,
     SimulatedPanTilt,
 )
-from robocar.mapping import (
-    CAMERA_HORIZONTAL_FOV_DEGREES,
+from robocar.explore_plan import (
     AUTO_LOOK_AROUND_TURNS,
     AUTO_MAX_TURN_PER_STOP_DEGREES,
-    AUTO_STEP_CM,
-    SCAN_ANGLES,
-    CameraMotionEstimate,
-    assess_picture,
-    MappingController,
-    MappingStore,
     direction_clearances,
-    plan_explore_step,
-    estimate_camera_yaw_change,
     forward_clearance,
-    fuse_pose,
+    plan_explore_step,
 )
+from robocar.mapping import AUTO_STEP_CM, MappingController, fuse_pose
+from robocar.pictures import CameraMotionEstimate, assess_picture, estimate_camera_yaw_change
+from robocar.places import CAMERA_HORIZONTAL_FOV_DEGREES
+from robocar.ranging import SCAN_ANGLES
+from robocar.store import MappingStore
 from robocar.exploration import CoverageGrid, Frontier, Waypoint
 from robocar.localization import RegistrationResult, compose, relative, wrap_degrees
 from robocar.vision_debug import render_matches

@@ -237,7 +237,7 @@ sonar room):
 ## Exploring
 
 Code: `src/robocar/exploration.py`; the planner is `plan_explore_step` in
-`mapping.py`; the benchmark floor plan is `tests/explore_sim.py`.
+`explore_plan.py`; the benchmark floor plan is `tests/explore_sim.py`.
 
 - **Coverage grid.** A 5 cm log-odds grid built from every sweep (joined
   sessions too, at their optimized poses). Each reading clears space along
@@ -350,7 +350,7 @@ second try. A step simulation using the real car's dead zone hit 5, 10 and
 turn. The code had pan 150° looking left, but on the car it looks right. Every
 strip picture was therefore mirrored, and the pictures disagreed with each
 other by twice their angle. Sweeps were mirrored relative to the car's turns
-as well. `pan_bearing()` in `mapping.py` now does the conversion in one place.
+as well. `pan_bearing()` in `drive.py` now does the conversion in one place.
 
 ## Sensor findings from the real car
 
@@ -393,15 +393,17 @@ transfers to the real car:
 | `FORWARD_CM_PER_SECOND_AT_FULL_DUTY` | drive.py | Run **Calibrate turns & steps**; it measures the real ratio. |
 | `TURN_DEGREES_PER_SECOND_AT_FULL_DUTY` | drive.py | Run **Calibrate turns & steps**; it measures per size and direction. |
 | `STRAFE_CM_PER_SECOND_AT_FULL_DUTY`, `MOTOR_DEADBAND_FRACTION` | drive.py | Strafe 1 s; lowest duty that moves the car. |
-| `CAMERA_HORIZONTAL_FOV_DEGREES` | mapping.py | IMX477 lens field of view. |
+| `HEAD_CAMERA_HFOV_DEG`, `CAMERA_HFOV_DEG` | semantics.py | Field of view of the head camera (OV5647, 53.5°) and the forward HQ camera (IMX477 with its 6 mm lens, 55.3°). |
+| `LIDAR_BEAM_WIDTH_DEGREES`, `LIDAR_MAX_RANGE_CM` | surfaces.py | TF-Luna beam (2°) and the furthest reading put on the map (500 cm). |
+| `CORRIDOR_HALF_WIDTH_CM` | explore_plan.py | Half the car's width plus a margin, for clear-way checks from lidar points. |
 
 Also check the sign convention once: put a box on the car's left and confirm
 the dashboard draws it on the left.
 
 ## Known limits and next steps
 
-- A sweep takes about 11–12 s, so even the four-minute explore limit fits
-  roughly 15–20 stops.
+- A sonar sweep takes about 11–12 s, so even the four-minute explore limit fits
+  roughly 15–20 stops (a lidar sweep about 7 s).
 - An opening narrower than the beam's footprint at that range (about 0.44 ×
   range for a 25° beam) can't be seen through from that spot. Every reading
   hits a jamb, and it looks like a wall until sweeps from elsewhere carve it
