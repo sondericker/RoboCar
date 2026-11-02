@@ -31,14 +31,14 @@ import cv2
 import numpy as np
 
 from robocar.localization import Pose, compose, register_scan, relative, wrap_degrees
-from robocar.semantics import CAMERA_HFOV_DEG, Sighting, static_scan
+from robocar.semantics import HEAD_CAMERA_HFOV_DEG, Sighting, static_scan
 from robocar.surfaces import SurfaceMap, extract_echoes, pose_rotation
 
 logger = logging.getLogger(__name__)
 
 # The OV5647's field of view in the mode RoboCar uses; one figure for all
 # the camera geometry (semantics.py explains it).
-CAMERA_HORIZONTAL_FOV_DEGREES = CAMERA_HFOV_DEG
+CAMERA_HORIZONTAL_FOV_DEGREES = HEAD_CAMERA_HFOV_DEG
 KEYFRAME_DETECT_FEATURES = 1000
 KEYFRAME_KEEP_FEATURES = 400
 KEYFRAME_MIN_FEATURES = 40
@@ -110,8 +110,8 @@ def detect_features(jpeg: bytes, features: int) -> tuple[list, np.ndarray | None
     return list(keypoints), descriptors, image.shape
 
 
-def camera_matrix(width: int, height: int) -> np.ndarray:
-    focal = width / (2 * math.tan(math.radians(CAMERA_HORIZONTAL_FOV_DEGREES) / 2))
+def camera_matrix(width: int, height: int, hfov_deg: float = CAMERA_HORIZONTAL_FOV_DEGREES) -> np.ndarray:
+    focal = width / (2 * math.tan(math.radians(hfov_deg) / 2))
     return np.array([[focal, 0, width / 2], [0, focal, height / 2], [0, 0, 1]], dtype=np.float64)
 
 
@@ -124,9 +124,13 @@ class Keyframe:
     height: int
     points: np.ndarray
     descriptors: np.ndarray
+    # How wide the camera that took it sees (the head camera unless told).
+    hfov_deg: float = CAMERA_HORIZONTAL_FOV_DEGREES
 
 
-def make_keyframe(observation_id: int, run_id: str, jpeg: bytes, pan_offset_deg: float) -> Keyframe | None:
+def make_keyframe(
+    observation_id: int, run_id: str, jpeg: bytes, pan_offset_deg: float, hfov_deg: float = CAMERA_HORIZONTAL_FOV_DEGREES
+) -> Keyframe | None:
     """Detect ORB features in a stop's forward picture and keep the strongest."""
     detected = detect_features(jpeg, KEYFRAME_DETECT_FEATURES)
     if detected is None:
@@ -136,7 +140,7 @@ def make_keyframe(observation_id: int, run_id: str, jpeg: bytes, pan_offset_deg:
         return None
     strongest = np.argsort([-keypoint.response for keypoint in keypoints])[:KEYFRAME_KEEP_FEATURES]
     points = np.float32([keypoints[index].pt for index in strongest])
-    return Keyframe(observation_id, run_id, pan_offset_deg, width, height, points, descriptors[strongest])
+    return Keyframe(observation_id, run_id, pan_offset_deg, width, height, points, descriptors[strongest], hfov_deg)
 
 
 @dataclass(frozen=True)
@@ -183,13 +187,15 @@ def verify_place(remembered: Keyframe, query: Keyframe) -> PlaceMatch | None:
     """Match two keyframes and fit a camera motion between them."""
     if (remembered.width, remembered.height) != (query.width, query.height):
         return None
+    if abs(remembered.hfov_deg - query.hfov_deg) > 1.0:
+        return None  # pictures from different cameras
     pairs = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(remembered.descriptors, query.descriptors, k=2)
     good = [pair[0] for pair in pairs if len(pair) == 2 and pair[0].distance < VERIFY_RATIO * pair[1].distance]
     if len(good) < VERIFY_MIN_INLIERS:
         return None
     first = np.float32([remembered.points[match.queryIdx] for match in good])
     second = np.float32([query.points[match.trainIdx] for match in good])
-    intrinsics = camera_matrix(query.width, query.height)
+    intrinsics = camera_matrix(query.width, query.height, query.hfov_deg)
 
     homography, homography_mask = cv2.findHomography(first, second, cv2.RANSAC, 3.0)
     homography_inliers = int(homography_mask.sum()) if homography_mask is not None else 0
@@ -278,6 +284,130 @@ class PlaceRecognizer:
         if rows:
             chunks.append((np.vstack(rows), np.concatenate(owners)))
         self._chunks = chunks
+
+
+# Placing the car from its live camera picture alone (no sweep): the
+# remembered places considered lie within this of where it thinks it is.
+CAMERA_FIX_RADIUS_CM = 200.0
+# Matches must agree on the heading within this to count, and at least this
+# many must agree: one match alone can come out confidently wrong.
+CAMERA_FIX_HEADING_SPREAD_DEG = 6.0
+CAMERA_FIX_MIN_AGREEING = 2
+# Directions toward the car from two places must cross at least this
+# steeply, and meet within this distance, to give a position.
+CAMERA_FIX_MIN_CROSSING_DEG = 20.0
+CAMERA_FIX_MAX_RANGE_CM = 300.0
+
+
+@dataclass(frozen=True)
+class CameraFix:
+    """Where the car is, from matching its live picture to remembered places."""
+
+    heading_deg: float
+    position: tuple[float, float]
+    places: tuple[int, ...]
+    inliers: int
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "heading_deg": round(self.heading_deg, 1),
+            "position": [round(value, 1) for value in self.position],
+            "places": list(self.places),
+            "inliers": self.inliers,
+        }
+
+
+def locate_from_places(
+    query: Keyframe,
+    recognizer: "PlaceRecognizer",
+    poses: Mapping[int, Pose],
+    predicted: Pose,
+    radius_cm: float = CAMERA_FIX_RADIUS_CM,
+    verify: Callable[[Keyframe, Keyframe], "PlaceMatch | None"] = verify_place,
+) -> CameraFix | None:
+    """Position and heading of the camera that took `query`, from remembered
+    places near `predicted` whose poses are known; None unless two or more
+    places agree.
+
+    Each verified match says how the car is turned relative to that place
+    (so its heading) and in which direction from the place it stands; the
+    distance along that direction is unknown, so a position needs two places
+    whose directions cross. Only the largest group of matches agreeing on the
+    heading counts (a match now and then comes out confidently wrong), and a
+    fix needs directions crossing steeply: two places looking at the same
+    wall from about the same way can agree on a wrong heading (by 10 to 15
+    degrees in tests), while places seeing the car from different sides
+    pinned it within 10 cm and 3 degrees."""
+
+    def allowed(candidate: Keyframe) -> bool:
+        place = poses.get(candidate.observation_id)
+        return place is not None and math.hypot(place[0] - predicted[0], place[1] - predicted[1]) <= radius_cm
+
+    found = []
+    for candidate, _ in recognizer.candidates(query, allowed, VIEW_VERIFY_LIMIT):
+        match = verify(candidate, query)
+        if match is not None:
+            found.append((poses[candidate.observation_id], match))
+    if len(found) < CAMERA_FIX_MIN_AGREEING:
+        return None
+    headings = [place[2] + match.yaw_deg for place, match in found]
+    # The largest (by inliers) group agreeing on the heading.
+    best: list[int] = []
+    for centre in headings:
+        group = [index for index, heading in enumerate(headings) if abs(wrap_degrees(heading - centre)) <= CAMERA_FIX_HEADING_SPREAD_DEG]
+        if sum(found[index][1].inliers for index in group) > sum(found[index][1].inliers for index in best):
+            best = group
+    if len(best) < CAMERA_FIX_MIN_AGREEING:
+        return None
+    found = [found[index] for index in best]
+    weights = np.array([match.inliers for _, match in found], dtype=float)
+    radians = np.radians([place[2] + match.yaw_deg for place, match in found])
+    mean = math.degrees(math.atan2(float((weights * np.sin(radians)).sum()), float((weights * np.cos(radians)).sum())))
+    # Position: where the directions from the places toward the car meet.
+    rays = [
+        (np.array(place[:2], dtype=float), math.radians(place[2] + match.bearing_deg), float(match.inliers))
+        for place, match in found
+        if match.bearing_deg is not None
+    ]
+    position = _cross_rays(rays)
+    if position is None:
+        return None
+    return CameraFix(
+        wrap_degrees(mean),
+        position,
+        tuple(match.keyframe_id for _, match in found),
+        int(weights.sum()),
+    )
+
+
+def _cross_rays(rays: Sequence[tuple[np.ndarray, float, float]]) -> tuple[float, float] | None:
+    """Least-squares meeting point of rays (origin, direction counterclockwise
+    from +y, weight), when at least two cross steeply ahead of their origins."""
+    if len(rays) < 2:
+        return None
+    directions = [np.array([-math.sin(angle), math.cos(angle)]) for _, angle, _ in rays]
+    steep = any(
+        CAMERA_FIX_MIN_CROSSING_DEG <= abs(wrap_degrees(math.degrees(rays[i][1] - rays[j][1]))) <= 180.0 - CAMERA_FIX_MIN_CROSSING_DEG
+        for i in range(len(rays))
+        for j in range(i + 1, len(rays))
+    )
+    if not steep:
+        return None
+    normal_sum = np.zeros((2, 2))
+    target = np.zeros(2)
+    for (origin, _, weight), direction in zip(rays, directions):
+        across = np.eye(2) - np.outer(direction, direction)  # distance off the ray's line
+        normal_sum += weight * across
+        target += weight * across @ origin
+    try:
+        point = np.linalg.solve(normal_sum, target)
+    except np.linalg.LinAlgError:
+        return None
+    for (origin, _, _), direction in zip(rays, directions):
+        along = float((point - origin) @ direction)
+        if along <= 0 or along > CAMERA_FIX_MAX_RANGE_CM:
+            return None
+    return float(point[0]), float(point[1])
 
 
 @dataclass

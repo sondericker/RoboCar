@@ -1,4 +1,8 @@
-"""Surface reconstruction from swept ultrasonic ranges.
+"""Surface reconstruction from swept ranges: the ultrasonic, or the lidar.
+
+A lidar sweep (items marked "sensor": "lidar") needs none of the beam
+corrections below: its 2 degree beam puts each reading on its centre line,
+so every reading is a point on a surface (see _lidar_echoes).
 
 Coordinates follow the robot's motor and servo conventions: a robot frame has
 +y forward and +x to the right, world headings and sweep angles are degrees
@@ -59,6 +63,38 @@ FEATURE_RADIUS_CM = 8.0
 CORNER_JOIN_CM = 25.0
 CORNER_EXTEND_CM = 45.0
 CARVE_INCIDENCE_DEGREES = 30.0
+# The TF-Luna lidar: a 2 degree beam. Under 20 cm it reads unreliably; it
+# measures to 8 m, but past 5 m a degree of heading error moves a point
+# further than the map's cells, so longer readings only clear space.
+LIDAR_BEAM_WIDTH_DEGREES = 2.0
+LIDAR_MIN_RANGE_CM = 20.0
+LIDAR_MAX_RANGE_CM = 500.0
+# A reading between two neighbours much nearer and much farther is the beam
+# straddling an edge (a "mixed pixel"), not a surface: it is dropped.
+LIDAR_MIXED_JUMP_CM = 15.0
+
+
+@dataclass(frozen=True)
+class RangeModel:
+    """What a range sensor's readings mean."""
+
+    name: str
+    beam_width_deg: float
+    min_cm: float
+    max_cm: float
+
+
+SONAR = RangeModel("sonar", SONAR_BEAM_WIDTH_DEGREES, SONAR_MIN_RANGE_CM, SONAR_MAX_RANGE_CM)
+LIDAR = RangeModel("lidar", LIDAR_BEAM_WIDTH_DEGREES, LIDAR_MIN_RANGE_CM, LIDAR_MAX_RANGE_CM)
+
+
+def scan_model(scan: Sequence[Mapping[str, object]]) -> RangeModel:
+    """The sensor a sweep was taken with (sonar unless marked otherwise)."""
+    return LIDAR if any(item.get("sensor") == "lidar" for item in scan) else SONAR
+
+
+def item_max_range(item: Mapping[str, object]) -> float:
+    return LIDAR_MAX_RANGE_CM if item.get("sensor") == "lidar" else SONAR_MAX_RANGE_CM
 
 
 @dataclass(frozen=True)
@@ -96,11 +132,11 @@ def sonar_origin(pose: Sequence[float]) -> np.ndarray:
     return to_world(pose, np.array([0.0, SONAR_FORWARD_OFFSET_CM]))[0]
 
 
-def _valid_range(distance: object) -> float | None:
+def _valid_range(distance: object, model: RangeModel = SONAR) -> float | None:
     if isinstance(distance, bool) or not isinstance(distance, (int, float)):
         return None
     value = float(distance)
-    if not math.isfinite(value) or value < SONAR_MIN_RANGE_CM:
+    if not math.isfinite(value) or value < model.min_cm:
         return None
     return value
 
@@ -167,11 +203,12 @@ def split_runs(scan: Sequence[Mapping[str, object]]) -> list[list[tuple[float, f
     """Group a sweep into angularly adjacent readings with continuous range."""
     angles = sorted(float(item["angle_deg"]) for item in scan)
     step = _sweep_step(angles)
+    model = scan_model(scan)
     readings = sorted(
         (float(item["angle_deg"]), value)
         for item in scan
-        if (value := _valid_range(item.get("distance_cm"))) is not None
-        and value <= SONAR_MAX_RANGE_CM
+        if (value := _valid_range(item.get("distance_cm"), model)) is not None
+        and value <= model.max_cm
     )
     runs: list[list[tuple[float, float]]] = []
     for angle, range_cm in readings:
@@ -209,6 +246,8 @@ def extract_echoes(
     beam_width_deg: float = SONAR_BEAM_WIDTH_DEGREES,
 ) -> list[list[Echo]]:
     """Return beam-corrected echoes, one list per continuous run of the sweep."""
+    if scan_model(scan) is LIDAR:
+        return _lidar_echoes(scan)
     half_beam = beam_width_deg / 2
     sweep = sorted(
         (float(item["angle_deg"]), _valid_range(item.get("distance_cm"))) for item in scan
@@ -329,6 +368,55 @@ def extract_echoes(
     return echo_runs
 
 
+def _lidar_echoes(scan: Sequence[Mapping[str, object]]) -> list[list[Echo]]:
+    """A lidar sweep's echoes: each trusted reading where its beam's centre
+    line says, one list per continuous run. Runs of two or more readings lie
+    on surfaces ("plane"); a lone reading nearer than both neighbours is a
+    thin thing such as a chair leg ("point"). Mixed readings across an edge
+    are dropped."""
+    sweep = sorted(
+        (float(item["angle_deg"]), _valid_range(item.get("distance_cm"), LIDAR)) for item in scan
+    )
+    step_deg = _sweep_step([angle for angle, _ in sweep])
+    step = math.radians(step_deg)
+    kept: list[tuple[float, float]] = []
+    for index, (angle, range_cm) in enumerate(sweep):
+        if range_cm is None or range_cm > LIDAR_MAX_RANGE_CM:
+            continue
+        before = sweep[index - 1][1] if index > 0 else None
+        after = sweep[index + 1][1] if index + 1 < len(sweep) else None
+        if before is not None and after is not None:
+            low, high = min(before, after), max(before, after)
+            if low + LIDAR_MIXED_JUMP_CM < range_cm < high - LIDAR_MIXED_JUMP_CM:
+                continue
+        kept.append((angle, range_cm))
+    runs: list[list[tuple[float, float]]] = []
+    for angle, range_cm in kept:
+        if runs:
+            previous_angle, previous_range = runs[-1][-1]
+            if angle - previous_angle <= step_deg * 1.5 and abs(range_cm - previous_range) <= _jump_tolerance(
+                range_cm, previous_range
+            ):
+                runs[-1].append((angle, range_cm))
+                continue
+        runs.append([(angle, range_cm)])
+    echo_runs = []
+    for run in runs:
+        kind = "plane" if len(run) > 1 else "point"
+        echo_runs.append(
+            [_lidar_echo(angle, range_cm, kind, range_cm * step * (1.0 if kind == "plane" else 0.5)) for angle, range_cm in run]
+        )
+    return echo_runs
+
+
+def _lidar_echo(angle: float, range_cm: float, kind: str, footprint_cm: float) -> Echo:
+    # About 2 cm of range noise (more far out), and the beam's half-width
+    # (plus servo play) across it.
+    sigma = math.hypot(2.0 + 0.01 * range_cm, range_cm * math.radians(LIDAR_BEAM_WIDTH_DEGREES / 2 + 0.5))
+    x, y = np.array([0.0, SONAR_FORWARD_OFFSET_CM]) + range_cm * direction(angle)
+    return Echo(angle, angle, range_cm, float(x), float(y), kind, sigma, footprint_cm)
+
+
 def estimate_beam_widths(scan: Sequence[Mapping[str, object]]) -> list[float]:
     """Measure the beam width from runs that look like one flat wall.
 
@@ -338,6 +426,8 @@ def estimate_beam_widths(scan: Sequence[Mapping[str, object]]) -> list[float]:
     (corners, clutter) or lack a flat top with rising flanks are skipped.
     """
     widths: list[float] = []
+    if scan_model(scan) is LIDAR:
+        return widths
     halves = np.arange(3.0, 25.01, 0.5)
     for run in split_runs(scan):
         if len(run) < 6:
@@ -616,6 +706,11 @@ class SurfaceMap:
         self._beam_samples: list[float] = []
         self._next_id = 1
 
+    def beam_for(self, scan: Sequence[Mapping[str, object]]) -> float:
+        """The beam width to read a sweep with: the lidar's, or the sonar's
+        as this map has measured it."""
+        return LIDAR.beam_width_deg if scan_model(scan) is LIDAR else self.beam_width_deg
+
     def walls(self, confirmed_only: bool = False) -> list[Surface]:
         return [
             surface
@@ -647,7 +742,7 @@ class SurfaceMap:
         retired = self._carve(scan, pose, origin)
         self._remember_free_rays(scan, pose, origin)
 
-        echo_runs = extract_echoes(scan, self.beam_width_deg)
+        echo_runs = extract_echoes(scan, self.beam_for(scan))
         heading_sigma = math.radians(heading_sigma_deg)
         candidates: list[tuple[np.ndarray, np.ndarray, np.ndarray, float]] = []
         singles: list[tuple[np.ndarray, float, float, float]] = []
@@ -777,12 +872,13 @@ class SurfaceMap:
 
     def _remember_free_rays(self, scan: Sequence[Mapping[str, object]], pose: Sequence[float], origin: np.ndarray) -> None:
         rays = []
+        model = scan_model(scan)
         for item in scan:
-            range_cm = _valid_range(item.get("distance_cm"))
+            range_cm = _valid_range(item.get("distance_cm"), model)
             if range_cm is None:
                 continue
             ray = direction(float(pose[2]) + float(item["angle_deg"]))
-            clear = min(range_cm, SONAR_MAX_RANGE_CM) - (5.0 + 0.03 * range_cm)
+            clear = min(range_cm, model.max_cm) - (5.0 + 0.03 * range_cm)
             if clear > 0:
                 rays.append((origin[0], origin[1], ray[0], ray[1], clear))
         if rays:
@@ -814,13 +910,15 @@ class SurfaceMap:
             return 0
         missed: set[int] = set()
         point_hits: dict[int, set[int]] = {}
-        core = math.tan(math.radians(self.beam_width_deg / 4))
+        model = scan_model(scan)
+        # A lidar beam is narrow enough that all of it is core.
+        core = math.tan(math.radians(model.beam_width_deg / 2 if model is LIDAR else self.beam_width_deg / 4))
         incidence_limit = math.cos(math.radians(CARVE_INCIDENCE_DEGREES))
         for item in scan:
-            range_cm = _valid_range(item.get("distance_cm"))
+            range_cm = _valid_range(item.get("distance_cm"), model)
             if range_cm is None:
                 continue
-            range_cm = min(range_cm, SONAR_MAX_RANGE_CM)
+            range_cm = min(range_cm, model.max_cm)
             ray = direction(float(pose[2]) + float(item["angle_deg"]))
             free_until = range_cm - (10.0 + 0.05 * range_cm)
             for surface in self.surfaces.values():

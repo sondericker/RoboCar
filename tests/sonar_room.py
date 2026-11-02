@@ -1,4 +1,4 @@
-"""A small simulated room for exercising sonar surface mapping in tests."""
+"""A small simulated room for exercising sonar and lidar surface mapping in tests."""
 
 import math
 
@@ -72,3 +72,34 @@ class SonarRoom:
             {"angle_deg": angle, "distance_cm": self.distance(pose, angle), "samples": 3, "error": None}
             for angle in angles
         ]
+
+    def lidar_distance(self, pose, angle_deg: float) -> float | None:
+        """The nearest surface on the beam's centre line (a lidar sees walls
+        at any angle; it misses nothing within 8 m)."""
+        origin = sonar_origin(pose)
+        ray = direction(pose[2] + angle_deg)
+        best = None
+        for start, end in self.segments:
+            edge = end - start
+            matrix = np.column_stack([ray, -edge])
+            if abs(np.linalg.det(matrix)) < 1e-9:
+                continue
+            distance, fraction = np.linalg.solve(matrix, start - origin)
+            if distance <= 0 or not 0 <= fraction <= 1:
+                continue
+            best = distance if best is None else min(best, distance)
+        return None if best is None or best > 800 else float(best)
+
+    def lidar_scan(self, pose, angles=range(60, -61, -1), noise_cm: float = 1.5, rng=None) -> list[dict[str, object]]:
+        """A lidar sweep as the car takes one: a reading per degree, with
+        range noise, marked "sensor": "lidar"."""
+        rng = rng or np.random.default_rng(0)
+        readings = []
+        for angle in angles:
+            distance = self.lidar_distance(pose, angle)
+            if distance is not None:
+                distance = round(float(distance + rng.normal(0.0, noise_cm)), 1)
+            readings.append(
+                {"angle_deg": angle, "distance_cm": distance, "samples": 3, "error": None, "sensor": "lidar"}
+            )
+        return readings

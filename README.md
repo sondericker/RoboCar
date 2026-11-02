@@ -69,6 +69,90 @@ ROBOCAR_MODEL_PATH=~/.cache/robocar/yolo11n.onnx
 ROBOCAR_LABELS_PATH=
 ```
 
+**Cameras.** The car has two, and RoboCar finds each by its sensor name:
+- **Forward (hunting):** a Raspberry Pi HQ camera (IMX477) with a 6 mm
+  lens, fixed facing forward on the chassis, in camera port 0. It is the
+  dashboard's live view and the hunt's eyes. RoboCar reads the whole sensor
+  in its fast binned mode (2028x1520, about 54 frames a second), scaled to
+  640x480 for detection: about 55° across and 43° high (`CAMERA_HFOV_DEG` in
+  `semantics.py`; change it with the lens). Open the lens's aperture fully
+  and focus at about 2 m: at detection's resolution that keeps roughly 1 m
+  to infinity sharp.
+- **Head (mapping):** the OV5647 on the pan/tilt head, in camera port 1.
+  Mapping pans it to measure turns, take side views and make the sweep
+  panorama, and turn calibration uses it.
+
+Both are set explicitly in `/boot/firmware/config.txt` (the OV5647 module is
+not found by auto-detection):
+
+```
+camera_auto_detect=0
+dtoverlay=imx477,cam0
+dtoverlay=ov5647,cam1
+```
+
+`ROBOCAR_FORWARD_CAMERA` and `ROBOCAR_HEAD_CAMERA` name the sensors
+(defaults `imx477` and `ov5647`). If only one is connected it does both
+jobs. With only the forward camera, the hunt still works, but mapping takes
+no picture strips or side views, turns go by the wheel counts, and turn
+calibration is unavailable. With neither found by name, `ROBOCAR_CAMERA_INDEX`
+picks the camera and `ROBOCAR_CAMERA_ON_HEAD=true` says it is on the head.
+
+With a fixed forward camera, the hunt looks around by spinning the car on the
+spot, watching all the way round, instead of panning the head.
+
+With both cameras, mapping uses the forward one too:
+- **Places for the hunt:** each stop also keeps a place picture from the
+  forward camera, apart from the head camera's (pictures from different
+  cameras do not match). While hunting, whenever the car stands still a
+  moment, its live picture is matched against them. When two or more places
+  agree on its heading and the directions from them toward the car cross
+  steeply, that fixes its position and heading. The fix is combined with
+  the wheel-based estimate, and dropped if the two disagree too much. It
+  counts as matching the map, so "knows where it is" can stay green without
+  stopping to sweep.
+  - **Accuracy:** in a rendered test room, fixes from three or more places
+    were within 10 cm and 3°. About one in eleven from just two places was
+    off by around 25 cm and 6°, so those count as less sure.
+  - **What is refused:** a single place, or two looking at the same wall
+    from about the same way, can agree on a wrong heading. They give no fix.
+- **Furniture:** the forward camera's stop picture is the one checked for
+  couches, beds and chairs. It is sharper and brighter than the head
+  camera's.
+- **The cat:** the forward camera's feed is watched while mapping too. Where
+  it sees the cat goes into the hunt's memory of its favourite spots.
+
+### Lidar
+
+A Benewake TF-Luna on the pan/tilt head, just above the ultrasonic, gives
+the car precise ranges: a 2° beam, readings 20 cm to 8 m, 100 a second. It
+sits on the Pi's I²C bus 1 at address `0x10`, shared with the motor board,
+with its pin 5 tied to ground (I²C mode). Plug it in or out only with
+everything powered off: a sensor connected live once jammed the whole bus
+(motors and battery readings with it) until a reboot. `ROBOCAR_LIDAR` is
+`auto` (used when it answers, the default), `on` (shown as a fault when
+missing) or `off`. `i2cdetect -y 1` should list `10`, `40` and `48`.
+
+What it changes:
+- **Sweeps:** a reading every degree from 60° left to 60° right (121 in
+  all, each the median of three frames, about 7 s a sweep), against 40
+  smeared sonar readings before. The sonar's reading is kept alongside each.
+- **The map:** each lidar reading is a point on a surface, so walls, chair
+  legs and doorways come out sharp. In the simulated two-room house, lidar
+  sweeps found 95% of the floor in 20 moves (the sonar about half), and a
+  sweep fitted to the map placed the car within about 2 cm and 1° (the
+  sonar about 12 cm and 5°). The dashboard draws the lidar's points, one per
+  2.5 cm.
+- **Safety:** before driving, the nearer of the lidar and the sonar counts.
+  The sonar's wide beam sees glass and thin things beside the line the
+  lidar passes, and the lidar sees dark fabric that soaks up sound. The way
+  ahead must be clear across the car's width, not just on one line.
+- **The cameras:** an object's distance comes from the lidar readings across
+  the middle of its box, not the wall behind it. A "Lidar over the picture"
+  panel draws each stop's readings over the camera's view, so you can see at
+  a glance that they line up.
+- **The hunt:** see below.
+
 Keep the car's wheels off the ground while first testing physical controls.
 The motor adapter is disabled unless `ROBOCAR_HARDWARE_ENABLED=true`. Dashboard
 controls are a convenience, not a safety-rated emergency stop. Do not expose
@@ -108,7 +192,8 @@ is limited to 30°–150° to avoid the servo end stops; calibrate the safe rang
 on the actual camera head before widening it.
 
 When physical hardware is enabled, the dashboard also displays the live
-ultrasonic range in centimeters. The sensor samples in the background and
+lidar range (with its signal strength and temperature) and the ultrasonic
+range in centimeters. The sensor samples in the background and
 reports missing echoes or read errors instead of presenting an old value as
 current. With hardware disabled, the UI identifies the range finder as
 disabled; it does not simulate a distance. The reading is informational and
@@ -128,37 +213,71 @@ like auto explore. The section shows:
 
 The map marks where the cat was last seen and its favourite spots.
 
+- **Eyes always open:** the camera feed is watched continuously, every frame
+  checked for the cat on the AI HAT+ (about 12 ms a frame). While the car is
+  looking for the cat, the moment one appears whatever it is doing stops (a
+  turn, a drive, even a sonar sweep half way through) and it goes after the
+  cat. In simulation it switched to the chase within a quarter of a second
+  of the cat coming into view.
+- **Sharp frames while moving:** the hunt runs the camera's exposure
+  itself. It keeps the brightness up with exposure time and gain, but caps
+  the exposure while the car or head is moving (8 ms to start with, allowing
+  up to 33 ms when still), using gain instead: detection copes with grain
+  far better than with blur. The moving cap adapts. If frames on the move
+  come out clearly softer than still ones it shortens (down to 2 ms), and if
+  they are about as sharp it lengthens again (up to 16 ms) for less noise.
+  Sharpness is judged relative to contrast, and the cap never shortens while
+  the light runs short (gain at its limit): a darker frame also looks
+  softer, and chasing that once spiralled down to black frames. In dim light
+  the cap grows instead. When the hunt ends the camera goes back to
+  auto-exposure.
 - **Seeking:** a belief map says where the cat might be. It covers the floor
   the map knows, weighted toward couches, beds and chairs the camera
   recognized and toward spots where the cat was found before.
-  - **Looking:** every look with the camera lowers it over what that look
-    could see, with walls blocking the view.
+  - **Looking:** everything the camera sees without a cat lowers it over
+    that view, with walls blocking the view.
   - **Cats move:** it drifts back toward the prior as time passes.
   - **Where next:** the car goes where it could see the most of it per
-    centimetre of travel, routed on the map and checked with the sonar.
-  - **On arrival:** with the head facing ahead, a full sweep re-checks the
-    map and its position, taking pictures every 10° from 60° left to 60°
-    right on the way (shown as the panorama). Those pictures are checked for
-    the cat, so the camera only pans again when the car has moved since. It
-    also glances ahead after every leg. Detection runs on the AI HAT+, in
-    about 12 ms a picture.
-- **Sharp pictures:** every hunt picture waits until the car and head have
-  been still a moment, then until two frames in a row match. Its sharpness
-  is then compared with recent pictures. A soft one is retaken after a
-  further wait, and the sharpest is kept. When a retake comes out clearly
-  sharper (motion blur), the settle delay grows, and it shrinks again while
-  first shots keep coming out sharp (between 0.25 and 1.5 s).
-- **Live picture:** between its own looks, the dashboard's picture is
-  refreshed about twice a second whenever the car is still. While it sweeps
-  or drives, the page says how old the picture is.
-- **Approaching:** it turns to the cat, centres the head, measures the
-  distance with the sonar, and closes to about 75 cm.
+    centimetre of travel.
+  - **Getting there:** it drives without stopping, about 35 cm/s, steering
+    along the map's route with the sonar watching ahead (it slows as things
+    get close and stops 45 cm short). It turns in place first when the way
+    is more than 35° off.
+  - **On arrival:** the head glances across the room, a fraction of a second
+    per direction, and the car moves on.
+  - **Sonar sweeps:** only when it no longer knows where it is on the map,
+    and at most every 2 minutes. The camera keeps watching through the
+    sweep, and its pictures make the panorama.
+- **Live picture:** the dashboard shows the feed about six times a second,
+  with the frame rate and exposure underneath.
+- **Approaching:** it steers straight at the cat while watching it, turning
+  in place when the cat is more than 20° off. It slows as it gets close
+  (creeping when its mood is mellow), measures the distance, and stops in
+  play range (about 1 m). If it
+  loses sight of the cat for a moment it holds still and looks; after 2.5 s
+  it searches nearby.
+- **Measuring the cat:** with the lidar, and the camera fixed facing ahead,
+  the head turns the lidar's beam onto the cat wherever it is in view (up to
+  55° either side) and measures it, trying a couple of degrees either side
+  in case the thin beam slipped past its edge. Between measurements each
+  camera frame scales the last one by how much bigger or smaller the cat
+  looks, so the distance stays right frame by frame. The dashboard says
+  whether the distance shown is measured ("lidar") or guessed from the
+  cat's size ("camera"). In simulation the distance was within about 1 cm
+  (median). Without a lidar, the sonar measures the cat once it is straight
+  ahead.
 - **Playing:** nothing is scripted.
-  - **Moves:** each beat picks one of 14 moves, each with fresh random
+  - **Moves:** each beat picks one of 16 moves, each with fresh random
     sizes, speeds and directions: pounce, charge and retreat, zig-zag in or
     out, sidestep, shimmy, wiggle, spin, orbit (circling while facing the
-    cat), stalk, freeze, peekaboo, head-bob, back-off tease and combos of
-    those.
+    cat), stalk, freeze, peekaboo, head-bob, back-off tease, combos of
+    those, and two that react to the cat as they go:
+    - **mouse:** playing prey from the live feed. It darts sideways across
+      the cat's view while the cat holds still, freezes the moment the cat
+      moves, and scoots off (backwards, or sideways if the map shows no room
+      behind) when the cat comes at it.
+    - **lure:** edging away in little pulses while the cat watches (prey
+      that leaves invites a chase), then waiting.
   - **Choosing:** the choice weighs what suits the distance, the car's
     drifting mood (frisky or mellow), what it hasn't done lately, and what
     has made the cat react.
@@ -173,9 +292,11 @@ The map marks where the cat was last seen and its favourite spots.
     again starting near where it was last seen.
 - **Learning:** saved in `hunt.json` beside the map database: how much the
   cat reacts to each move, the camera's distance-from-size scale (learned
-  from the sonar), and where the cat likes to be.
+  from the lidar, or the sonar), and where the cat likes to be.
 - **Safety:**
-  - **Distance:** it never closes to less than 30 cm from the cat.
+  - **Distance:** it never closes to less than 30 cm from the cat. Backing
+    away from a cat just seen in front is always allowed, however close it
+    is.
   - **Seeing the cat:** it moves near the cat only after seeing it just now,
     in front, because the camera and sonar can't see beside or behind the
     car.
@@ -192,8 +313,8 @@ The map marks where the cat was last seen and its favourite spots.
     battery, or on **STOP**.
 
 In a simulated two-room house (`tests/hunt_sim.py`, `tests/test_hunt.py`):
-- **Finding:** the car found the cat in 15 of 15 runs, usually within 30
-  seconds to 2 minutes.
+- **Finding:** the car found the cat in 10 of 10 runs, half of them within
+  4 seconds and all within about a minute and a half.
 - **Playing:** it played for about five minutes per run, resting two or
   three times and using all 14 moves.
 - **Safety:** it never bumped a wall or touched the cat.
@@ -237,7 +358,7 @@ panel and as a small one beside the title, plus the Raspberry Pi's own supply.
 
 **Start mapping survey** records checkpoints while you drive manually.
 **Start attended auto explore** enables bounded autonomous motion only when
-physical hardware and the ultrasonic sensor are enabled, the car is stopped,
+physical hardware and a range sensor (lidar or ultrasonic) are enabled, the car is stopped,
 and the operator confirms the room is clear and attended. The car scans while
 stopped, moves in short bursts, then stops and scans again. Autonomous motion
 uses full normalized motor output and the default 4095/4095 motor duty cap.
@@ -306,9 +427,12 @@ After each sweep it decides where to go by **what it could learn there**:
   - **Matching:** a sweep is matched to the mapped walls. In clutter, where
     walls don't line up, it is fitted to the coverage map instead. Every
     echo should end on a confirmed obstacle somewhere across the 25° beam,
-    and none on floor the map knows is clear. That fit is trusted only when
-    it is a clear winner (in simulation every trusted fit was within 20 cm
-    and 8°). It then fixes the pose to ±12 cm and ±5°.
+    and none on floor the map knows is clear. A fit is trusted only when it
+    is a clear winner that explains at least 70% of the sweep. In three
+    simulated layouts, trusted fits were typically within 4–7 cm and 2–5°,
+    though about one in fifty came out badly twisted. So a fit is combined
+    with the wheel-based estimate (counted as ±12 cm, ±5°) and dropped when
+    the two disagree beyond what both allow.
   - **Limit:** in the workshop, sweeps from almost the same spot agree on
     only about 40% of their ranges, so fits to a thin map are rarely
     trusted. More mapping runs over the same floor firm the map up.
@@ -356,8 +480,11 @@ a row match (the car and head have stopped moving), up to 2 seconds. Each
 stop's picture is checked for brightness, clipping, sharpness and usable
 detail. If it isn't decent, it is retaken: a blurred one at the same exposure
 after a pause, otherwise with adjusted exposure (compensation from −1 to
-+4 EV, then manual exposures up to 50 ms with gain), up to five tries. The best
-picture is kept, and the setting that worked is where the next stop starts.
++4 EV, then manual exposures with gain up to 95 ms at gain 16), up to five
+tries. The best picture is kept, and the setting that worked is where the
+next stop starts. (The head camera's pictures on the 10-31 runs were all at
+the old longest setting, 50 ms at gain 12, and most were still dark: the
+workshop at night needs the longer ones. The car stands still for them.)
 The **What the camera sees** panel shows:
 
 - the latest stop picture with its detected features and exposure;
@@ -366,7 +493,7 @@ The **What the camera sees** panel shows:
 - the latest turn check against its strip picture;
 - the latest recognized place against the stored picture.
 
-**Calibrate turns & steps** (attended) measures how far the car really turns
+**Calibrate turns & steps** (attended; needs the head camera) measures how far the car really turns
 and moves. Face it toward a flat wall about 1–1.5 m away with room to turn.
 It photographs a strip across the pan, then turns 10°, 20° and 30° left and
 right, adjusting each command until the camera says it landed within 2°. Each
@@ -394,9 +521,11 @@ protective devices; the sensor cannot see behind the car or guarantee detection
 of every surface. Test with wheels raised first, then at low speed in a cleared
 area. Keep unauthenticated dashboard access restricted to a trusted network.
 
-At each stop RoboCar sweeps the ultrasonic sensor across 40 directions, 3°
-apart (three pings each, always stepping the same way so servo backlash
-cancels). It turns the sweep into **surfaces**: fine wall segments joined at
+At each stop RoboCar sweeps the head across the room, always stepping the
+same way so servo backlash cancels. With the lidar it reads every degree
+(121 directions); without it, the ultrasonic every 3° (40 directions, three
+pings each). From a lidar sweep each reading is a point on a surface; the
+corrections below are for the sonar's wide beam. It turns the sweep into **surfaces**: fine wall segments joined at
 corners into contours, plus point features such as edges and legs. Openings
 and passages stay open: echoes are pulled back to the edges they came from,
 walls break wherever their points leave a gap, and contours never close
@@ -424,8 +553,7 @@ This is still an approximate sketch, not a validated or safety-rated map.
 Ultrasonic sensors miss soft and very oblique surfaces, monocular images have
 no absolute scale, and wheel slip varies. Do not use it for autonomous
 navigation or collision avoidance; exploration still steers from the raw
-sweep. A sweep takes about 11–12 seconds, so a two-minute explore session fits
-fewer bursts than before.
+sweep. A sonar sweep takes about 11–12 seconds, a lidar sweep about 7.
 
 **Remembering places:** every stop's picture features, sweep and pose are kept
 in the database across sessions. At each stop RoboCar checks whether it has

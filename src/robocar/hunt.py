@@ -1,21 +1,41 @@
 """The cat hunt: find the cat in a mapped room, then play with it.
 
+**Eyes always open.** The camera feed is watched continuously (see
+robocar.watch): every frame is checked for the cat. While seeking, the
+moment a cat appears whatever the car is doing (a turn, a drive, a sonar
+sweep) stops, and it goes after the cat.
+
 **Seeking.** A belief map says where the cat might be. It covers the floor
 the coverage grid knows, and is weighted toward furniture cats like (a
 couch, bed or chair the camera recognized) and toward spots where the cat
-was found before. Every look with the camera lowers the belief over what
-that look could actually see (walls block the view), and the belief slowly
+was found before. Everything the camera sees without a cat lowers the
+belief over that view (walls block the view), and the belief slowly
 drifts back toward its prior, because cats move. The next vantage point is
-the one that could show the most belief per centimetre of travel. On the
-way there the car checks ahead with a forward glance after every leg; on
-arrival it does a full sonar sweep (re-checking the map and where it is)
-and pans the camera across the room.
+the one that could show the most belief per centimetre of travel. The car
+drives there without stopping, steering along the map's route with the
+sonar watching ahead, glances across the room with the head on arrival,
+and moves on. It stops for a full sonar sweep only when it no longer knows
+where it is on the map, and not more often than every couple of minutes.
+
+**Approaching.** The car steers straight at the cat while it watches it,
+slowing as it closes in, until it is in play range.
+
+**Measuring the cat.** With the lidar on the head and the camera fixed
+facing ahead, the head turns the lidar's narrow beam onto the cat wherever
+it is in view and measures it to a centimetre or two. Between measurements
+each camera frame scales the last measured range by how much bigger or
+smaller the cat looks, so the distance stays right frame by frame (and the
+camera's size-to-distance scale keeps learning from the lidar).
 
 **Playing.** No canned routine. Each beat a policy picks one of many moves
 (pounce, zig-zag, orbit, sidestep, spin, stalk, peekaboo...) with fresh
 random parameters. It weighs what suits the distance to the cat, what the
 car's slowly drifting mood calls for, what has not been done lately, and
-what has learned to get the cat to react. After each move the cat's own
+what has learned to get the cat to react. Some moves react to the cat as
+they go, from the live feed: "mouse" plays prey (darting across the cat's
+view while it holds still, freezing when it moves, scooting off when it
+comes at the car) and "lure" edges away while the cat watches, the way
+prey that leaves invites a chase. After each move the cat's own
 movement, with the car's movement taken out, scores that move. Every so
 often the car backs off and waits about a minute, wiggling now and then,
 before going back to bothering the cat. The scores, the camera's distance
@@ -54,8 +74,9 @@ MIN_CAT_DISTANCE_CM = 30.0
 PLAY_NEAR_CM = 50.0
 PLAY_FAR_CM = 110.0
 PLAY_TARGET_CM = 75.0
-# Camera: the OV5647's 640x480 mode is about 53 degrees across and 41 high.
-CAMERA_VFOV_DEG = 41.0
+# Camera: the HQ camera with its 6 mm lens is about 55 degrees across and
+# 43 high (4.71 mm of sensor height), in the 4:3 frames detection uses.
+CAMERA_VFOV_DEG = 42.9
 # Distance from a cat's box height: distance = scale / box height (pixels).
 # A sitting cat is about 25 cm tall; the scale is learned from the sonar.
 DEFAULT_SIZE_SCALE = 25.0 * 240.0 / math.tan(math.radians(CAMERA_VFOV_DEG / 2))
@@ -65,6 +86,19 @@ SCALE_SAMPLES = 9
 # well and the cat is this close (further out the beam catches walls first).
 CALIBRATE_AGREEMENT = 0.25
 CALIBRATE_WITHIN_CM = 150.0
+# The lidar's 2 degree beam stays on a cat much further out, and is trusted
+# over a camera guess that may still be badly scaled (half out).
+PRECISE_AGREEMENT = 0.5
+PRECISE_CALIBRATE_WITHIN_CM = 300.0
+# The head turns the lidar onto the cat within this far either side.
+HEAD_RANGE_LIMIT_DEG = 55.0
+# Beside the cat's centre too: the nearest of these hits the cat (a thin
+# beam can slip past its edge to the wall behind).
+RANGE_FAN_DEG = (0, -2, 2)
+# A measured range keeps anchoring the camera's distance this long.
+RANGE_FRESH_SECONDS = 1.5
+# In the approach, a lidar range at most this often (each turns the head).
+APPROACH_RANGE_SECONDS = 0.3
 # Seeking.
 BELIEF_CELL_CM = 20.0
 VIEW_RANGE_CM = 350.0
@@ -113,6 +147,45 @@ CAT_FAR_FRESH_SECONDS = 5.0
 # A vantage point the car could not get to is left alone this long.
 UNREACHABLE_SECONDS = 120.0
 UNREACHABLE_RADIUS_CM = 50.0
+# Driving while looking: a control step this often. Throttle 0.36 is about
+# 35 cm/s; steering 0.3 turns in place at about 85 degrees a second.
+CONTROL_SECONDS = 0.1
+CRUISE_THROTTLE = 0.36
+APPROACH_THROTTLE = 0.3
+CREEP_THROTTLE = 0.2
+TURN_COMMAND = 0.3
+STEER_PER_DEGREE = 0.006
+STEER_LIMIT = 0.2
+# Further off the way than this, turn in place first.
+TURN_IN_PLACE_DEG = 35.0
+ROUTE_REFRESH_SECONDS = 0.5
+WAYPOINT_REACHED_CM = 8.0
+ARRIVED_CM = 25.0
+CRUISE_MAX_SECONDS = 45.0
+# No closer than this to the goal in this long while driving: stuck.
+STUCK_SECONDS = 3.0
+STUCK_PROGRESS_CM = 4.0
+# Belief is lowered over what the camera sees at most this often while driving.
+BELIEF_LOOK_SECONDS = 0.5
+# A sighting this old still steers the approach; without a newer one for
+# LOST_SECONDS the cat is lost.
+SIGHTING_FRESH_SECONDS = 0.6
+LOST_SECONDS = 2.5
+APPROACH_MAX_SECONDS = 30.0
+# Playing mouse: for this long, darting this far sideways after the cat has
+# held still this long; the cat counts as moving when it has gone this far in
+# the last window, and as coming at the car when it closes this fast.
+MOUSE_SECONDS = (4.0, 9.0)
+MOUSE_DART_CM = (12.0, 25.0)
+MOUSE_DART_WAIT_SECONDS = (0.7, 2.0)
+MOUSE_WINDOW_SECONDS = 0.5
+MOUSE_MOVED_CM = 12.0
+MOUSE_FLEE_SPEED_CM_S = 40.0
+# A full sonar sweep (to find its place on the map again) at most this often.
+RELOCALIZE_SECONDS = 120.0
+# With the camera fixed facing ahead, looking around is a spin on the spot,
+# watching all the way round.
+SPIN_LOOK_DEGREES = 360.0
 
 
 @dataclass(frozen=True)
@@ -134,6 +207,19 @@ class Look:
     person_ahead: bool = False
 
 
+@dataclass(frozen=True)
+class Sighting:
+    """What one frame of the continuous camera feed showed, and when and
+    from where it was taken."""
+
+    at: float  # the body's clock at capture
+    pan: int  # where the head pointed
+    odometry: Pose  # where the car was
+    look: Look
+    moving: bool
+    detections: tuple[Mapping[str, object], ...] = ()
+
+
 class HuntBody(Protocol):
     """What the hunt needs from the car (or a simulation of it)."""
 
@@ -143,13 +229,29 @@ class HuntBody(Protocol):
 
     def stopped(self) -> bool: ...
 
-    def look(self, pan: int) -> Look: ...  # point the head, take a picture, detect
+    def look(self, pan: int) -> Look: ...  # point the head; what the next frame shows
 
-    def ping(self, pan: int) -> float | None: ...  # sonar range with the head at `pan`
+    def camera_pans(self) -> bool: ...  # the camera turns with the head (else it faces ahead)
+
+    def sighting(self) -> Sighting | None: ...  # the latest frame of the continuous feed
+
+    def interrupt_on_cat(self, enabled: bool) -> None: ...  # a cat sighting ends turns, moves, sweeps
+
+    def spotted(self) -> Sighting | None: ...  # the latest cat sighting since interrupts went on or cleared
+
+    def clear_spotted(self) -> None: ...
+
+    def ping(self, pan: int, precise: bool = False) -> float | None: ...  # range with the head at `pan` (see range_ahead)
+
+    # The latest range straight ahead, without waiting: the nearer of lidar
+    # and sonar, or with `precise` the lidar's narrow beam alone when fitted.
+    def range_ahead(self, precise: bool = False) -> float | None: ...
+
+    def ranges_precisely(self) -> bool: ...  # a lidar is fitted
 
     def observe(self) -> None: ...  # a full stop: sweep, localize, update the map
 
-    def sweep_looks(self, pans: Sequence[int]) -> dict[int, Look]: ...  # looks from the last stop's sweep pictures
+    def knows_where_it_is(self) -> bool: ...
 
     def pose(self) -> Pose: ...  # best estimate on the map, now
 
@@ -164,6 +266,10 @@ class HuntBody(Protocol):
     def move(self, forward_cm: float, sideways_cm: float, speed: float = 1.0) -> bool: ...  # sideways: + right
 
     def arc(self, strafe: float, steering: float, seconds: float) -> bool: ...
+
+    def command(self, throttle: float, strafe: float, steering: float) -> None: ...  # keep moving like this
+
+    def halt(self) -> None: ...  # stop moving, now
 
     def battery_ok(self) -> bool: ...
 
@@ -424,11 +530,12 @@ class CatBelief:
 class _Track:
     """Where the cat is, relative to the car."""
 
-    bearing: float
+    bearing: float  # relative to the car's heading at `heading`
     distance: float | None
     box_height: float
     seen_at: float
     misses: int = 0
+    heading: float = 0.0  # the car's odometry heading when seen
 
 
 class HuntEngine:
@@ -459,6 +566,11 @@ class HuntEngine:
         self.end_reason: str | None = None
         self.unreachable: list[tuple[float, float, float]] = []  # x, y, until
         self.performed = ""  # the move that actually ran (moves fall back when there is no room)
+        self.watching = False  # whether a cat sighting interrupts what the car is doing
+        self.last_observe = -math.inf
+        self.absorbed_at = -math.inf  # the latest continuous-feed frame taken into account
+        # The latest precise range to the cat: when, how far, and how tall it looked then.
+        self.ranged: tuple[float, float, float] | None = None
         self.memory.hunts += 1
         self.memory.fade()
 
@@ -483,8 +595,12 @@ class HuntEngine:
             "cat": None
             if track is None
             else {
-                "bearing_deg": round(track.bearing, 1),
+                "bearing_deg": round(self._cat_bearing(), 1),
                 "distance_cm": None if track.distance is None else round(track.distance),
+                # "lidar" while a measured range anchors it, else the camera's guess.
+                "distance_from": "lidar"
+                if self.ranged is not None and track.seen_at - self.ranged[0] <= RANGE_FRESH_SECONDS
+                else "camera",
                 "seen_seconds_ago": round(self.body.now() - track.seen_at, 1),
             },
             "last_cat_position": None if self.last_cat_position is None else [round(v, 1) for v in self.last_cat_position],
@@ -498,13 +614,18 @@ class HuntEngine:
 
     def run(self) -> str:
         try:
-            self._say("seeking", "starting the hunt: checking where I am")
-            if not self._observe():
-                return self._end("stopped")
+            self._say("seeking", "starting the hunt")
+            if not self.body.knows_where_it_is():
+                self._say(action="checking where I am on the map first")
+                if not self._observe():
+                    return self._end("stopped")
+            self.belief = CatBelief(self.body.grid(), self.body.landmarks(), self.memory)
             while True:
                 reason = self._should_end()
                 if reason:
                     return self._end(reason)
+                # While looking for the cat, seeing it interrupts anything.
+                self._watch(self.phase in ("seeking", "starting", "searching"))
                 if self.phase in ("seeking", "starting"):
                     self._seek()
                 elif self.phase == "approaching":
@@ -517,6 +638,9 @@ class HuntEngine:
                     self._search_nearby()
         except _Stopped:
             return self._end("stopped")
+        finally:
+            self._watch(False)
+            self.body.halt()
 
     def _should_end(self) -> str | None:
         if self.body.stopped():
@@ -543,60 +667,143 @@ class HuntEngine:
 
     # -- sensing ------------------------------------------------------------
 
+    def _watch(self, enabled: bool) -> None:
+        if enabled != self.watching:
+            self.watching = enabled
+            self.body.interrupt_on_cat(enabled)
+
     def _observe(self) -> bool:
-        """A full stop: sweep, localize, update the map. The belief is built
-        once per hunt, from the map as mapping left it, and kept: rebuilding
-        it would forget where the car has already looked."""
+        """A full stop: sweep, localize, update the map (a cat seen meanwhile
+        cuts it short; the caller checks)."""
+        self.last_observe = self.body.now()
         self.body.observe()
-        if self.belief is None:
-            self.belief = CatBelief(self.body.grid(), self.body.landmarks(), self.memory)
         return not self.body.stopped()
 
-    def _look(self, pan: int, look: Look | None = None) -> Look:
-        """Look toward `pan`: a picture taken now, or `look` from one taken
-        a moment ago (the head is then left where it is)."""
-        if look is None:
-            self.head = pan
-            look = self.body.look(pan)
+    def _maybe_relocalize(self) -> None:
+        """A sweep to find its place on the map again, only when lost and
+        not too often: stopping to sweep is slow."""
+        if self.body.knows_where_it_is() or self.body.now() - self.last_observe < RELOCALIZE_SECONDS:
+            return
+        self._say(action="not sure where I am any more: a quick sweep to find my place on the map")
+        self._check(self._observe())
+
+    def _spotted(self) -> bool:
+        """Whether the feed has caught the cat: if so, stop and go after it."""
+        sighting = self.body.spotted()
+        if sighting is None or sighting.look.cat is None:
+            return False
+        self.body.halt()
+        self.body.clear_spotted()
+        self._absorb(sighting)
+        return self._found()
+
+    def _absorb(self, sighting: Sighting) -> None:
+        """Take a frame of the continuous feed into account."""
+        if sighting.at <= self.absorbed_at:
+            return
+        self.absorbed_at = sighting.at
+        # Frames stream by many a second: a miss counts only for a deliberate look.
+        self._note(sighting.look, sighting.pan, sighting.odometry[2], sighting.at, count_miss=False)
+
+    def _look(self, pan: int) -> Look:
+        """Point the head toward `pan` and see what the next frame shows (a
+        camera fixed facing ahead sees ahead whatever the head does)."""
+        self.head = pan
+        look = self.body.look(pan)
         self.stats["looks"] += 1
+        self._note(look, pan if self.body.camera_pans() else 90, self.body.odometry()[2], self.body.now())
+        return look
+
+    def _note(self, look: Look, pan: int, heading: float, at: float, count_miss: bool = True) -> None:
         if abs(pan_bearing(pan)) <= 10.0:
-            self.front_looked = (self.body.now(), self.body.pose()[2])
+            self.front_looked = (at, self.body.pose()[2])
         if look.person_ahead:
-            self.person_seen = (self.body.now(), self.body.pose()[2])
+            self.person_seen = (at, self.body.pose()[2])
         elif abs(pan_bearing(pan)) <= 10.0:
             self.person_seen = None
         if look.cat is not None:
-            self._see(look.cat)
-        elif self.track is not None and abs(pan_bearing(pan) - self.track.bearing) <= CAMERA_HFOV_DEG / 2 - 5.0:
+            self._see(look.cat, heading, at)
+        elif count_miss and self.track is not None and abs(pan_bearing(pan) - self._cat_bearing()) <= CAMERA_HFOV_DEG / 2 - 5.0:
             # Only a look where the cat should have been counts as missing it.
             self.track.misses += 1
-        return look
 
-    def _see(self, cat: CatView) -> None:
+    def _see(self, cat: CatView, heading: float | None = None, at: float | None = None) -> None:
+        """The cat seen in a frame taken with the car's odometry heading at
+        `heading` (now, if not given)."""
+        now_heading = self.body.odometry()[2]
+        heading = now_heading if heading is None else heading
+        seen_at = self.body.now() if at is None else at
         distance = self.memory.size_scale / max(cat.box_height, 1.0)
-        self.track = _Track(cat.bearing_deg, distance, cat.box_height, self.body.now())
+        if self.ranged is not None and seen_at - self.ranged[0] <= RANGE_FRESH_SECONDS:
+            # Measured lately: the camera only says how much that has changed.
+            _, ranged_cm, box_then = self.ranged
+            distance = ranged_cm * box_then / max(cat.box_height, 1.0)
+        self.track = _Track(cat.bearing_deg, distance, cat.box_height, seen_at, heading=heading)
         pose = self.body.pose()
-        heading = math.radians(pose[2] + cat.bearing_deg)
-        self.last_cat_position = (pose[0] - math.sin(heading) * distance, pose[1] + math.cos(heading) * distance)
+        world = math.radians(pose[2] + self._cat_bearing())
+        self.last_cat_position = (pose[0] - math.sin(world) * distance, pose[1] + math.cos(world) * distance)
+
+    def _cat_bearing(self) -> float:
+        """Where the cat was last seen, relative to the car's heading now."""
+        if self.track is None:
+            return 0.0
+        turned = self.body.odometry()[2] - self.track.heading
+        return (self.track.bearing - turned + 180.0) % 360.0 - 180.0
 
     def _range_to_cat(self) -> float | None:
-        """With the cat straight ahead, the sonar measures it (and teaches the
-        camera's distance scale)."""
-        if self.track is None or abs(self.track.bearing) > 8.0:
+        """Measure the cat (and teach the camera's distance scale).
+
+        With a lidar and a camera that stays facing ahead, the head turns the
+        lidar onto the cat wherever it is in view; otherwise, with the cat
+        straight ahead, the range ahead measures it."""
+        if self.track is None:
             return None
-        sonar = self.body.ping(90)
-        if sonar is None:
+        bearing = self._cat_bearing()
+        precise = self.body.ranges_precisely()
+        if precise and not self.body.camera_pans() and abs(bearing) <= HEAD_RANGE_LIMIT_DEG:
+            readings = []
+            for offset in RANGE_FAN_DEG:
+                pan = int(round(90 - bearing - offset))
+                if not 30 <= pan <= 150:
+                    continue
+                reading = self.body.ping(pan, precise=True)
+                self.head = pan
+                if reading is not None:
+                    readings.append(reading)
+                if readings and offset == 0 and self.track.distance is not None and (
+                    abs(readings[0] - self.track.distance) <= PRECISE_AGREEMENT * self.track.distance
+                ):
+                    break  # the centre reading already agrees: no need to look beside it
+            measured = min(readings) if readings else None
+        elif abs(bearing) <= 8.0:
+            measured = self.body.range_ahead(precise=precise)
+            self.head = 90
+        else:
+            return None
+        if measured is None or self.track is None:
             return None
         estimate = self.track.distance
-        if estimate is None or abs(sonar - estimate) <= CALIBRATE_AGREEMENT * estimate:
-            if sonar <= CALIBRATE_WITHIN_CM:
-                self.memory.calibrate(self.track.box_height, sonar)
-            self.track.distance = sonar
-            return sonar
+        agreement, within = (PRECISE_AGREEMENT, PRECISE_CALIBRATE_WITHIN_CM) if precise else (CALIBRATE_AGREEMENT, CALIBRATE_WITHIN_CM)
+        if estimate is None or abs(measured - estimate) <= agreement * estimate:
+            if measured <= within:
+                self.memory.calibrate(self.track.box_height, measured)
+            self.track.distance = measured
+            if precise:
+                self.ranged = (self.track.seen_at, measured, self.track.box_height)
+            return measured
         return None
 
     def _lost(self) -> bool:
         return self.track is None or self.track.misses >= LOST_AFTER_LOOKS
+
+    def _person_ahead_now(self) -> bool:
+        """A person close in front in the continuous feed just now."""
+        sighting = self.body.sighting()
+        return (
+            sighting is not None
+            and sighting.look.person_ahead
+            and self.body.now() - sighting.at <= SIGHTING_FRESH_SECONDS
+        )
 
     # -- seeking ------------------------------------------------------------
 
@@ -611,7 +818,8 @@ class HuntEngine:
         vantage = self.belief.best_vantage(self.body.pose(), self.rng, [(x, y) for x, y, _ in self.unreachable])
         if vantage is None:
             self._say(action="nowhere new to look from here; turning round", log=True)
-            self._check(self.body.turn(self.rng.choice((-1, 1)) * 120.0, precise=True))
+            self._check(self.body.turn(self.rng.choice((-1, 1)) * 120.0, precise=False))
+            self._spotted()
             return
         (x, y), mass = vantage
         pose = self.body.pose()
@@ -624,18 +832,23 @@ class HuntEngine:
             }
             turn = max(sectors, key=sectors.get)
             self._say(action=f"nothing ahead; turning {turn:+.0f} degrees to look that way")
-            self._check(self.body.turn(turn, precise=True))
+            self._check(self.body.turn(turn, precise=False))
+            self._spotted()
             return
         self._say(action=f"heading to look from ({x:.0f}, {y:.0f}) cm: {100 * mass:.0f}% chance of a view of the cat")
         start = self.body.pose()
-        if self._travel((x, y)):
-            return  # the cat turned up on the way
+        outcome = self._cruise_to((x, y))
+        if outcome == "cat":
+            return
         end = self.body.pose()
-        if math.hypot(end[0] - start[0], end[1] - start[1]) < 10.0:
+        if outcome != "arrived" and math.hypot(end[0] - start[0], end[1] - start[1]) < 10.0:
             # Got nowhere: try somewhere else for a while, and get clear first.
             self.unreachable.append((x, y, self.body.now() + UNREACHABLE_SECONDS))
             self._unstick()
-        self._check(self._observe())
+            if self._spotted():
+                return
+        self._maybe_relocalize()
+        self._spotted()
 
     def _unstick(self) -> None:
         """Hemmed in: glance about with the sonar, turn to the clearest way
@@ -654,29 +867,67 @@ class HuntEngine:
         self.head = 90
         if best is None or best[1] < 8.0:
             self._say(action="hemmed in here; turning round to find a way out")
-            self._check(self.body.turn(180.0, precise=True))
+            self._check(self.body.turn(180.0, precise=False))
             return
         turn, room = best
         self._say(action=f"couldn't get there; edging out the clearest way ({turn:+.0f} degrees)")
         if abs(turn) > 5.0:
-            self._check(self.body.turn(turn, precise=True))
+            self._check(self.body.turn(turn, precise=False))
+            if self.body.spotted() is not None:
+                return
         self._safe_forward(min(25.0, room))
 
     def _look_around(self) -> bool:
-        """Pan the camera across the room; True once the cat is found."""
+        """Sweep the head across the room (or, with the camera fixed facing
+        ahead, spin on the spot); True once the cat is found (by a look, or
+        by the feed in between)."""
         assert self.belief is not None
+        if not self.body.camera_pans():
+            return self._spin_look()
         pose = self.body.pose()
         pans = LOOK_PANS if self.rng.random() < 0.5 else tuple(reversed(LOOK_PANS))
-        # Right after a stop, its sweep has already pictured these directions.
-        swept = self.body.sweep_looks(pans)
-        for pan in sorted(pans, key=lambda pan: pan not in swept):
+        for pan in pans:
             self._check(not self.body.stopped())
-            look = self._look(pan, swept.get(pan))
+            if self._spotted():
+                return True
+            look = self._look(pan)
             if look.cat is not None:
+                self.body.clear_spotted()
                 return self._found()
             self.belief.looked(pose[:2], pose[2] + pan_bearing(pan))
         self.head = 90
-        return False
+        return self._spotted()
+
+    def _spin_look(self, degrees: float = SPIN_LOOK_DEGREES) -> bool:
+        """Turn on the spot watching the feed; True as soon as the cat shows."""
+        side = self.rng.choice((-1, 1))
+        start = self.body.odometry()[2]
+        last_belief = -math.inf
+        self.head = 90
+        try:
+            while True:
+                self._check(not self.body.stopped())
+                if self._spotted():
+                    return True
+                if abs(self.body.odometry()[2] - start) >= degrees:
+                    return False
+                now = self.body.now()
+                sighting = self.body.sighting()
+                if sighting is not None:
+                    self._absorb(sighting)
+                    if (
+                        self.belief is not None
+                        and now - last_belief >= BELIEF_LOOK_SECONDS
+                        and sighting.look.cat is None
+                        and now - sighting.at <= SIGHTING_FRESH_SECONDS
+                    ):
+                        last_belief = now
+                        pose = self.body.pose()
+                        self.belief.looked(pose[:2], pose[2] + pan_bearing(sighting.pan))
+                self.body.command(0.0, 0.0, side * TURN_COMMAND)
+                self._check(self.body.wait(CONTROL_SECONDS))
+        finally:
+            self.body.halt()
 
     def _found(self) -> bool:
         self.stats["finds"] += 1
@@ -685,35 +936,77 @@ class HuntEngine:
             self.memory.remember_cat(*self.last_cat_position)
         distance = "" if self.track is None or self.track.distance is None else f", about {self.track.distance:.0f} cm away"
         self._say("approaching", f"found the cat{distance}!")
+        self._watch(False)
         return True
 
-    def _travel(self, goal: tuple[float, float]) -> bool:
-        """Drive toward a vantage point in legs; True if the cat shows up."""
-        for _ in range(8):
-            self._check(not self.body.stopped())
-            pose = self.body.pose()
-            if math.hypot(goal[0] - pose[0], goal[1] - pose[1]) < 25.0:
-                return False
-            leg = self.body.grid().route(pose, goal)
-            if leg is None:
-                return False
-            bearing, distance = leg
-            if abs(bearing) > 8.0:
-                self._check(self.body.turn(bearing, precise=True))
-            ahead = self.body.ping(90)
-            room = min(SEEK_LEG_CM, max(distance, MIN_LEG_CM), self.body.grid().clear_run(self.body.pose(), SEEK_LEG_CM))
-            if ahead is not None:
-                room = min(room, ahead - SEEK_STANDOFF_CM)
-            if room < 8.0:
-                return False
-            if self._person_in_the_way():
-                self._say(action="someone is standing in the way; waiting for them to move")
-                self._check(self.body.wait(2.0))
-                return False
-            self._check(self.body.move(room, 0.0))
-            if self._look(90).cat is not None:
-                return self._found()
-        return False
+    def _cruise_to(self, goal: tuple[float, float], stop_for_cat: bool = True, standoff: float = SEEK_STANDOFF_CM) -> str:
+        """Drive to a point without stopping, steering along the map's route
+        with the sonar watching ahead and the camera looking. Returns
+        "arrived", "cat" (seen on the way), "blocked", "person" or "stuck"."""
+        assert self.belief is not None or not stop_for_cat
+        grid = self.body.grid()
+        started = self.body.now()
+        waypoint: tuple[float, float] | None = None
+        refreshed = -math.inf
+        last_belief = -math.inf
+        best_gap, best_at = math.inf, started
+        try:
+            while True:
+                self._check(not self.body.stopped())
+                if stop_for_cat and self._spotted():
+                    return "cat"
+                now = self.body.now()
+                pose = self.body.pose()
+                gap = math.hypot(goal[0] - pose[0], goal[1] - pose[1])
+                if gap < ARRIVED_CM:
+                    return "arrived"
+                if gap < best_gap - STUCK_PROGRESS_CM:
+                    best_gap, best_at = gap, now
+                elif now - best_at > STUCK_SECONDS or now - started > CRUISE_MAX_SECONDS:
+                    return "stuck"
+                if (
+                    waypoint is None
+                    or now - refreshed >= ROUTE_REFRESH_SECONDS
+                    or math.hypot(waypoint[0] - pose[0], waypoint[1] - pose[1]) < WAYPOINT_REACHED_CM
+                ):
+                    leg = grid.route(pose, goal)
+                    if leg is None:
+                        return "blocked"
+                    bearing, length = leg
+                    heading = math.radians(pose[2] + bearing)
+                    length = max(length, MIN_LEG_CM)
+                    waypoint = (pose[0] - math.sin(heading) * length, pose[1] + math.cos(heading) * length)
+                    refreshed = now
+                error = math.degrees(math.atan2(-(waypoint[0] - pose[0]), waypoint[1] - pose[1])) - pose[2]
+                error = (error + 180.0) % 360.0 - 180.0
+                sighting = self.body.sighting()
+                if sighting is not None:
+                    self._absorb(sighting)
+                if self._person_ahead_now():
+                    self.body.halt()
+                    self._say(action="someone is standing in the way; waiting for them to move")
+                    self._check(self.body.wait(1.0))
+                    return "person"
+                if abs(error) > TURN_IN_PLACE_DEG:
+                    self.body.command(0.0, 0.0, math.copysign(TURN_COMMAND, error))
+                else:
+                    ahead = self.body.range_ahead()
+                    self.head = 90
+                    room = grid.clear_run(pose, SEEK_LEG_CM)
+                    if ahead is not None:
+                        room = min(room, ahead - standoff)
+                    if room < 5.0:
+                        return "blocked"
+                    throttle = CRUISE_THROTTLE * min(1.0, max(0.5, room / 40.0)) * math.cos(math.radians(error))
+                    steering = max(-STEER_LIMIT, min(STEER_LIMIT, error * STEER_PER_DEGREE))
+                    self.body.command(throttle, 0.0, steering)
+                if self.belief is not None and now - last_belief >= BELIEF_LOOK_SECONDS:
+                    last_belief = now
+                    if sighting is not None and sighting.look.cat is None and now - sighting.at <= SIGHTING_FRESH_SECONDS:
+                        self.belief.looked(pose[:2], pose[2] + pan_bearing(sighting.pan))
+                self._check(self.body.wait(CONTROL_SECONDS))
+        finally:
+            self.body.halt()
 
     # -- approaching --------------------------------------------------------
 
@@ -721,35 +1014,82 @@ class HuntEngine:
         """Turn the body toward the cat and centre the head."""
         if self.track is None:
             return
-        bearing = self.track.bearing
+        bearing = self._cat_bearing()
         if abs(bearing) > 6.0:
             self._check(self.body.turn(bearing, precise=precise))
             self.track.bearing = 0.0
+            self.track.heading = self.body.odometry()[2]
         self._look(90)
 
     def _approach(self) -> None:
-        self._face_cat(precise=False)
-        for _ in range(6):
-            if self._lost():
-                self._say("searching", "lost sight of the cat; looking nearby")
-                return
-            self._range_to_cat()
-            distance = self.track.distance if self.track else None
-            if distance is None:
-                self._say(action="can't tell how far the cat is; creeping closer")
-                self._safe_forward(10.0)
-            elif distance <= PLAY_FAR_CM:
-                self._say("playing", f"in play range ({distance:.0f} cm): let's play!")
-                self._bout_ends = self.body.now() + self.rng.uniform(*BOUT_SECONDS)
-                return
-            else:
-                self._say(action=f"sneaking up on the cat ({distance:.0f} cm away)")
-                self._safe_forward(min(SEEK_LEG_CM, distance - PLAY_TARGET_CM))
-            look = self._look(90)
-            if look.cat is not None and abs(look.cat.bearing_deg) > 10.0:
-                self._face_cat()
-        self._say("playing", "close enough: let's play!")
-        self._bout_ends = self.body.now() + self.rng.uniform(*BOUT_SECONDS)
+        """Steer straight at the cat while watching it, slowing as it gets
+        close, until it is in play range."""
+        if self.head != 90:
+            self._look(90)
+        started = self.body.now()
+        last_ranged = -math.inf
+        try:
+            while True:
+                self._check(not self.body.stopped())
+                if self._should_end():
+                    return
+                now = self.body.now()
+                sighting = self.body.sighting()
+                if sighting is not None:
+                    self._absorb(sighting)
+                track = self.track
+                if track is None or now - track.seen_at > LOST_SECONDS:
+                    self._say("searching", "lost sight of the cat; looking nearby")
+                    return
+                bearing = self._cat_bearing()
+                if now - last_ranged >= APPROACH_RANGE_SECONDS and (abs(bearing) <= 8.0 or self.body.ranges_precisely()):
+                    last_ranged = now
+                    self._range_to_cat()
+                    track = self.track or track
+                distance = track.distance
+                if distance is not None and distance <= PLAY_FAR_CM:
+                    self.body.halt()
+                    self._say("playing", f"in play range ({distance:.0f} cm): let's play!")
+                    self._bout_ends = self.body.now() + self.rng.uniform(*BOUT_SECONDS)
+                    return
+                if now - started > APPROACH_MAX_SECONDS:
+                    self.body.halt()
+                    self._say("playing", "close enough: let's play!")
+                    self._bout_ends = self.body.now() + self.rng.uniform(*BOUT_SECONDS)
+                    return
+                if self._person_ahead_now():
+                    self.body.halt()
+                    self._check(self.body.wait(0.5))
+                    continue
+                if now - track.seen_at > SIGHTING_FRESH_SECONDS:
+                    # Lost it for a moment: hold still and let the camera find it.
+                    self.body.command(0.0, 0.0, 0.0)
+                elif abs(bearing) > 20.0:
+                    self.body.command(0.0, 0.0, math.copysign(TURN_COMMAND, bearing))
+                else:
+                    ahead = self.body.range_ahead()
+                    pose = self.body.pose()
+                    room = self.body.grid().clear_run(pose, SEEK_LEG_CM)
+                    if ahead is not None:
+                        room = min(room, ahead - MIN_CAT_DISTANCE_CM)
+                    if distance is not None:
+                        room = min(room, distance - PLAY_TARGET_CM)
+                    if room < 4.0:
+                        self.body.halt()
+                        self._say("playing", "as close as I can get: let's play!")
+                        self._bout_ends = self.body.now() + self.rng.uniform(*BOUT_SECONDS)
+                        return
+                    if self.mood < 0.4:
+                        self._say(action=f"stalking the cat ({distance:.0f} cm away)" if distance else "stalking the cat", log=False)
+                    else:
+                        self._say(action=f"sneaking up on the cat ({distance:.0f} cm away)" if distance else "sneaking up on the cat", log=False)
+                    pace = CREEP_THROTTLE if self.mood < 0.4 else APPROACH_THROTTLE
+                    throttle = max(CREEP_THROTTLE, pace * min(1.0, room / 50.0))
+                    steering = max(-STEER_LIMIT, min(STEER_LIMIT, bearing * STEER_PER_DEGREE))
+                    self.body.command(throttle, 0.0, steering)
+                self._check(self.body.wait(CONTROL_SECONDS))
+        finally:
+            self.body.halt()
 
     # -- safety -------------------------------------------------------------
 
@@ -759,7 +1099,7 @@ class HuntEngine:
         room = self.body.grid().clear_run(self.body.pose(), SEEK_LEG_CM)
         if ahead is not None:
             room = min(room, ahead - MIN_CAT_DISTANCE_CM)
-        if self.track is not None and self.track.distance is not None and abs(self.track.bearing) < 40.0:
+        if self.track is not None and self.track.distance is not None and abs(self._cat_bearing()) < 40.0:
             room = min(room, self.track.distance - MIN_CAT_DISTANCE_CM)
         return max(0.0, room)
 
@@ -798,7 +1138,7 @@ class HuntEngine:
         return (
             track is not None
             and self.body.now() - track.seen_at <= FRESH_SECONDS
-            and abs(track.bearing) <= CAT_AHEAD_DEG
+            and abs(self._cat_bearing()) <= CAT_AHEAD_DEG
             and (track.distance is None or track.distance >= MIN_CAT_DISTANCE_CM)
         )
 
@@ -829,8 +1169,20 @@ class HuntEngine:
         self._check(self.body.move(distance, 0.0, speed))
         return distance
 
+    def _cat_clear_to_back(self) -> bool:
+        """Reversing is safe from the cat when it was just seen in front, however
+        close (backing away is what a close cat calls for), or as for any move."""
+        track = self.track
+        if (
+            track is not None
+            and self.body.now() - track.seen_at <= FRESH_SECONDS
+            and abs(self._cat_bearing()) <= CAT_AHEAD_DEG
+        ):
+            return True
+        return self._cat_clear_to_move()
+
     def _safe_back(self, wanted: float, came_forward: float = 0.0) -> float:
-        if not self._cat_clear_to_move():
+        if not self._cat_clear_to_back():
             return 0.0
         # Straight back along a path just driven forward is known to be clear.
         distance = min(wanted, max(self._back_room(), came_forward))
@@ -902,7 +1254,7 @@ class HuntEngine:
     def _close_in(self, distance: float) -> bool:
         """The cat drifted off: close back in, as a stalk or a dash, or round
         whatever is in the way. False if there is no way to get closer."""
-        if self.track is not None and abs(self.track.bearing) > 8.0:
+        if self.track is not None and abs(self._cat_bearing()) > 8.0:
             self._face_cat()
         gap = distance - PLAY_TARGET_CM
         stealthy = self.mood < 0.4
@@ -929,7 +1281,7 @@ class HuntEngine:
         if not self._drive_route((float(spot[0]), float(spot[1])), legs=3):
             return False
         self._look(90)
-        if self.track is not None and abs(self.track.bearing) > 8.0:
+        if self.track is not None and abs(self._cat_bearing()) > 8.0:
             self._face_cat()
         self._say("playing", "going round the obstacle to get back to the cat")
         return True
@@ -960,7 +1312,7 @@ class HuntEngine:
         track = self.track
         if track is None or track.distance is None or self.body.now() - track.seen_at > 5.0:
             return math.inf
-        off = abs((track.bearing - heading_change + 180.0) % 360.0 - 180.0)
+        off = abs((self._cat_bearing() - heading_change + 180.0) % 360.0 - 180.0)
         if off >= 90.0:
             return math.inf
         # Moving at an angle closes the gap by cos(off) per cm.
@@ -994,7 +1346,7 @@ class HuntEngine:
         if self.track is None or self.track.distance is None or self.body.now() - self.track.seen_at > 2.0:
             return None
         odometry = self.body.odometry()
-        heading = math.radians(odometry[2] + self.track.bearing)
+        heading = math.radians(odometry[2] + self._cat_bearing())
         return np.array([odometry[0] - math.sin(heading) * self.track.distance, odometry[1] + math.cos(heading) * self.track.distance])
 
     def _reaction(self, before: np.ndarray | None) -> float | None:
@@ -1019,7 +1371,7 @@ class HuntEngine:
     def _rest(self) -> None:
         backed = self._safe_back(self.rng.uniform(15.0, BACK_LIMIT_CM))
         self._look(90)
-        if self.track is not None and abs(self.track.bearing) > 10.0:
+        if self.track is not None and abs(self._cat_bearing()) > 10.0:
             self._face_cat()
         until = self.body.now() + self.rng.uniform(*REST_SECONDS)
         self._say("resting", f"backed off {backed:.0f} cm; waiting, watching the cat")
@@ -1055,20 +1407,38 @@ class HuntEngine:
     # -- searching nearby ---------------------------------------------------
 
     def _search_nearby(self) -> None:
-        """Look around where the cat was last seen before a full hunt."""
+        """Look around where the cat was last seen before a full hunt (the
+        feed watches throughout: seeing it ends the search at once)."""
+        if not self.body.camera_pans():
+            if self._spin_look():
+                return
+            self.track = None
+            self._say("seeking", "the cat moved on: hunting for it again")
+            if self.belief is not None and self.last_cat_position is not None:
+                self.belief.boost(self.last_cat_position)
+            return
         for pan in (90, 60, 120, 30, 150):
+            if self._spotted():
+                return
             if self._look(pan).cat is not None:
-                self._say("approaching", "there it is again!")
+                self.body.clear_spotted()
+                self._found()
+                self._say(action="there it is again!")
                 return
         for _ in range(2):
             self._check(self.body.turn(self.rng.choice((-1, 1)) * 90.0, precise=False))
+            if self._spotted():
+                return
             for pan in (60, 90, 120):
+                if self._spotted():
+                    return
                 if self._look(pan).cat is not None:
-                    self._say("approaching", "spotted the cat again!")
+                    self.body.clear_spotted()
+                    self._found()
+                    self._say(action="spotted the cat again!")
                     return
         self.track = None
         self._say("seeking", "the cat moved on: hunting for it again")
-        self._check(self._observe())
         if self.belief is not None and self.last_cat_position is not None:
             self.belief.boost(self.last_cat_position)
 
@@ -1203,7 +1573,7 @@ def move_spin(engine: HuntEngine) -> str:
     for _ in range(4):
         engine._check(engine.body.turn(side * 90.0, precise=False))
     engine._look(90)
-    if engine.track is not None and abs(engine.track.bearing) > 10.0:
+    if engine.track is not None and abs(engine._cat_bearing()) > 10.0:
         engine._face_cat()
     return f"spinning a full circle {'left' if side > 0 else 'right'}!"
 
@@ -1226,7 +1596,7 @@ def move_orbit(engine: HuntEngine) -> str:
     steering = side * min(0.5, rate / 384.0)
     engine._check(engine.body.arc(strafe, steering, seconds))
     engine._look(90)
-    if engine.track is not None and abs(engine.track.bearing) > 10.0:
+    if engine.track is not None and abs(engine._cat_bearing()) > 10.0:
         engine._face_cat()
     return f"circling {_side_name(side)} around the cat"
 
@@ -1278,6 +1648,122 @@ def move_back_off_tease(engine: HuntEngine) -> str:
     return f"backing off {back:.0f} cm... then sneaking {went:.0f} cm back in"
 
 
+def _cat_motion(engine: HuntEngine, history: deque) -> tuple[float, float]:
+    """How far the cat has moved over the last MOUSE_WINDOW_SECONDS (cm, the
+    car's own motion taken out) and how fast it is closing in (cm/s)."""
+    now = engine.body.now()
+    position = engine._cat_world()
+    distance = engine.track.distance if engine.track is not None else None
+    if position is not None and distance is not None:
+        history.append((now, position, distance))
+    while len(history) > 1 and now - history[1][0] >= MOUSE_WINDOW_SECONDS:
+        history.popleft()
+    if len(history) < 2 or now - history[0][0] < MOUSE_WINDOW_SECONDS * 0.6:
+        return 0.0, 0.0
+    then, old_position, old_distance = history[0]
+    _, new_position, new_distance = history[-1]
+    elapsed = max(now - then, 1e-3)
+    return float(np.linalg.norm(new_position - old_position)), (old_distance - new_distance) / elapsed
+
+
+def _flee(engine: HuntEngine, side: int) -> float:
+    """Scoot away from a cat coming at the car: back if the map allows,
+    otherwise off to the side. How far it went."""
+    went = engine._safe_back(engine.rng.uniform(12.0, BACK_LIMIT_CM))
+    if went > 0:
+        return went
+    for direction in (side, -side):
+        room = engine._side_room(direction)
+        distance = min(engine.rng.uniform(12.0, 25.0), room)
+        if distance >= 5.0 and engine._slide(0.0, direction * distance):
+            return distance
+    return 0.0
+
+
+def move_mouse(engine: HuntEngine) -> str:
+    """Play prey, reacting to the live feed: dart across the cat's view while
+    it holds still, freeze the moment it moves, and scoot off when it comes
+    at the car. Cats stalk what freezes and pounce on what bolts."""
+    engine.performed = "mouse"
+    until = engine.body.now() + engine.rng.uniform(*MOUSE_SECONDS)
+    side = _side(engine)
+    history: deque = deque()
+    darts = freezes = flees = 0
+    next_dart = engine.body.now() + engine.rng.uniform(*MOUSE_DART_WAIT_SECONDS)
+    frozen = False
+    while engine.body.now() < until:
+        engine._check(engine.body.wait(CONTROL_SECONDS))
+        sighting = engine.body.sighting()
+        if sighting is not None:
+            engine._absorb(sighting)
+        track = engine.track
+        now = engine.body.now()
+        if track is None or now - track.seen_at > LOST_SECONDS:
+            break
+        moved, closing = _cat_motion(engine, history)
+        if (track.distance is not None and track.distance < PLAY_NEAR_CM - 5.0) or closing > MOUSE_FLEE_SPEED_CM_S:
+            if _flee(engine, side) > 0:
+                flees += 1
+            history.clear()
+            next_dart = engine.body.now() + engine.rng.uniform(*MOUSE_DART_WAIT_SECONDS)
+            frozen = False
+            continue
+        if moved > MOUSE_MOVED_CM:
+            # The cat is moving: hold still, like prey that hopes not to be seen.
+            if not frozen:
+                freezes += 1
+                frozen = True
+            next_dart = now + engine.rng.uniform(*MOUSE_DART_WAIT_SECONDS)
+            continue
+        frozen = False
+        if now >= next_dart:
+            if abs(engine._cat_bearing()) > 15.0:
+                engine._face_cat()
+            room = engine._side_room(side)
+            distance = min(engine.rng.uniform(*MOUSE_DART_CM), room)
+            if distance >= 5.0 and engine._slide(0.0, side * distance):
+                darts += 1
+            side = -side
+            history.clear()
+            next_dart = engine.body.now() + engine.rng.uniform(*MOUSE_DART_WAIT_SECONDS)
+    engine._look(90)
+    if darts + flees == 0:
+        return move_freeze(engine) if freezes else move_wiggle(engine)
+    return f"playing mouse: {darts} dart(s), froze {freezes} time(s), fled {flees} time(s)"
+
+
+def move_lure(engine: HuntEngine) -> str:
+    """Edge away in little pulses while the cat watches (prey that leaves
+    invites a chase), then hold still; if the cat follows, freeze."""
+    engine.performed = "lure"
+    room = engine._back_room()
+    if room < 6.0:
+        return move_sidestep(engine)
+    history: deque = deque()
+    backed = 0.0
+    followed = False
+    for _ in range(engine.rng.randint(2, 4)):
+        step = min(engine.rng.uniform(4.0, 8.0), room - backed)
+        if step < 3.0:
+            break
+        went = engine._safe_back(step)
+        if went <= 0:
+            break
+        backed += went
+        engine._check(engine.body.wait(engine.rng.uniform(0.4, 1.0)))
+        sighting = engine.body.sighting()
+        if sighting is not None:
+            engine._absorb(sighting)
+        _, closing = _cat_motion(engine, history)
+        if closing > 8.0:
+            followed = True
+            break
+    engine._check(engine.body.wait(engine.rng.uniform(0.8, 2.0)))
+    if backed <= 0:
+        return move_sidestep(engine)
+    return f"luring: edged {backed:.0f} cm away" + (" and the cat followed!" if followed else ", then waited")
+
+
 def move_combo(engine: HuntEngine) -> str:
     """Two quick moves run together into something new."""
     names = [name for name in ("wiggle", "shimmy", "pounce", "sidestep", "head_bob", "peekaboo") if name in MOVES]
@@ -1303,6 +1789,8 @@ MOVES: dict[str, Callable[[HuntEngine], str]] = {
     "head_bob": move_head_bob,
     "back_off_tease": move_back_off_tease,
     "combo": move_combo,
+    "mouse": move_mouse,
+    "lure": move_lure,
 }
 
 
@@ -1334,4 +1822,6 @@ MOVE_SPECS: dict[str, dict] = {
     "head_bob": {"fit": _band(30.0, 140.0), "energy": -0.3, "toward": False},
     "back_off_tease": {"fit": _band(30.0, 80.0), "energy": 0.2, "toward": False},
     "combo": {"fit": _band(45.0, 110.0), "energy": 0.4, "toward": True},
+    "mouse": {"fit": _band(45.0, 120.0), "energy": 0.4, "toward": False},
+    "lure": {"fit": _band(40.0, 110.0), "energy": -0.1, "toward": False},
 }

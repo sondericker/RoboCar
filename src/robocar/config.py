@@ -17,6 +17,15 @@ class Config:
     camera_backend: str = "picamera2"
     camera_index: int = 0
     camera_enabled: bool = False
+    # Two cameras, found by sensor name: one on the pan/tilt head (mapping
+    # pans it to measure turns and make panoramas) and one fixed facing
+    # forward on the chassis (the hunt's eyes). Either may be missing; the
+    # other then does both jobs. Empty names turn that camera off.
+    head_camera_model: str = "ov5647"
+    forward_camera_model: str = "imx477"
+    # With neither found by name: whether the single camera (camera_index)
+    # rides on the pan/tilt head or is fixed facing forward.
+    camera_on_head: bool = False
     frame_width: int = 640
     frame_height: int = 480
     model_path: Path | None = None
@@ -32,6 +41,10 @@ class Config:
     mapping_database: Path = _default_mapping_database()
     # Lithium cells in series in the car's battery (the Freenove kit: two).
     battery_cells: int = 2
+    # The TF-Luna lidar on the head, on I2C. auto: used when it answers;
+    # on: expected (reported as a fault when missing); off: not used.
+    lidar: str = "auto"
+    lidar_bus: int = 1
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -72,6 +85,10 @@ class Config:
         if not 1 <= battery_cells <= 6:
             raise ValueError("ROBOCAR_BATTERY_CELLS must be between 1 and 6")
 
+        lidar = os.getenv("ROBOCAR_LIDAR", "auto").strip().lower()
+        if lidar not in {"auto", "on", "off"}:
+            raise ValueError("ROBOCAR_LIDAR must be 'auto', 'on' or 'off'")
+
         return cls(
             host=os.getenv("ROBOCAR_HOST", "127.0.0.1"),
             port=int(os.getenv("ROBOCAR_PORT", "5000")),
@@ -79,6 +96,9 @@ class Config:
             camera_index=int(os.getenv("ROBOCAR_CAMERA_INDEX", "0")),
             camera_enabled=os.getenv("ROBOCAR_CAMERA_ENABLED", "false").lower()
             in {"1", "true", "yes"},
+            camera_on_head=os.getenv("ROBOCAR_CAMERA_ON_HEAD", "false").lower() in {"1", "true", "yes"},
+            head_camera_model=os.getenv("ROBOCAR_HEAD_CAMERA", "ov5647").strip().lower(),
+            forward_camera_model=os.getenv("ROBOCAR_FORWARD_CAMERA", "imx477").strip().lower(),
             frame_width=int(os.getenv("ROBOCAR_FRAME_WIDTH", "640")),
             frame_height=int(os.getenv("ROBOCAR_FRAME_HEIGHT", "480")),
             model_path=Path(model).expanduser() if model else None,
@@ -95,4 +115,6 @@ class Config:
             if mapping_database
             else _default_mapping_database(),
             battery_cells=battery_cells,
+            lidar=lidar,
+            lidar_bus=int(os.getenv("ROBOCAR_LIDAR_BUS", "1")),
         )

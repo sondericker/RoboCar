@@ -20,7 +20,11 @@ def main() -> None:
         app.extensions["robocar_drive"].close()
         app.extensions["robocar_pan_tilt"].close()
         app.extensions["robocar_range_sensor"].close()
+        if app.extensions["robocar_lidar"] is not None:
+            app.extensions["robocar_lidar"].close()
         app.extensions["robocar_camera"].close()
+        if app.extensions["robocar_head_camera"] is not app.extensions["robocar_camera"]:
+            app.extensions["robocar_head_camera"].close()
         # Last, once nothing uses it: HailoRT crashes the process at exit if
         # its session is left for the interpreter to tear down.
         app.extensions["robocar_detector"].close()

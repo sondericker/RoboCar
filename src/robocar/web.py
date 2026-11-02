@@ -4,7 +4,7 @@ import time
 
 from flask import Flask, Response, jsonify, render_template, request
 
-from robocar.camera import CameraService
+from robocar.camera import CameraService, connected_models
 from robocar.config import Config
 from robocar.detector import ObjectDetector
 from robocar.drive import (
@@ -19,7 +19,7 @@ from robocar.drive import (
 )
 from robocar.mapping import MappingController, MappingStore
 from robocar.power import BoardADC, PiPower, PowerMonitor, board_version
-from robocar.range_sensor import FreenoveRangeSensor, RangeSensorController
+from robocar.range_sensor import FreenoveRangeSensor, RangeSensorController, TFLunaRangeSensor
 
 
 logger = logging.getLogger(__name__)
@@ -40,6 +40,54 @@ def _open_hardware(name: str, opener):
         reason = f"{type(exc).__name__}: {exc}"
         logger.error("%s unavailable: %s", name, reason)
         return None, reason
+
+
+def _open_cameras(config: Config, detector) -> tuple[CameraService, CameraService, bool]:
+    """(forward camera, head camera, whether the mapping camera is on the head).
+
+    The forward camera is the dashboard's live view and the hunt's eyes; the
+    head camera is mapping's. In hardware mode cameras are found by sensor
+    name; when only one is connected it does both jobs, and with neither
+    found by name (or outside hardware mode) the configured camera number is
+    used as before."""
+
+    def service(model: str | None, index: int = config.camera_index) -> CameraService:
+        return CameraService(
+            config.camera_backend, index, config.frame_width, config.frame_height, detector, config.camera_enabled, model=model
+        )
+
+    # Real cameras are looked up only in hardware mode (never from tests).
+    present = connected_models(config.camera_backend) if config.hardware_enabled else []
+    has = lambda model: bool(model) and any(model in name for name in present)
+    head, forward = config.head_camera_model, config.forward_camera_model
+    if has(head) and has(forward):
+        return service(forward), service(head), True
+    if has(forward):
+        camera = service(forward)
+        return camera, camera, False
+    if has(head):
+        camera = service(head)
+        return camera, camera, True
+    camera = service(None)
+    return camera, camera, config.camera_on_head
+
+
+def _open_lidar(config: Config) -> RangeSensorController | None:
+    """The head's lidar, if there is one: None when it is turned off, or in
+    auto mode when it does not answer (the sonar then does all the ranging)."""
+    if not config.hardware_enabled or config.lidar == "off":
+        return None
+    try:
+        driver = TFLunaRangeSensor(config.lidar_bus)
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        if config.lidar == "auto":
+            logger.info("No lidar found on I2C bus %d (%s); ranging with the sonar only", config.lidar_bus, reason)
+            return None
+        logger.error("Lidar unavailable: %s", reason)
+        return RangeSensorController(None, True, fault=reason, name="Lidar")
+    logger.info("TF-Luna lidar found on I2C bus %d", config.lidar_bus)
+    return RangeSensorController(driver, True, sample_interval=0.1, name="Lidar")
 
 
 def create_app(config: Config | None = None) -> Flask:
@@ -64,6 +112,7 @@ def create_app(config: Config | None = None) -> Flask:
     )
     pan_tilt = PanTiltController(pan_tilt_driver or SimulatedPanTilt(), config.hardware_enabled, fault=pan_tilt_fault)
     range_sensor = RangeSensorController(range_sensor_driver, config.hardware_enabled, fault=range_fault)
+    lidar = _open_lidar(config)
     adc, adc_fault = (
         _open_hardware("Battery monitor", lambda: BoardADC(board_version(config.freenove_server_path)))
         if config.hardware_enabled
@@ -83,25 +132,24 @@ def create_app(config: Config | None = None) -> Flask:
         config.nms_threshold,
         hailo_model=config.hailo_model_path,
     )
-    camera = CameraService(
-        config.camera_backend,
-        config.camera_index,
-        config.frame_width,
-        config.frame_height,
-        detector,
-        config.camera_enabled,
-    )
+    camera, head_camera, camera_on_head = _open_cameras(config, detector)
     mapping = MappingController(
-        camera=camera,
+        camera=head_camera,
         drive=drive,
         pan_tilt=pan_tilt,
         range_sensor=range_sensor,
         store=MappingStore(config.mapping_database),
         detector=detector,
+        camera_on_head=camera_on_head,
+        hunt_camera=camera,
+        lidar=lidar,
     )
 
     app = Flask(__name__)
+    # The dashboard's live view (and the hunt's eyes) is the forward camera;
+    # mapping uses the head camera. With one camera they are the same.
     app.extensions["robocar_camera"] = camera
+    app.extensions["robocar_head_camera"] = head_camera
     app.extensions["robocar_detector"] = detector
     app.extensions["robocar_power"] = power
     mapping.battery_level = power.battery_level
@@ -114,6 +162,7 @@ def create_app(config: Config | None = None) -> Flask:
     app.extensions["robocar_drive"] = drive
     app.extensions["robocar_pan_tilt"] = pan_tilt
     app.extensions["robocar_range_sensor"] = range_sensor
+    app.extensions["robocar_lidar"] = lidar
     app.extensions["robocar_mapping"] = mapping
 
     @app.get("/")
@@ -133,8 +182,10 @@ def create_app(config: Config | None = None) -> Flask:
         return jsonify(
             {
                 "camera": camera.status(),
+                "head_camera": head_camera.status() if head_camera is not camera else None,
                 "drive": drive.status(),
                 "range": range_sensor.status(),
+                "lidar": lidar.status() if lidar is not None else None,
                 "mapping": mapping.status(),
                 "power": power.status(),
             }
@@ -264,6 +315,10 @@ def create_app(config: Config | None = None) -> Flask:
         if image is None:
             return jsonify({"error": "No such picture yet"}), 404
         return Response(image, mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/mapping/cloud")
+    def mapping_cloud():
+        return jsonify(mapping.lidar_cloud())
 
     @app.get("/api/mapping/surfaces")
     def mapping_surfaces():

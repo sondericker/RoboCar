@@ -17,6 +17,42 @@ OPEN_SETTLE_FRAMES = 8
 EXPOSURE_SETTLE_FRAMES = 4
 # Let auto-exposure use frames up to 100 ms long in dim rooms.
 LONGEST_FRAME_US = 100_000
+# Sensor modes reading at least this share of the widest one's area count
+# as showing the whole view; of those, the smallest that still runs this fast.
+FULL_VIEW_SHARE = 0.95
+MIN_SENSOR_FPS = 30.0
+PREFERRED_BIT_DEPTH = 10
+
+
+def connected_models(backend: str) -> list[str]:
+    """Sensor names of the cameras connected (lower case, in the order
+    Picamera2 numbers them); [] when they cannot be listed."""
+    if backend != "picamera2":
+        return []
+    try:
+        info = import_module("picamera2").Picamera2.global_camera_info()
+    except Exception as exc:  # no picamera2, no libcamera: no camera list
+        logger.info("Could not list cameras: %s", exc)
+        return []
+    return [str(entry.get("Model", "")).lower() for entry in info]
+
+
+def full_view_mode(modes: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The sensor mode to use: the whole field of view (binned, not cropped),
+    at a usable frame rate, as small as possible so frames come fast. On the
+    HQ camera (IMX477) that is 2028x1520, about 54 frames a second; the
+    OV5647's 640x480 mode also reads nearly its full width."""
+    usable = [mode for mode in modes if mode.get("crop_limits") and mode.get("size")]
+    if not usable:
+        return None
+    area = lambda mode: mode["crop_limits"][2] * mode["crop_limits"][3]
+    widest = max(area(mode) for mode in usable)
+    full = [mode for mode in usable if area(mode) >= FULL_VIEW_SHARE * widest]
+    fast = [mode for mode in full if float(mode.get("fps", 0.0)) >= MIN_SENSOR_FPS] or full
+    smallest = min(mode["size"][0] * mode["size"][1] for mode in fast)
+    candidates = [mode for mode in fast if mode["size"][0] * mode["size"][1] == smallest]
+    preferred = [mode for mode in candidates if mode.get("bit_depth") == PREFERRED_BIT_DEPTH]
+    return (preferred or sorted(candidates, key=lambda mode: -float(mode.get("fps", 0.0))))[0]
 
 
 class CameraService:
@@ -28,9 +64,13 @@ class CameraService:
         height: int,
         detector: ObjectDetector,
         enabled: bool = False,
+        model: str | None = None,
     ) -> None:
+        """With `model` (a sensor name such as "imx477"), that camera is used
+        whichever number it has; otherwise camera number `camera_index`."""
         self._backend = backend
         self._camera_index = camera_index
+        self.model = model.lower() if model else None
         self._width = width
         self._height = height
         self._detector = detector
@@ -42,6 +82,7 @@ class CameraService:
         self._settle_frames = 0
         self.error: str | None = None
         self.last_detections: list[dict[str, object]] = []
+        self.sensor_mode: dict[str, object] | None = None
 
     @property
     def detector_status(self) -> str:
@@ -52,14 +93,21 @@ class CameraService:
             return
         if self._backend == "picamera2":
             picamera2 = import_module("picamera2")
-            camera = picamera2.Picamera2()
-            camera.configure(
-                camera.create_video_configuration(
-                    # Picamera2's "RGB888" is stored B, G, R: the order OpenCV
-                    # expects. ("BGR888" swapped red and blue in every frame.)
-                    main={"format": "RGB888", "size": (self._width, self._height)}
-                )
-            )
+            camera = picamera2.Picamera2(self._picamera_number(picamera2))
+            # Picamera2's "RGB888" is stored B, G, R: the order OpenCV
+            # expects. ("BGR888" swapped red and blue in every frame.)
+            main = {"format": "RGB888", "size": (self._width, self._height)}
+            mode = full_view_mode(list(getattr(camera, "sensor_modes", []) or []))
+            configuration = None
+            if mode is not None:
+                try:
+                    configuration = camera.create_video_configuration(
+                        main=main, sensor={"output_size": tuple(mode["size"]), "bit_depth": mode["bit_depth"]}
+                    )
+                except (TypeError, KeyError):  # an older picamera2 without sensor selection
+                    configuration = None
+            camera.configure(configuration or camera.create_video_configuration(main=main))
+            self.sensor_mode = None if mode is None else {"size": list(mode["size"]), "fps": round(float(mode["fps"]), 1)}
             camera.start()
             self._camera = camera
             self._apply_exposure()
@@ -75,6 +123,14 @@ class CameraService:
             self._apply_exposure()
             self._settle_frames = OPEN_SETTLE_FRAMES
         self.error = None
+
+    def _picamera_number(self, picamera2: Any) -> int:
+        if self.model is None:
+            return self._camera_index
+        for number, entry in enumerate(picamera2.Picamera2.global_camera_info()):
+            if self.model in str(entry.get("Model", "")).lower():
+                return int(entry.get("Num", number))
+        raise RuntimeError(f"No {self.model} camera is connected")
 
     def _apply_exposure(self) -> None:
         """Send the requested exposure to an open camera (best effort for OpenCV)."""
@@ -163,6 +219,22 @@ class CameraService:
                 if not self._enabled and not self._held:
                     self._release()
 
+    def capture_frame(self):
+        """A raw BGR frame for continuous processing (no settling, no JPEG)."""
+        with self._lock:
+            try:
+                frame = self._capture_frame()
+                self.error = None
+                return frame
+            except (ImportError, OSError, RuntimeError) as exc:
+                self.error = str(exc)
+                logger.error("Camera frame capture failed: %s", exc)
+                self._release()
+                return None
+            finally:
+                if not self._enabled and not self._held:
+                    self._release()
+
     def _capture_frame(self):
         self._open()
         if self._backend == "picamera2":
@@ -200,8 +272,10 @@ class CameraService:
         with self._lock:
             return {
                 "backend": self._backend,
+                "model": self.model,
                 "enabled": self._enabled,
                 "connected": self._camera is not None,
+                "sensor_mode": self.sensor_mode,
                 "error": self.error,
                 "detector": self.detector_status,
                 "detections": self.last_detections,

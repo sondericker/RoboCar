@@ -16,6 +16,17 @@ logger = logging.getLogger(__name__)
 GPIOZERO_PING_SECONDS = 0.06
 RANGE_QUEUE_LENGTH = 3
 GPIOZERO_DEFAULT_QUEUE_LENGTH = 9
+# The TF-Luna lidar on the head, in I2C mode (its pin 5 tied to ground).
+# Registers 0-5 hold the latest frame: distance (cm), signal strength and
+# chip temperature (hundredths of a degree), little-endian. It measures 100
+# times a second; a reading is one frame. Below 100 the signal is too weak
+# to trust (dark or distant surface), and 65535 means the receiver is
+# saturated (a mirror or retroreflector straight on).
+TFLUNA_ADDRESS = 0x10
+TFLUNA_MIN_STRENGTH = 100
+TFLUNA_SATURATED = 0xFFFF
+TFLUNA_MAX_RANGE_CM = 800
+TFLUNA_FRAME_SECONDS = 0.01
 
 
 class RangeSensor(Protocol):
@@ -85,6 +96,57 @@ class FreenoveRangeSensor:
                 sys.path.remove(self._server_path)
 
 
+class TFLunaRangeSensor:
+    """Benewake TF-Luna single-point lidar: a 2 degree beam, 0.2-8 m."""
+
+    # A reading taken one frame after the head moved shows the new direction
+    # only (there is no running median to forget).
+    settle_seconds = TFLUNA_FRAME_SECONDS
+
+    def __init__(self, bus: int = 1, address: int = TFLUNA_ADDRESS) -> None:
+        try:
+            from smbus2 import SMBus
+        except ImportError:
+            from smbus import SMBus  # Raspberry Pi OS's python3-smbus
+        self._bus = SMBus(bus)
+        self._address = address
+        self._lock = threading.Lock()
+        self.strength: int | None = None
+        self.temperature_c: float | None = None
+        try:
+            # Fail now, not on the first sample, if it is not there.
+            self.get_distance()
+        except Exception:
+            self._bus.close()
+            raise
+
+    def get_distance(self) -> float | None:
+        with self._lock:
+            # One combined transaction, so traffic from the motor board on
+            # the same bus cannot come between register address and data.
+            data = self._bus.read_i2c_block_data(self._address, 0x00, 6)
+        distance = data[0] | data[1] << 8
+        strength = data[2] | data[3] << 8
+        self.strength = strength
+        self.temperature_c = round((data[4] | data[5] << 8) / 100.0, 1)
+        return lidar_distance(distance, strength)
+
+    def details(self) -> dict[str, object]:
+        return {"signal": self.strength, "temperature_c": self.temperature_c}
+
+    def close(self) -> None:
+        self._bus.close()
+
+
+def lidar_distance(distance_cm: int, strength: int) -> float | None:
+    """A TF-Luna frame's distance, or None when the frame is not to be trusted."""
+    if strength < TFLUNA_MIN_STRENGTH or strength >= TFLUNA_SATURATED:
+        return None
+    if not 0 < distance_cm <= TFLUNA_MAX_RANGE_CM:
+        return None
+    return float(distance_cm)
+
+
 class RangeSensorController:
     def __init__(
         self,
@@ -93,10 +155,12 @@ class RangeSensorController:
         sample_interval: float = 0.2,
         *,
         fault: str | None = None,
+        name: str = "Ultrasonic",
     ) -> None:
         if sample_interval <= 0:
             raise ValueError("sample_interval must be greater than 0")
         self._driver = driver
+        self._name = name
         self._physical = physical
         self._sample_interval = sample_interval
         self._lock = threading.Lock()
@@ -110,7 +174,7 @@ class RangeSensorController:
         if driver is not None:
             self._sampler = threading.Thread(
                 target=self._sample_loop,
-                name="range-sensor",
+                name=f"range-sensor-{name.lower()}",
                 daemon=True,
             )
             self._sampler.start()
@@ -130,7 +194,21 @@ class RangeSensorController:
                 "distance_cm": self._distance_cm,
                 "error": self._error,
                 "updated_at": self._updated_at,
+                **self._details(),
             }
+
+    def _details(self) -> dict[str, object]:
+        details = getattr(self._driver, "details", None)
+        if details is None:
+            return {}
+        try:
+            return dict(details())
+        except Exception:
+            return {}
+
+    def details(self) -> dict[str, object]:
+        """Extra facts about the latest reading (a lidar's signal strength)."""
+        return self._details()
 
     def sample_now(self) -> float | None:
         if self._driver is None:
@@ -175,7 +253,7 @@ class RangeSensorController:
                 with self._lock:
                     previous_error = self._error
                 if error != previous_error:
-                    logger.exception("Ultrasonic range reading failed")
+                    logger.exception("%s range reading failed", self._name)
 
             with self._lock:
                 self._distance_cm = float(distance) if distance is not None else None

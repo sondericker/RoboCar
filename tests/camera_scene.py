@@ -46,6 +46,7 @@ class RoomScene:
         width: int = 320,
         height: int = 240,
         pixels_per_cm: float = 4.0,
+        hfov_deg: float = CAMERA_HORIZONTAL_FOV_DEGREES,
     ) -> None:
         rng = np.random.default_rng(seed)
         self.walls = [(np.array(start, dtype=float), np.array(end, dtype=float)) for start, end in walls]
@@ -76,7 +77,7 @@ class RoomScene:
         textures.append(np.full((rows, 4), 90, dtype=np.uint8))
         textures.append(np.full((rows, 4), 170, dtype=np.uint8))
         self.atlas = np.hstack(textures)
-        self.focal = width / (2 * math.tan(math.radians(CAMERA_HORIZONTAL_FOV_DEGREES) / 2))
+        self.focal = width / (2 * math.tan(math.radians(hfov_deg) / 2))
 
     def view(self, pose, pan_offset_deg: float = 0.0) -> bytes:
         x, y, heading = pose

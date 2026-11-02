@@ -29,11 +29,16 @@ from typing import Callable, Mapping, Sequence
 
 import numpy as np
 
-from robocar.surfaces import SONAR_MAX_RANGE_CM, direction, sonar_origin
+from robocar.surfaces import direction, item_max_range, sonar_origin
 
-# The OV5647 in the 640x480 mode RoboCar uses reads almost the full sensor
-# width (2560 of 2592 pixels): about 53 degrees across.
-CAMERA_HFOV_DEG = 53.0
+# The camera faces forward on the chassis: the HQ camera (IMX477, 6.29 mm
+# wide sensor, read in full) behind a 6 mm lens, 2 atan(6.29 / 2 / 6), about
+# 55.3 degrees across. (The OV5647 it replaced was about 53.) Change this
+# with the lens.
+CAMERA_HFOV_DEG = 55.3
+# The OV5647 on the pan head (mapping's camera): 3.68 mm of sensor width
+# behind a 3.6 mm lens, about 53.5 degrees across.
+HEAD_CAMERA_HFOV_DEG = 53.5
 DYNAMIC_LABELS = frozenset({"person", "cat", "dog", "bird", "horse", "sheep", "cow", "teddy bear"})
 # Things that stay put and help say where the car is and what room it is in.
 LANDMARK_LABELS = frozenset(
@@ -60,6 +65,12 @@ ROOM_HINTS: dict[str, dict[str, float]] = {
 MIN_CONFIDENCE = 0.4
 # Sonar readings this far either side of a detection's edges belong to it.
 RANGE_MARGIN_DEG = 4.0
+# Lidar readings across the middle of a detection's box (the edges show
+# what is behind it); the object is the nearest range at least this many
+# of them agree on within LIDAR_CLUSTER_CM (a stray reading is ignored).
+LIDAR_BOX_SHARE = 0.7
+LIDAR_CLUSTER_CM = 12.0
+LIDAR_CLUSTER_MIN = 2
 # Readings toward a person or pet, out to this far beyond the nearest one,
 # are theirs rather than the wall behind.
 DYNAMIC_DEPTH_CM = 40.0
@@ -129,7 +140,22 @@ def _reading(item: Mapping[str, object]) -> float | None:
     value = item.get("distance_cm")
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
-    return float(value) if value <= SONAR_MAX_RANGE_CM else None
+    return float(value) if value <= item_max_range(item) else None
+
+
+def _object_range(readings: Sequence[float], lidar: bool) -> float | None:
+    """The range to an object from the readings across it."""
+    if not readings:
+        return None
+    if not lidar:
+        # The sonar's wide beam reports the nearest thing in it anyway.
+        return min(readings)
+    ordered = sorted(readings)
+    for index, value in enumerate(ordered):
+        group = [other for other in ordered[index:] if other - value <= LIDAR_CLUSTER_CM]
+        if len(group) >= min(LIDAR_CLUSTER_MIN, len(ordered)):
+            return float(np.median(group))
+    return None
 
 
 def sightings_from(
@@ -137,9 +163,13 @@ def sightings_from(
     frame_width: int,
     camera_bearing_deg: float,
     scan: Sequence[Mapping[str, object]],
+    hfov_deg: float = CAMERA_HFOV_DEG,
 ) -> list[Sighting]:
     """Detections in a picture taken facing `camera_bearing_deg` (relative to
-    the car), with ranges from the sweep where it measured them."""
+    the car) by a camera `hfov_deg` across, with ranges from the sweep where
+    it measured them: from a lidar sweep, the readings across the middle of
+    the object."""
+    lidar = any(item.get("sensor") == "lidar" for item in scan)
     sightings = []
     for detection in detections:
         label = str(detection.get("label", ""))
@@ -147,18 +177,20 @@ def sightings_from(
         if confidence < MIN_CONFIDENCE or (label not in DYNAMIC_LABELS and label not in LANDMARK_LABELS):
             continue
         x, y, width, height = (int(value) for value in detection["box"])
-        left = pixel_bearing(x, frame_width)
-        right = pixel_bearing(x + width, frame_width)
+        left = pixel_bearing(x, frame_width, hfov_deg)
+        right = pixel_bearing(x + width, frame_width, hfov_deg)
         bearing = camera_bearing_deg + (left + right) / 2
         half_width = abs(left - right) / 2
+        # Never narrower than a reading either side of the centre.
+        window = max(1.0, half_width * LIDAR_BOX_SHARE) if lidar else half_width + RANGE_MARGIN_DEG
         ranges = [
             reading
             for item in scan
             if (reading := _reading(item)) is not None
-            and abs(float(item["angle_deg"]) - bearing) <= half_width + RANGE_MARGIN_DEG
+            and abs(float(item["angle_deg"]) - bearing) <= window
         ]
         sightings.append(
-            Sighting(label, confidence, bearing, half_width, min(ranges) if ranges else None, (x, y, width, height))
+            Sighting(label, confidence, bearing, half_width, _object_range(ranges, lidar), (x, y, width, height))
         )
     return sightings
 

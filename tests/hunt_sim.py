@@ -6,6 +6,11 @@ The camera sees the cat only inside its field of view, within 4 m and with
 nothing in the way; the sonar echoes off it like a post. The cat wanders now
 and then and reacts to the car's moves (to all of them, or only to the kinds
 it likes), and never sits closer than 25 cm to a wall.
+
+Like the real car's camera feed, the view is always current: `sighting()`
+is what the camera shows now, and with interrupts on, a cat coming into
+view ends a turn, move or sweep at once (checked every tenth of a second).
+Steady motion set with `command()` happens while time passes in `wait()`.
 """
 
 import math
@@ -15,12 +20,25 @@ import numpy as np
 
 from explore_sim import FloorPlan, NO_ECHO_CM, ROOM_A, CORRIDOR, ROOM_B
 from robocar.exploration import CoverageGrid
-from robocar.hunt import CAMERA_HFOV_DEG, DEFAULT_SIZE_SCALE, PERSON_AHEAD_DEG, CatView, Look, pan_bearing
+from robocar.drive import (
+    FORWARD_CM_PER_SECOND_AT_FULL_DUTY,
+    MOTOR_DEADBAND_FRACTION,
+    STRAFE_CM_PER_SECOND_AT_FULL_DUTY,
+    TURN_DEGREES_PER_SECOND_AT_FULL_DUTY,
+)
+from robocar.hunt import CAMERA_HFOV_DEG, DEFAULT_SIZE_SCALE, PERSON_AHEAD_DEG, CatView, Look, Sighting, pan_bearing
 from robocar.surfaces import SONAR_BEAM_WIDTH_DEGREES, direction, sonar_origin
 
 CAT_RADIUS_CM = 10.0
 TOUCH_CM = 20.0
 CAR_RADIUS_CM = 15.0
+FEED_CHECK_SECONDS = 0.1
+HEAD_SECONDS_PER_DEGREE = 0.002
+
+
+def speed_fraction(command: float) -> float:
+    effective = max(0.0, abs(command) - MOTOR_DEADBAND_FRACTION) / (1 - MOTOR_DEADBAND_FRACTION)
+    return math.copysign(effective, command)
 
 
 def build_map(floor: FloorPlan) -> CoverageGrid:
@@ -79,8 +97,13 @@ class SimCat:
 
 
 class SimHuntBody:
-    def __init__(self, floor: FloorPlan, grid: CoverageGrid, pose, cat: SimCat, rng: random.Random, landmarks=()):
+    def __init__(
+        self, floor: FloorPlan, grid: CoverageGrid, pose, cat: SimCat, rng: random.Random, landmarks=(), camera_fixed=True, lidar=False
+    ):
         self.floor = floor
+        # A lidar on the head beside the sonar: precise ranges on a 2 degree beam.
+        self.lidar = lidar
+        self.precise_ranges = 0
         self._grid = grid
         self.truth = tuple(float(v) for v in pose)
         self.cat = cat
@@ -97,8 +120,15 @@ class SimHuntBody:
         self.observations = 0
         self.looks = 0
         self.stop_at = math.inf
-        self._swept_at = None
-        self.sweep_looks_used = 0
+        # Like the real car: the camera fixed facing forward (or on the head).
+        self.camera_fixed = camera_fixed
+        self.interrupts = False
+        self._spotted = None
+        self.interrupted = 0  # actions a cat sighting cut short
+        self.first_visible_at = None  # when the cat first came into the camera's view
+        self.command_now = (0.0, 0.0, 0.0)
+        self.commanded_seconds = 0.0  # time spent driving on steady commands
+        self._react_clock = 0.0
 
     # -- time -----------------------------------------------------------------
     def now(self) -> float:
@@ -110,8 +140,57 @@ class SimHuntBody:
         self.cat.idle(seconds)
 
     def wait(self, seconds: float) -> bool:
-        self._spend(max(0.0, seconds))
+        remaining = max(0.0, seconds)
+        while remaining > 1e-9:
+            dt = min(0.05, remaining)
+            remaining -= dt
+            if self.command_now != (0.0, 0.0, 0.0):
+                self._drive_for(dt)
+            self._spend(dt)
+            if self.command_now != (0.0, 0.0, 0.0):
+                self._feed()
         return not self.stopped()
+
+    def command(self, throttle: float, strafe: float, steering: float) -> None:
+        self.command_now = (float(throttle), float(strafe), float(steering))
+
+    def halt(self) -> None:
+        self.command_now = (0.0, 0.0, 0.0)
+
+    def _drive_for(self, dt: float) -> None:
+        throttle, strafe, steering = self.command_now
+        self.commanded_seconds += dt
+        heading = direction(self.truth[2])
+        right = np.array([heading[1], -heading[0]])
+        velocity = (
+            heading * FORWARD_CM_PER_SECOND_AT_FULL_DUTY * speed_fraction(throttle)
+            + right * STRAFE_CM_PER_SECOND_AT_FULL_DUTY * speed_fraction(strafe)
+        )
+        candidate = np.array(self.truth[:2]) + velocity * dt
+        if self.person is not None and throttle > 0:
+            offset = np.array(self.person) - np.array(self.truth[:2])
+            bearing = math.degrees(math.atan2(-offset[0], offset[1]))
+            if abs((bearing - self.truth[2] + 180) % 360 - 180) <= 25 and np.linalg.norm(offset) < 150:
+                self.moves_toward_person += 1
+        hit = self._collide(candidate)
+        if hit == "wall":
+            self.bumps += 1
+            self.command_now = (0.0, 0.0, 0.0)
+            return
+        if hit == "cat":
+            self.touches += 1
+            self.command_now = (0.0, 0.0, 0.0)
+            return
+        turn = TURN_DEGREES_PER_SECOND_AT_FULL_DUTY * speed_fraction(steering) * dt
+        self.truth = (float(candidate[0]), float(candidate[1]), self.truth[2] + turn)
+        self._track_cat()
+        self.cat.car = self.truth[:2]
+        # The cat notices a car driving about now and then.
+        self._react_clock += dt
+        if self._react_clock >= 1.0:
+            self._react_clock = 0.0
+            kind = "turn" if abs(throttle) < 0.05 and abs(strafe) < 0.05 else "forward" if throttle > 0 else "strafe"
+            self.cat.reacts_to(kind, self._cat_distance())
 
     def stopped(self) -> bool:
         return self.t >= self.stop_at
@@ -132,10 +211,52 @@ class SimHuntBody:
         return False
 
     def look(self, pan: int) -> Look:
-        self.pan = pan
+        self._point(pan)
         self.looks += 1
-        self._spend(0.25)
-        return self._view(pan)
+        self._spend(0.07)  # the next frame
+        return self._view(self._camera_pan())
+
+    def camera_pans(self) -> bool:
+        return not self.camera_fixed
+
+    def _camera_pan(self) -> int:
+        return 90 if self.camera_fixed else self.pan
+
+    def _point(self, pan: int) -> None:
+        if pan != self.pan:
+            self._spend(0.05 + HEAD_SECONDS_PER_DEGREE * abs(pan - self.pan))
+            self.pan = pan
+
+    def sighting(self) -> Sighting:
+        pan = self._camera_pan()
+        return Sighting(self.t, pan, self.truth, self._view(pan), self.command_now != (0.0, 0.0, 0.0))
+
+    def interrupt_on_cat(self, enabled: bool) -> None:
+        self.interrupts = enabled
+        self._spotted = None
+
+    def spotted(self):
+        return self._spotted
+
+    def clear_spotted(self) -> None:
+        self._spotted = None
+
+    def _feed(self) -> bool:
+        """What the continuous feed sees now: True if a cat sighting should
+        interrupt the current action."""
+        pan = self._camera_pan()
+        look = self._view(pan)
+        if look.cat is not None:
+            if self.first_visible_at is None:
+                self.first_visible_at = self.t
+            self._spotted = Sighting(self.t, pan, self.truth, look, True)
+            if self.interrupts:
+                self.interrupted += 1
+                return True
+        return False
+
+    def knows_where_it_is(self) -> bool:
+        return True
 
     def _view(self, pan: int) -> Look:
         camera = sonar_origin(self.truth)
@@ -156,9 +277,44 @@ class SimHuntBody:
             person_ahead = abs((bearing - self.truth[2] + 180) % 360 - 180) <= PERSON_AHEAD_DEG and np.linalg.norm(offset) < 150
         return Look(cat, person_ahead)
 
-    def ping(self, pan: int) -> float | None:
-        self.pan = pan
-        self._spend(0.1)
+    def ping(self, pan: int, precise: bool = False) -> float | None:
+        self._point(pan)
+        self._spend(0.04 if self.lidar else 0.1)
+        return self._range(pan, precise)
+
+    def range_ahead(self, precise: bool = False) -> float | None:
+        self._point(90)
+        return self._range(90, precise)
+
+    def ranges_precisely(self) -> bool:
+        return self.lidar
+
+    def _range(self, pan: int, precise: bool = False) -> float | None:
+        if not self.lidar:
+            return self._sonar_range(pan)
+        lidar = self._lidar_range(pan)
+        if precise:
+            self.precise_ranges += 1
+            return lidar
+        sonar = self._sonar_range(pan)
+        return min(value for value in (lidar, sonar) if value is not None) if lidar is not None or sonar is not None else None
+
+    def _lidar_range(self, pan: int) -> float | None:
+        angle = pan_bearing(pan)
+        best = self.floor.sonar.lidar_distance(self.truth, angle)
+        origin = sonar_origin(self.truth)
+        for thing, radius in ((np.array([self.cat.x, self.cat.y]), CAT_RADIUS_CM), (None if self.person is None else np.array(self.person), 15.0)):
+            if thing is None:
+                continue
+            offset = thing - origin
+            distance = float(np.linalg.norm(offset))
+            bearing = math.degrees(math.atan2(-offset[0], offset[1]))
+            half = math.degrees(math.atan2(radius, max(distance, 1.0))) + 1.0
+            if abs((bearing - self.truth[2] - angle + 180) % 360 - 180) <= half:
+                best = distance - radius if best is None else min(best, distance - radius)
+        return None if best is None else round(best + self.rng.gauss(0.0, 1.5), 1)
+
+    def _sonar_range(self, pan: int) -> float | None:
         angle = pan_bearing(pan)
         wall = self.floor.sonar.distance(self.truth, angle)
         best = NO_ECHO_CM if wall is None else wall
@@ -175,18 +331,16 @@ class SimHuntBody:
         return best
 
     def observe(self) -> None:
+        """A sonar sweep, the head passing 33 to 150; the feed watches throughout."""
         self.observations += 1
-        self._spend(10.0)
+        for pan in range(33, 151, 9):
+            self.pan = pan
+            self._spend(10.0 / 14)
+            if self._feed():
+                self.pan = 90
+                return
+        self.pan = 90
         self._grid.integrate(self.floor.scan(self.truth), self.truth, SONAR_BEAM_WIDTH_DEGREES)
-        self._swept_at = (self.truth, self.t)
-
-    def sweep_looks(self, pans) -> dict:
-        """What the sweep's pictures showed, while the car stands where it took them."""
-        swept, self._swept_at = self._swept_at, None
-        if swept is None or swept[0] != self.truth:
-            return {}
-        self.sweep_looks_used += 1
-        return {pan: self._view(pan) for pan in pans}
 
     def pose(self):
         return self.truth
@@ -214,8 +368,16 @@ class SimHuntBody:
         self.closest_cat = min(self.closest_cat, self._cat_distance())
 
     def turn(self, degrees: float, precise: bool) -> bool:
-        self.truth = (self.truth[0], self.truth[1], self.truth[2] + degrees)
-        self._spend(abs(degrees) / 150.0 + (0.8 if precise else 0.2))
+        step = math.copysign(min(abs(degrees), 15.0), degrees)
+        turned = 0.0
+        while abs(turned) < abs(degrees) - 1e-9:
+            piece = math.copysign(min(abs(step), abs(degrees) - abs(turned)), degrees)
+            self.truth = (self.truth[0], self.truth[1], self.truth[2] + piece)
+            turned += piece
+            self._spend(abs(piece) / 150.0)
+            if self._feed():
+                break
+        self._spend(0.8 if precise else 0.2)
         self.cat.car = self.truth[:2]
         self.cat.reacts_to("turn", self._cat_distance())
         return not self.stopped()
@@ -231,8 +393,10 @@ class SimHuntBody:
             if abs((bearing - self.truth[2] + 180) % 360 - 180) <= 25 and np.linalg.norm(offset) < 150:
                 self.moves_toward_person += 1
         position = np.array(self.truth[:2], float)
+        start = np.array(self.truth[:2], float)
+        since_check = 0.0
         for fraction in np.linspace(0, 1, max(2, int(length / 2) + 1))[1:]:
-            candidate = np.array(self.truth[:2]) + step_vector * fraction
+            candidate = start + step_vector * fraction
             hit = self._collide(candidate)
             if hit == "wall":
                 self.bumps += 1
@@ -240,7 +404,13 @@ class SimHuntBody:
             if hit == "cat":
                 self.touches += 1
                 break
+            since_check += float(np.linalg.norm(candidate - position))
             position = candidate
+            if since_check >= 50.0 * speed * FEED_CHECK_SECONDS:
+                since_check = 0.0
+                self.truth = (float(position[0]), float(position[1]), self.truth[2])
+                if self._feed():
+                    break
         self.truth = (float(position[0]), float(position[1]), self.truth[2])
         self._spend(length / (50.0 * speed) + 0.25)
         self._track_cat()
@@ -264,6 +434,8 @@ class SimHuntBody:
                 break
             self.truth = (float(candidate[0]), float(candidate[1]), self.truth[2] + steering * 384.0 * 0.05)
             self._track_cat()
+            if _ % 2 and self._feed():
+                break
         self._spend(seconds + 0.2)
         self.cat.car = self.truth[:2]
         self.cat.reacts_to("strafe", self._cat_distance())

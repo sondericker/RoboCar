@@ -49,7 +49,9 @@ def _inside(point, box, margin: float = 0.0) -> bool:
 
 
 class FloorPlan:
-    def __init__(self) -> None:
+    def __init__(self, sensor: str = "sonar") -> None:
+        self.sensor = sensor
+        self._rng = np.random.default_rng(3)
         self.sonar = SonarRoom(walls=FLOOR_WALLS, posts=())
         self.segments = [tuple(map(np.array, wall)) for wall in FLOOR_WALLS]
         cells = []
@@ -60,6 +62,8 @@ class FloorPlan:
         self.floor = np.unique(np.array(cells), axis=0)
 
     def scan(self, pose) -> list[dict[str, object]]:
+        if self.sensor == "lidar":
+            return self.sonar.lidar_scan(pose, rng=self._rng)
         readings = self.sonar.scan(pose, SWEEP_ANGLES)
         for reading in readings:
             if reading["distance_cm"] is None or reading["distance_cm"] > NO_ECHO_CM:
@@ -109,9 +113,9 @@ class FloorPlan:
         return seen / len(cells)
 
 
-def explore(moves: int = 60, plan=plan_explore_step, start=START, on_sweep=None):
+def explore(moves: int = 60, plan=plan_explore_step, start=START, on_sweep=None, sensor: str = "sonar"):
     """Run the planner on the floor plan; returns per-move coverage and the run."""
-    floor = FloorPlan()
+    floor = FloorPlan(sensor)
     grid = CoverageGrid()
     pose = start
     turns_without_progress = backup_bursts = 0
@@ -140,7 +144,7 @@ def explore(moves: int = 60, plan=plan_explore_step, start=START, on_sweep=None)
             backup_bursts = 0
             just_backed_up = False
             if step.distance_cm > 0:
-                ahead = floor.sonar.distance(pose, 0.0)
+                ahead = floor.sonar.lidar_distance(pose, 0.0) if sensor == "lidar" else floor.sonar.distance(pose, 0.0)
                 ahead = NO_ECHO_CM if ahead is None else ahead
                 if ahead - step.distance_cm >= AUTO_WALL_STANDOFF_CM:
                     pose, bumped = floor.drive(pose, step.distance_cm)

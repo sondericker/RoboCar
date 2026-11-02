@@ -345,6 +345,21 @@
     }
     const coverageImage = new Image();
     let coverageStamp = null;
+    // The lidar's points (one per 2.5 cm), fetched when the map changes.
+    let cloudPoints = [];
+    let cloudStamp = null;
+    async function loadCloud(map) {
+      if (!map.cloud_points) { cloudPoints = []; return; }
+      const stamp = `${map.run_id}-${map.scan_count}-${map.path.length}-${map.cloud_points}`;
+      if (stamp === cloudStamp) return;
+      cloudStamp = stamp;
+      try {
+        const response = await fetch("/api/mapping/cloud", {cache: "no-store"});
+        if (!response.ok) return;
+        cloudPoints = (await response.json()).points;
+        if (lastMap) drawSurfaceMap(lastMap);
+      } catch (_) { cloudStamp = null; }
+    }
     let lastMap = null;
     function loadCoverage(map) {
       if (!map.grid) return;
@@ -358,6 +373,7 @@
       const {width, height} = prepareMapCanvas();
       const bounds = [{x: 0, y: 0}];
       map.echoes.forEach(([x, y]) => bounds.push({x, y}));
+      cloudPoints.forEach(([x, y]) => bounds.push({x, y}));
       map.path.forEach(([x, y]) => bounds.push({x, y}));
       map.history.forEach(path => path.forEach(([x, y]) => bounds.push({x, y})));
       map.surfaces.forEach(surface => bounds.push(
@@ -398,10 +414,20 @@
         mapContext.beginPath(); mapContext.moveTo(target.x - 10, target.y); mapContext.lineTo(target.x + 10, target.y);
         mapContext.moveTo(target.x, target.y - 10); mapContext.lineTo(target.x, target.y + 10); mapContext.stroke();
       }
-      mapContext.fillStyle = "rgba(242, 179, 93, .35)";
-      for (const echo of map.echoes) {
-        const point = toScreen(echo);
-        mapContext.fillRect(point.x - 1, point.y - 1, 2, 2);
+      // Lidar points: sharp, one per 2.5 cm, drawn at least a pixel each.
+      if (cloudPoints.length) {
+        const size = Math.max(1, Math.min(3, 2.5 * scale));
+        mapContext.fillStyle = "rgba(236, 243, 247, .85)";
+        for (const cloudPoint of cloudPoints) {
+          const point = toScreen(cloudPoint);
+          mapContext.fillRect(point.x - size / 2, point.y - size / 2, size, size);
+        }
+      } else {
+        mapContext.fillStyle = "rgba(242, 179, 93, .35)";
+        for (const echo of map.echoes) {
+          const point = toScreen(echo);
+          mapContext.fillRect(point.x - 1, point.y - 1, 2, 2);
+        }
       }
 
       const surfaces = new Map(map.surfaces.map(surface => [surface.id, surface]));
@@ -521,14 +547,16 @@
       document.getElementById("map-caption").textContent =
         `Run ${(map.run_id || "").slice(0, 8)} · ${map.surfaces.length} surfaces ` +
         `(${confirmedSurfaces} confirmed) in ${map.contours.length} contours · ` +
-        `${map.features.length} point features · ${map.scan_count} sweeps · beam ${map.beam_width_deg}° · ` +
+        `${map.features.length} point features · ${map.scan_count} sweeps · ` +
+        (map.cloud_points ? `${map.cloud_points} lidar points · ` : `sonar beam ${map.beam_width_deg}° · `) +
         `pose ±${map.pose_sigma_cm.toFixed(1)} cm, ±${map.heading_sigma_deg.toFixed(1)}°. ` +
         (map.history.length ? `${map.history.length} earlier session(s) joined · ` : "") +
         (map.links.length ? `${map.links.length} recognized place(s) · ` : "") +
         (map.grid ? `${(100 * map.grid.explored).toFixed(0)}% of the grid known · ` : "") +
         (landmarks.length ? `${landmarks.length} object(s) recognized` +
           (rooms.length ? ` (${rooms.map(room => room.name).join(", ")})` : "") + " · " : "") +
-        "Solid = confirmed, dashed = seen once, dots = raw echoes, purple = recognized places, " +
+        (map.cloud_points ? "White dots = lidar points, " : "Dots = raw sonar echoes, ") +
+        "solid = confirmed, dashed = seen once, purple = recognized places, " +
         "teal = swept free space, gold = unexplored edges, crosshair = where it is heading, " +
         "violet = objects and rooms the camera recognized.";
     }
@@ -544,10 +572,27 @@
       const originX = width / 2;
       const originY = height - 36;
       const scale = Math.min((width * 0.46) / maxDistance, (height * 0.82) / maxDistance);
+      const lidarScan = scans.some(item => item.sensor === "lidar");
+      if (lidarScan) {
+        // A lidar sweep: a reading every degree, drawn as the room's outline.
+        const ordered = [...scans].sort((a, b) => b.angle_deg - a.angle_deg);
+        mapContext.fillStyle = "rgba(42, 154, 144, .25)";
+        mapContext.beginPath(); mapContext.moveTo(originX, originY);
+        for (const item of ordered) {
+          const ray = heading(item.angle_deg);
+          mapContext.lineTo(originX + ray.x * item.distance_cm * scale, originY - ray.y * item.distance_cm * scale);
+        }
+        mapContext.closePath(); mapContext.fill();
+        mapContext.fillStyle = "#ecf3f7";
+        for (const item of ordered) {
+          const ray = heading(item.angle_deg);
+          mapContext.fillRect(originX + ray.x * item.distance_cm * scale - 1, originY - ray.y * item.distance_cm * scale - 1, 2, 2);
+        }
+      }
       mapContext.strokeStyle = "#2a9a90";
       mapContext.fillStyle = "#a9e8d7";
       mapContext.lineWidth = 1;
-      for (const item of scans) {
+      for (const item of lidarScan ? [] : scans) {
         const ray = heading(item.angle_deg);
         const x = originX + ray.x * item.distance_cm * scale;
         const y = originY - ray.y * item.distance_cm * scale;
@@ -557,9 +602,9 @@
       mapContext.fillStyle = "#ecf3f7";
       mapContext.beginPath(); mapContext.arc(originX, originY, 6, 0, Math.PI * 2); mapContext.fill();
       document.getElementById("map-caption").textContent =
-        `Single local scan · ${scans.length} valid directions · scale fitted to ${maxDistance.toFixed(0)} cm`;
+        `Single local ${lidarScan ? "lidar" : "sonar"} scan · ${scans.length} valid directions · scale fitted to ${maxDistance.toFixed(0)} cm`;
     }
-    const visionOrder = ["stop", "motion", "turn", "place"];
+    const visionOrder = ["stop", "lidar", "objects", "motion", "turn", "place", "panorama"];
     const visionShown = {};
     async function refreshVision() {
       try {
@@ -604,6 +649,7 @@
         if (map.path.length || map.surfaces.length || map.features.length) {
           lastMap = map;
           loadCoverage(map);
+          loadCloud(map);
           drawSurfaceMap(map);
         } else {
           drawScan(data.observations[data.observations.length - 1] || null);
@@ -616,7 +662,9 @@
       const last = mapping.localization;
       const sources = ["wheels"];
       if (last?.visual_used) sources.push(last.side_views ? "camera + side views" : "camera");
-      if (last?.registration?.accepted) sources.push(`sonar fit (${last.registration.matches} echoes)`);
+      const sensor = last?.sensor || "sonar";
+      if (last?.registration?.accepted) sources.push(`${sensor} wall fit (${last.registration.matches} echoes)`);
+      else if (last?.grid_match?.used) sources.push(`${sensor} fit to the map (${last.grid_match.hits} points)`);
       const place = mapping.last_place;
       const recognized = place
         ? ` · recognized ${place.kind === "relocalized" ? "a place from an earlier session" : "a place visited before"}` +
@@ -788,12 +836,21 @@
           tiltInput.value = head.tilt;
           document.getElementById("tilt-value").value = `${head.tilt}°`;
         }
-        const range = status.range;
-        document.getElementById("range-status").textContent =
-          !range.enabled ? "Range finder disabled (hardware not enabled)" :
-            range.error ? `Range finder error: ${range.error}` :
-            range.distance_cm === null ? "Waiting for range reading…" :
-            `Distance: ${range.distance_cm.toFixed(1)} cm`;
+        const range = status.range, lidar = status.lidar;
+        const sonarText =
+          !range.enabled ? "Sonar disabled (hardware not enabled)" :
+            range.error ? `Sonar: ${range.error}` :
+            range.distance_cm === null ? "Sonar: waiting for a reading…" :
+            `Sonar: ${range.distance_cm.toFixed(1)} cm`;
+        const lidarText =
+          !lidar ? "Lidar: not fitted" :
+            !lidar.enabled ? `Lidar unavailable${lidar.fault ? ": " + lidar.fault : ""}` :
+            lidar.error ? `Lidar: ${lidar.error === "No echo received" ? "no trusted return" : lidar.error}` +
+              (lidar.signal != null ? ` (signal ${lidar.signal})` : "") :
+            lidar.distance_cm === null ? "Lidar: waiting for a reading…" :
+            `Lidar: ${lidar.distance_cm.toFixed(0)} cm · signal ${lidar.signal ?? "?"}` +
+              (lidar.temperature_c != null ? ` · ${lidar.temperature_c.toFixed(0)} °C` : "");
+        document.getElementById("range-status").textContent = `${lidarText} · ${sonarText}`;
         updatePower(status.power);
         updateWhere(status.mapping.localized);
         updateMappingControls(status.mapping);
@@ -886,7 +943,8 @@
         : status.end_reason ? `${END_REASONS[status.end_reason] || status.end_reason} ${status.action ? "(" + status.action + ")" : ""}` : "Not hunting.";
       const cat = status.cat;
       document.getElementById("hunt-cat").textContent = !cat ? (running ? "Cat not in sight." : "")
-        : `Cat ${cat.distance_cm === null ? "at an unknown distance" : `about ${cat.distance_cm} cm away`}, ` +
+        : `Cat ${cat.distance_cm === null ? "at an unknown distance"
+            : cat.distance_from === "lidar" ? `${cat.distance_cm} cm away (lidar)` : `about ${cat.distance_cm} cm away (camera)`}, ` +
           `${Math.abs(cat.bearing_deg) < 5 ? "straight ahead" : `${Math.abs(cat.bearing_deg).toFixed(0)}° ${cat.bearing_deg > 0 ? "left" : "right"}`}` +
           ` · seen ${cat.seen_seconds_ago < 1.5 ? "just now" : `${cat.seen_seconds_ago.toFixed(0)} s ago`}`;
       const stats = status.stats;
@@ -918,10 +976,15 @@
       }
       const hasPicture = Boolean(huntFrameAt);
       const age = data.frame_age_seconds;
+      const camera = data.camera || {};
+      const feed = camera.fps
+        ? ` Watching ${camera.fps.toFixed(0)} frames a second (exposure ${camera.exposure_ms} ms, gain ${camera.gain}; ` +
+          `at most ${camera.moving_cap_ms} ms while moving).`
+        : "";
       document.getElementById("hunt-feed-age").textContent = !hasPicture ? ""
         : !running ? "Last picture from the hunt."
-        : age < 2 ? "Live picture."
-        : `Picture from ${age.toFixed(0)} s ago (the car is sweeping or moving; a new one comes once it is still).`;
+        : age < 2 ? `Live picture.${feed}`
+        : `Picture from ${age.toFixed(0)} s ago.${feed}`;
       huntFeed.hidden = !hasPicture;
       document.getElementById("hunt-feed-placeholder").hidden = hasPicture;
     }
@@ -929,8 +992,8 @@
       try {
         updateHunt(await (await fetch("/api/hunt", {cache: "no-store"})).json());
       } catch (_) { /* the next poll will try again */ }
-      // Twice a second while hunting, for a lively picture; once a second otherwise.
-      setTimeout(refreshHunt, huntRunning ? 500 : 1000);
+      // About three times a second while hunting, for a lively picture; once a second otherwise.
+      setTimeout(refreshHunt, huntRunning ? 300 : 1000);
     }
     huntToggle.addEventListener("click", async () => {
       const starting = huntToggle.dataset.running !== "true";

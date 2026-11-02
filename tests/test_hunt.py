@@ -25,7 +25,8 @@ from robocar.mapping import MappingController, MappingStore
 from robocar.range_sensor import RangeSensorController
 from robocar.web import create_app
 
-SIDEWAYS_MOVES = {"sidestep", "shimmy", "orbit", "zigzag"}
+SIDEWAYS_MOVES = {"sidestep", "shimmy", "orbit", "zigzag", "mouse"}  # mouse darts sideways
+HUNT_STILL_SECONDS_FOR_TESTS = 0.4  # a little longer than the car takes to count as still
 
 
 class HouseHunt(unittest.TestCase):
@@ -36,9 +37,9 @@ class HouseHunt(unittest.TestCase):
         cls.floor = FloorPlan()
         cls.grid = build_map(cls.floor)
 
-    def hunt(self, car, cat_at, seed, seconds, cat=None, memory=None, person=None):
+    def hunt(self, car, cat_at, seed, seconds, cat=None, memory=None, person=None, camera_fixed=True):
         cat = cat or SimCat(self.floor, cat_at, random.Random(seed))
-        body = SimHuntBody(self.floor, copy.deepcopy(self.grid), car, cat, random.Random(seed + 1))
+        body = SimHuntBody(self.floor, copy.deepcopy(self.grid), car, cat, random.Random(seed + 1), camera_fixed=camera_fixed)
         body.person = person
         engine = HuntEngine(body, memory or HuntMemory(), rng=random.Random(seed + 2), session_seconds=seconds)
         true_distances = []
@@ -63,6 +64,13 @@ class SeekingTests(HouseHunt):
         self.assertEqual(body.bumps, 0)
         self.assertEqual(body.touches, 0)
         self.assertEqual(reason, "time_limit")
+
+    def test_a_camera_on_the_head_still_works(self):
+        engine, body, cat, reason, _ = self.hunt((0.0, -40.0, 0.0), (-520.0, 150.0), 31, 300, camera_fixed=False)
+        found = next((s["elapsed_seconds"] for s in body.statuses if s["phase"] in ("approaching", "playing")), None)
+        self.assertIsNotNone(found, "never found the cat")
+        self.assertEqual(body.bumps, 0)
+        self.assertEqual(body.touches, 0)
 
     def test_a_remembered_haunt_is_searched_first(self):
         memory = HuntMemory()
@@ -158,9 +166,20 @@ class PlayingTests(HouseHunt):
             self.assertEqual(body.moves_toward_person, 0, f"seed {seed}")
             self.assertEqual(body.touches, 0, f"seed {seed}")
 
-    def test_looking_around_after_a_stop_uses_the_sweep_pictures(self):
-        engine, body, *_ = self.hunt((0.0, -40.0, 0.0), (-520.0, 150.0), 31, 120)
-        self.assertGreater(body.sweep_looks_used, 0)
+    def test_the_moment_the_cat_is_seen_the_car_goes_after_it(self):
+        for seed, cat_at in ((31, (-520.0, 150.0)), (41, (90.0, 110.0)), (51, (-300.0, 80.0))):
+            engine, body, *_ = self.hunt((0.0, -40.0, 0.0), cat_at, seed, 240)
+            self.assertIsNotNone(body.first_visible_at, f"seed {seed}: the cat never came into view")
+            chasing = next((st["elapsed_seconds"] for st in body.statuses if st["phase"] == "approaching"), None)
+            self.assertIsNotNone(chasing, f"seed {seed}: never went after the cat")
+            # No finishing the turn or sweep first: after it within moments.
+            self.assertLess(chasing - body.first_visible_at, 1.0, f"seed {seed}")
+
+    def test_it_drives_while_looking_instead_of_stopping_to_sweep(self):
+        engine, body, *_ = self.hunt((0.0, -40.0, 0.0), (-520.0, 150.0), 31, 240)
+        self.assertEqual(body.observations, 0)  # it knew where it was: no sweeps at all
+        self.assertGreater(body.commanded_seconds, 10.0)
+        self.assertEqual(body.bumps, 0)
 
 
 class PartsTests(unittest.TestCase):
@@ -243,146 +262,191 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(calls[3][1], {"steering": 0.1, "strafe": 0.7})
 
 
-class HuntPictureTests(unittest.TestCase):
-    """Pictures wait for the car to be still; the preview never interrupts."""
+class HuntBodyTests(unittest.TestCase):
+    """The real car's hunt body: eyes on the feed, interruptible actions."""
 
     def setUp(self):
         import cv2
         import numpy as np
 
-        self.events = []
-        events = self.events
-        image = cv2.imencode(".jpg", np.full((480, 640, 3), 90, np.uint8))[1].tobytes()
+        self.frames = []
+        frames = self.frames
+        self.cat_visible = True
+        test = self
+        picture = np.full((480, 640, 3), 90, np.uint8)
 
         class Camera:
+            def capture_frame(self):
+                import time
+
+                frames.append(time.monotonic())
+                time.sleep(0.01)
+                return picture.copy()
+
             def capture_snapshot(self):
-                events.append(("picture", __import__("time").monotonic()))
-                return image
+                return cv2.imencode(".jpg", picture)[1].tobytes()
+
+            def set_exposure(self, settings):
+                test.exposure = settings
 
         class Detector:
             available = True
 
             def detect(self, frame):
-                return [{"label": "cat", "confidence": 0.9, "box": [280, 200, 80, 60]}]
+                return [{"label": "cat", "confidence": 0.9, "box": [280, 200, 80, 60]}] if test.cat_visible else []
 
         drive = DriveController(SimulatedDriver(), max_duty=4095, command_timeout=1, physical=True)
         pan_tilt = PanTiltController(SimulatedPanTilt(), physical=True)
-        sensor = RangeSensorController(None, physical=False)
-        self.mapping = MappingController(Camera(), drive, pan_tilt, sensor, MappingStore(Path(":memory:")), detector=Detector())
-        for resource in (sensor, pan_tilt, drive, self.mapping):
+
+        class Sensor:
+            def get_distance(self):
+                return 120.0
+
+            def close(self):
+                pass
+
+        self.sensor = RangeSensorController(Sensor(), physical=True, sample_interval=0.05)
+        self.mapping = MappingController(Camera(), drive, pan_tilt, self.sensor, MappingStore(Path(":memory:")), detector=Detector())
+        for resource in (self.sensor, pan_tilt, drive, self.mapping):
             self.addCleanup(resource.close)
 
-    def test_a_picture_after_a_move_waits_for_the_car_to_settle(self):
-        import time
-
-        from robocar.mapping import HUNT_STILL_SECONDS, _HuntBody
-
-        body = _HuntBody(self.mapping)
-        with patch.object(self.mapping, "_move_burst", return_value=True):
-            body.move(10.0, 0.0)
-        moved = time.monotonic()
-        look = body.look(body._pan)
-        self.assertIsNotNone(look.cat)
-        first_picture = min(t for kind, t in self.events if kind == "picture")
-        self.assertGreaterEqual(first_picture - moved, HUNT_STILL_SECONDS - 0.02)
-        self.assertIsNotNone(self.mapping.hunt_frame())
-
-    def test_a_hunt_stop_faces_ahead_and_its_sweep_pictures_are_checked_for_the_cat(self):
-        from robocar.hunt import pan_bearing
-        from robocar.mapping import SweepStrip, _HuntBody
-
-        body = _HuntBody(self.mapping)
-        body._point_head(150)
-        mapping = self.mapping
-        picture = mapping._camera.capture_snapshot()
-        pans_at_stop = []
-
-        def stop(mode):
-            pans_at_stop.append(mapping._pan_tilt.status()["pan"])
-            mapping._sweep_strip = SweepStrip(
-                {pan: (picture,) for pan in range(30, 151, 10)}, 90, 100, mapping._drive.odometry()
-            )
-
-        with patch.object(mapping, "_capture_observation", side_effect=stop):
-            body.observe()
-        self.assertEqual(pans_at_stop, [90])
-        looks = body.sweep_looks((30, 60, 90, 120, 150))
-        self.assertEqual(sorted(looks), [30, 60, 90, 120, 150])
-        for pan, look in looks.items():
-            self.assertIsNotNone(look.cat)
-            self.assertAlmostEqual(look.cat.bearing_deg, pan_bearing(pan), delta=5.0)
-        self.assertEqual(body.sweep_looks((90,)), {})  # used once
-        # Not after the car has moved since.
-        with patch.object(mapping, "_capture_observation", side_effect=stop):
-            body.observe()
-        with patch.object(mapping._drive, "odometry", return_value=(0.0, 30.0, 0.0)):
-            self.assertEqual(body.sweep_looks((90,)), {})
-
-    def test_the_preview_only_shoots_when_the_car_is_idle_and_still(self):
-        from robocar.mapping import HUNT_STILL_SECONDS, _HuntBody
-
-        body = _HuntBody(self.mapping)
-        with body._acting():
-            body.preview()
-        self.assertEqual(self.events, [])  # busy: no picture
-        body.preview()
-        self.assertEqual(self.events, [])  # just moved: not still yet
-        body._still_since -= HUNT_STILL_SECONDS + 0.1
-        body.preview()
-        self.assertTrue(self.events)
-        self.assertIsNotNone(self.mapping.hunt_frame())
-
-
-class SharpPictureTests(unittest.TestCase):
-    def test_a_blurred_picture_is_retaken_and_the_settle_delay_learned(self):
-        import cv2
-        import numpy as np
-
+    def body(self):
         from robocar.mapping import _HuntBody
 
-        rng = np.random.default_rng(3)
-        scene = (rng.random((480, 640, 3)) * 255).astype(np.uint8)
-        sharp = cv2.imencode(".jpg", scene)[1].tobytes()
-        smeared = cv2.imencode(".jpg", cv2.blur(scene, (25, 1)))[1].tobytes()  # sideways motion blur
-        shots = []
+        body = _HuntBody(self.mapping)
+        body.start()
+        self.addCleanup(body.close)
+        return body
 
-        class Camera:
-            def __init__(self):
-                self.queue = []
+    def test_a_look_is_the_next_frame_after_the_head_has_turned(self):
+        import time
+
+        body = self.body()
+        body.look(150)
+        pointed = time.monotonic()
+        look = body.look(150)
+        self.assertIsNotNone(look.cat)
+        self.assertTrue(any(at >= pointed - 0.02 for at in self.frames))
+        self.assertIsNotNone(self.mapping.hunt_frame())  # the dashboard's live picture
+        camera = self.mapping.hunt_status()["camera"]
+        self.assertEqual(camera, {})  # filled in by reports while hunting
+        body.report({"phase": "seeking", "action": "test"})
+        self.assertGreater(self.mapping.hunt_status()["camera"]["fps"], 0)
+        self.assertIn("exposure_ms", self.mapping.hunt_status()["camera"])
+
+    def test_a_cat_cuts_a_move_or_turn_short_without_stopping_the_hunt(self):
+        import time
+
+        body = self.body()
+        self.cat_visible = False
+        body.interrupt_on_cat(True)
+        with patch.object(self.mapping._drive, "status", wraps=self.mapping._drive.status):
+            started = time.monotonic()
+            threading_timer = __import__("threading").Timer(0.3, lambda: setattr(self, "cat_visible", True))
+            threading_timer.start()
+            self.assertTrue(self.mapping._move_burst(0.4, 5.0))  # ends early, and is not a failure
+            self.assertLess(time.monotonic() - started, 2.0)
+        self.assertIsNotNone(body.spotted())
+        self.assertFalse(body.stopped())
+        self.assertTrue(self.mapping._turn_by(90.0))  # still interrupted: returns at once
+        body.clear_spotted()
+        body.interrupt_on_cat(False)
+        self.assertFalse(self.mapping._interrupt.is_set())
+
+    def test_a_sweep_is_cut_short_by_a_cat(self):
+        body = self.body()
+        body.interrupt_on_cat(True)
+        self.mapping._interrupt.set()
+        scan, _ = self.mapping._sweep(100, 90, ())
+        self.assertIsNone(scan)
+
+    def test_steady_commands_and_the_sonar_ahead(self):
+        body = self.body()
+        body.look(150)
+        self.assertEqual(body.range_ahead(), 120.0)
+        self.assertEqual(body._pan, 90)  # turned to face ahead
+        body.command(0.3, 0.0, 0.05)
+        self.assertAlmostEqual(self.mapping._drive.status()["throttle"], 0.3)
+        self.assertTrue(body._moving())
+        body.halt()
+        self.assertEqual(self.mapping._drive.status()["throttle"], 0)
+
+    def test_a_fixed_camera_looks_ahead_whatever_the_head_does(self):
+        self.mapping.camera_on_head = False
+        body = self.body()
+        self.assertFalse(body.camera_pans())
+        look = body.look(150)
+        self.assertIsNotNone(look.cat)
+        sighting = body.sighting()
+        self.assertEqual(sighting.pan, 90)
+        self.assertAlmostEqual(sighting.look.cat.bearing_deg, 0.0, delta=3.0)  # the cat is ahead, not 60 degrees right
+
+    def test_with_two_cameras_the_hunt_watches_through_the_forward_one(self):
+        import numpy as np
+
+        head_frames = []
+
+        class HeadCamera:
+            def capture_frame(self):
+                head_frames.append(1)
+                return np.zeros((480, 640, 3), np.uint8)
 
             def capture_snapshot(self):
-                picture = self.queue.pop(0) if self.queue else sharp
-                shots.append(picture)
-                return picture
+                return None
 
-        class Detector:
-            available = True
-
-            def detect(self, frame):
-                return []
-
-        camera = Camera()
+        forward = self.mapping._camera
         drive = DriveController(SimulatedDriver(), max_duty=4095, command_timeout=1, physical=True)
         pan_tilt = PanTiltController(SimulatedPanTilt(), physical=True)
-        sensor = RangeSensorController(None, physical=False)
-        mapping = MappingController(camera, drive, pan_tilt, sensor, MappingStore(Path(":memory:")), detector=Detector())
-        for resource in (sensor, pan_tilt, drive, mapping):
+        mapping = MappingController(
+            HeadCamera(), drive, pan_tilt, self.sensor, MappingStore(Path(":memory:")),
+            detector=self.mapping._detector, camera_on_head=True, hunt_camera=forward,
+        )
+        for resource in (pan_tilt, drive, mapping):
             self.addCleanup(resource.close)
+        from robocar.mapping import _HuntBody
+
         body = _HuntBody(mapping)
-        with patch.object(mapping, "_wait_until_steady", return_value=True):
-            body._look_now()  # learns how sharp a still picture here looks
-            delay = body.still_seconds
-            camera.queue = [smeared]
-            shots.clear()
-            body._look_now()
-            self.assertEqual(shots, [smeared, sharp])  # retaken, the sharp one kept
-            self.assertEqual(body.retakes, 1)
-            self.assertGreater(body.still_seconds, delay)  # motion blur: wait longer from now on
-            longer = body.still_seconds
-            for _ in range(5):
-                body._look_now()
-            self.assertLess(body.still_seconds, longer)  # sharp first shots: back down again
-        self.assertEqual(mapping.hunt_status()["camera"], {})  # only reported while hunting
+        body.start()
+        self.addCleanup(body.close)
+        self.assertFalse(body.camera_pans())  # the forward camera does not turn with the head
+        self.assertTrue(mapping.camera_on_head)  # mapping still pans the head camera
+        look = body.look(150)
+        self.assertIsNotNone(look.cat)
+        self.assertEqual(head_frames, [])  # the head camera was not used for watching
+
+    def test_still_frames_are_offered_for_placing_the_car(self):
+        import time
+
+        self.mapping.camera_on_head = False
+        body = self.body()
+        self.assertIsNotNone(body.watcher.wait_for(time.monotonic(), 2.0))
+        time.sleep(HUNT_STILL_SECONDS_FOR_TESTS)
+        with patch.object(self.mapping, "place_fix_from_picture", return_value={"used": True}) as fix:
+            deadline = time.monotonic() + 2.0
+            result = None
+            while result is None and time.monotonic() < deadline:
+                result = body.try_place_fix()
+                time.sleep(0.05)
+        self.assertEqual(result, {"used": True})
+        jpeg, bearing, odometry = fix.call_args.args
+        self.assertTrue(jpeg.startswith(b"\xff\xd8"))
+        self.assertEqual(bearing, 0.0)  # the fixed camera looks ahead
+        self.assertEqual(len(odometry), 3)
+
+    def test_a_hunt_sweep_shows_a_panorama_from_the_feed(self):
+        import time
+
+        body = self.body()
+
+        def sweep(mode):
+            for pan in range(30, 151, 10):
+                self.mapping._pan_tilt.set_angles(pan, 100)
+                time.sleep(0.05)
+
+        with patch.object(self.mapping, "_capture_observation", side_effect=sweep):
+            body.observe()
+        panels = {panel["name"] for panel in self.mapping.vision_panels()}
+        self.assertIn("panorama", panels)
 
 
 class WebHuntTests(unittest.TestCase):

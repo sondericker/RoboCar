@@ -170,3 +170,50 @@ def render_panorama(views: list[tuple[float, bytes]], hfov_deg: float, title: st
                 cv2.putText(marks, label, (max(0, x - 18), 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (169, 232, 215), 1, cv2.LINE_AA)
                 break
     return _with_caption(np.vstack([panorama, marks]), title, lines)
+
+
+def _range_colour(distance_cm: float) -> tuple[int, int, int]:
+    """Near red through yellow to far blue (BGR), over 0-400 cm."""
+    hue = int(max(0.0, min(1.0, distance_cm / 400.0)) * 120)
+    hsv = np.uint8([[[hue, 230, 255]]])
+    return tuple(int(value) for value in cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0])
+
+
+def render_lidar_overlay(
+    jpeg: bytes,
+    scan: list[dict[str, object]],
+    camera_bearing_deg: float,
+    hfov_deg: float,
+    title: str,
+    lines: list[str],
+) -> bytes | None:
+    """The picture with the lidar's readings where they fall in it: a dot per
+    reading along the middle, coloured by range, and a profile above it
+    (taller is nearer). Shows at a glance whether lidar and camera agree."""
+    thumbnail = _thumbnail(jpeg)
+    if thumbnail is None:
+        return None
+    image, _ = thumbnail
+    height, width = image.shape[:2]
+    focal = (width / 2) / np.tan(np.radians(hfov_deg / 2))
+    middle = height // 2
+    shown = []
+    for item in scan:
+        distance = item.get("distance_cm")
+        if not isinstance(distance, (int, float)) or isinstance(distance, bool):
+            continue
+        relative = float(item["angle_deg"]) - camera_bearing_deg
+        if abs(relative) >= hfov_deg / 2:
+            continue
+        x = int(round(width / 2 - focal * np.tan(np.radians(relative))))
+        shown.append((x, float(distance)))
+    if not shown:
+        return None
+    shown.sort()
+    profile = [(x, int(middle - 6 - min(60.0, 3000.0 / max(distance, 20.0)))) for x, distance in shown]
+    cv2.polylines(image, [np.array(profile, dtype=np.int32)], False, (236, 243, 247), 1, cv2.LINE_AA)
+    for x, distance in shown:
+        cv2.circle(image, (x, middle), 3, _range_colour(distance), -1, cv2.LINE_AA)
+    for x, distance in shown[:: max(1, len(shown) // 5)]:
+        cv2.putText(image, f"{distance:.0f}", (x - 10, middle + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (236, 243, 247), 1, cv2.LINE_AA)
+    return _with_caption(image, title, [f"{len(shown)} lidar readings in view", *lines])

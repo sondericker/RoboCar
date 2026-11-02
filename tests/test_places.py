@@ -1,7 +1,10 @@
 import math
 import tempfile
 import unittest
+
+from robocar.semantics import CAMERA_HFOV_DEG
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from camera_scene import RoomScene
@@ -13,6 +16,7 @@ from robocar.places import (
     PlaceRecognizer,
     PoseGraph,
     information_from_sigma,
+    locate_from_places,
     make_keyframe,
     verify_place,
 )
@@ -108,6 +112,72 @@ class PlaceRecognitionTests(unittest.TestCase):
         query = self.keyframe(9, (10.0, -10.0, 85.0))
         candidates = recognizer.candidates(query, lambda keyframe: True)
         self.assertEqual(candidates[0][0].observation_id, 2)
+
+
+class CameraFixTests(unittest.TestCase):
+    """Placing the car from its camera picture alone, against remembered places."""
+
+    def test_a_live_picture_places_the_car_from_remembered_places(self):
+        # The forward HQ camera's view.
+        scene = RoomScene(ROOM_WALLS, hfov_deg=CAMERA_HFOV_DEG)
+        places = {1: (0.0, 0.0, 0.0), 2: (40.0, 30.0, 20.0), 3: (-40.0, 20.0, -25.0), 4: (0.0, 60.0, 10.0), 5: (60.0, -20.0, 35.0)}
+        recognizer = PlaceRecognizer()
+        for node, pose in places.items():
+            recognizer.add(make_keyframe(node, "run", scene.view(pose, 0.0), 0.0, CAMERA_HFOV_DEG))
+        truth = (30.0, 0.0, 5.0)
+        query = make_keyframe(-1, "run", scene.view(truth, 0.0), 0.0, CAMERA_HFOV_DEG)
+        fix = locate_from_places(query, recognizer, places, (45.0, -10.0, 5.0))
+        self.assertIsNotNone(fix)
+        self.assertGreaterEqual(len(fix.places), 2)
+        self.assertLess(math.hypot(fix.position[0] - truth[0], fix.position[1] - truth[1]), 12.0)
+        self.assertLess(abs(fix.heading_deg - truth[2]), 3.0)
+
+    def synthetic(self, truth, places, wrong=()):
+        """Matches as a perfect camera would report them (or `wrong` ones)."""
+        from robocar.places import PlaceMatch
+
+        def verify(remembered, query):
+            place = places[remembered.observation_id]
+            yaw = truth[2] - place[2] + (25.0 if remembered.observation_id in wrong else 0.0)
+            bearing = math.degrees(math.atan2(-(truth[0] - place[0]), truth[1] - place[1])) - place[2]
+            return PlaceMatch(remembered.observation_id, yaw, bearing, 100, 120)
+
+        class Recognizer:
+            def candidates(self, query, allowed, limit=8):
+                return [(keyframe, 50) for keyframe in keyframes if allowed(keyframe)][:limit]
+
+        keyframes = [SimpleNamespace(observation_id=node) for node in places]
+        return Recognizer(), verify
+
+    def test_one_confidently_wrong_match_is_outvoted(self):
+        truth = (20.0, 30.0, 40.0)
+        places = {1: (0.0, 0.0, 10.0), 2: (80.0, 20.0, 90.0), 3: (10.0, 90.0, -60.0)}
+        recognizer, verify = self.synthetic(truth, places, wrong={3})
+        fix = locate_from_places(SimpleNamespace(), recognizer, places, truth, verify=verify)
+        self.assertEqual(sorted(fix.places), [1, 2])
+        self.assertAlmostEqual(fix.heading_deg, 40.0, delta=0.1)
+        self.assertAlmostEqual(fix.position[0], 20.0, delta=0.5)
+        self.assertAlmostEqual(fix.position[1], 30.0, delta=0.5)
+
+    def test_no_fix_without_two_agreeing_places_seeing_it_from_different_sides(self):
+        truth = (20.0, 30.0, 40.0)
+        one = {1: (0.0, 0.0, 10.0)}
+        recognizer, verify = self.synthetic(truth, one)
+        self.assertIsNone(locate_from_places(SimpleNamespace(), recognizer, one, truth, verify=verify))
+        # Two places in line with the car: their directions do not cross.
+        in_line = {1: (0.0, 0.0, 10.0), 2: (10.0, 15.0, 10.0)}
+        recognizer, verify = self.synthetic(truth, in_line)
+        self.assertIsNone(locate_from_places(SimpleNamespace(), recognizer, in_line, truth, verify=verify))
+        # Disagreeing headings.
+        apart = {1: (0.0, 0.0, 10.0), 2: (80.0, 20.0, 90.0)}
+        recognizer, verify = self.synthetic(truth, apart, wrong={2})
+        self.assertIsNone(locate_from_places(SimpleNamespace(), recognizer, apart, truth, verify=verify))
+
+    def test_places_far_from_where_the_car_thinks_it_is_are_not_considered(self):
+        truth = (20.0, 30.0, 40.0)
+        places = {1: (0.0, 0.0, 10.0), 2: (80.0, 20.0, 90.0)}
+        recognizer, verify = self.synthetic(truth, places)
+        self.assertIsNone(locate_from_places(SimpleNamespace(), recognizer, places, (900.0, 900.0, 0.0), verify=verify))
 
 
 class SimulatedHouse:

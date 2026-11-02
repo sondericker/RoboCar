@@ -30,10 +30,12 @@ import cv2
 import numpy as np
 
 from robocar.surfaces import (
+    LIDAR,
     SONAR_BEAM_WIDTH_DEGREES,
     SONAR_FORWARD_OFFSET_CM,
     SONAR_MAX_RANGE_CM,
     direction,
+    scan_model,
     sonar_origin,
 )
 
@@ -125,7 +127,8 @@ KINDS = ("open", "doorway", "edge", "lead")
 # around the best. A match is good with at least MATCH_GOOD_SCORE agreement
 # and MATCH_MIN_HITS hits, and only when nothing farther than
 # MATCH_UNIQUE_CM / MATCH_UNIQUE_DEG from it scores within MATCH_MIN_MARGIN
-# of it (chosen on simulated sweeps so every match passing it was right).
+# of it. (Both chosen on simulated sweeps in two layouts, checked on a third:
+# every match passing them was within 20 cm and 8 degrees.)
 MATCH_HIT_CM = 10.0
 MATCH_SPREAD_CM = 5.0
 MATCH_SEARCH_STEP_CM = 4.0
@@ -138,8 +141,13 @@ MATCH_GOOD_SCORE = 0.6
 MATCH_UNIQUE_CM = 12.0
 MATCH_UNIQUE_DEG = 6.0
 MATCH_MIN_MARGIN = 0.035
+# ...and only when it explains most of the sweep: a fit resting on part of
+# it is held loosely and can come out twisted.
+MATCH_MIN_HIT_SHARE = 0.7
 # Tries across the sonar's beam for where each echo came from.
 MATCH_BEAM_RAYS = 5
+LIDAR_MATCH_HIT_CM = 7.0
+LIDAR_MATCH_SPREAD_CM = 3.0
 MATCH_BEAM_HALF_DEG = SONAR_BEAM_WIDTH_DEGREES / 2
 MATCH_CHUNK_POSES = 48
 # Obstacles count for matching once confirmed: one echo marks an arc across
@@ -191,10 +199,15 @@ class ScanMatch:
     judged: int  # hits plus echoes landing on floor mapped as empty
     prior_score: float  # the same share at the pose it started from
     margin: float  # how much better it fits than the best pose well away from it
+    echoes: int  # usable echoes in the sweep
 
     @property
     def good(self) -> bool:
-        return self.margin >= MATCH_MIN_MARGIN and self.score >= MATCH_GOOD_SCORE and self.hits >= MATCH_MIN_HITS
+        return (
+            self.margin >= MATCH_MIN_MARGIN
+            and self.score >= MATCH_GOOD_SCORE
+            and self.hits >= max(MATCH_MIN_HITS, MATCH_MIN_HIT_SHARE * self.echoes)
+        )
 
     def summary(self) -> dict[str, object]:
         return {
@@ -204,6 +217,7 @@ class ScanMatch:
             "judged": self.judged,
             "prior_score": round(self.prior_score, 2),
             "margin": round(self.margin, 3),
+            "echoes": self.echoes,
             "good": self.good,
         }
 
@@ -336,7 +350,11 @@ class ExplorationLearner:
 
 
 def _echo_runs(
-    readings: Sequence[tuple[float, float]], pose: Sequence[float], origin: np.ndarray, beam_width_deg: float
+    readings: Sequence[tuple[float, float]],
+    pose: Sequence[float],
+    origin: np.ndarray,
+    beam_width_deg: float,
+    max_range_cm: float = SONAR_MAX_RANGE_CM,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """Walls implied by runs of neighbouring echoes at similar ranges, each
     extended WALL_EXTEND_CM past its ends, as (start, end) segments.
@@ -346,7 +364,7 @@ def _echo_runs(
     as the beam sees a flat wall instead: at sweep angle a, a wall at
     distance d whose normal points at angle n reads d / cos(max(0, |a - n| - half
     the beam width))."""
-    echoes = sorted((angle, distance) for angle, distance in readings if distance <= SONAR_MAX_RANGE_CM)
+    echoes = sorted((angle, distance) for angle, distance in readings if distance <= max_range_cm)
     angles = sorted(angle for angle, _ in readings)
     step = min((b - a for a, b in zip(angles, angles[1:]) if b > a), default=3.0)
     half = beam_width_deg / 2
@@ -388,14 +406,17 @@ def _echo_runs(
 
 
 def _openings(
-    readings: Sequence[tuple[float, float]], pose: Sequence[float], origin: np.ndarray
+    readings: Sequence[tuple[float, float]],
+    pose: Sequence[float],
+    origin: np.ndarray,
+    max_range_cm: float = SONAR_MAX_RANGE_CM,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """Openings in a sweep: stretches reading clearly deeper than readings on
     both sides within LEAD_SIDE_DEGREES (the beam smears an opening's edges,
     so they deepen gradually). Returns each opening's mouth (at the nearer
     sides' distance, in the middle of the stretch) and the direction into it."""
     ordered = sorted(readings)
-    depth = [min(distance, SONAR_MAX_RANGE_CM + 50.0) for _, distance in ordered]
+    depth = [min(distance, max_range_cm + 50.0) for _, distance in ordered]
     angles = [angle for angle, _ in ordered]
     mouths: list[float | None] = []
     for index, (angle, here) in enumerate(zip(angles, depth)):
@@ -472,6 +493,9 @@ class CoverageGrid:
         self.looks = np.zeros((0, 0), dtype=np.uint8)
         # Openings seen in sweeps: (mouth point, direction into it).
         self.leads: list[tuple[np.ndarray, np.ndarray]] = []
+        # How far a sweep sees, for judging what a vantage point would show:
+        # the sonar's reach, or the lidar's once a lidar sweep comes in.
+        self.view_range_cm = SONAR_MAX_RANGE_CM
 
     def _ensure(self, points: np.ndarray) -> None:
         low = points.min(axis=0)
@@ -509,22 +533,39 @@ class CoverageGrid:
         )
 
     def integrate(self, scan: Sequence[Mapping[str, object]], pose: Sequence[float], beam_width_deg: float) -> None:
+        """Add a sweep seen from `pose`. A sonar sweep is read with
+        `beam_width_deg`; a lidar sweep (see surfaces.scan_model) with its
+        own narrow beam, whatever is passed."""
+        model = scan_model(scan)
+        lidar = model is LIDAR
+        if lidar:
+            beam_width_deg = model.beam_width_deg
+            self.view_range_cm = max(self.view_range_cm, model.max_cm)
         origin = sonar_origin(pose)
         readings: list[tuple[float, float]] = []
         for item in scan:
             distance = item.get("distance_cm")
             if isinstance(distance, bool) or not isinstance(distance, (int, float)) or not math.isfinite(distance):
                 continue
+            if distance < model.min_cm:
+                continue
             readings.append((float(item["angle_deg"]), float(distance)))
-        walls_seen = _echo_runs(readings, pose, origin, beam_width_deg)
-        for mouth, into in _openings(readings, pose, origin):
+        # Light does not bounce off glancing walls the way sound does, so a
+        # lidar sweep needs no implied walls to stop its rays.
+        walls_seen = [] if lidar else _echo_runs(readings, pose, origin, beam_width_deg, model.max_cm)
+        for mouth, into in _openings(readings, pose, origin, model.max_cm):
             if all(np.linalg.norm(mouth - other) > LEAD_MERGE_CM for other, _ in self.leads):
                 self.leads.append((mouth, into))
         # (direction, distance cleared, distance of the echo or None)
         rays: list[tuple[np.ndarray, float, float | None]] = []
         for angle, distance in readings:
-            echo = distance if distance <= SONAR_MAX_RANGE_CM else None
-            reach = min(distance, SONAR_MAX_RANGE_CM)
+            echo = distance if distance <= model.max_cm else None
+            reach = min(distance, model.max_cm)
+            if lidar:
+                # A trusted lidar reading past its mapping range still says
+                # the way is clear that far.
+                rays.append((direction(float(pose[2]) + angle), reach, echo))
+                continue
             # The beam's core clears space; only the centre line marks the echo.
             for offset in (-beam_width_deg / 4, 0.0, beam_width_deg / 4):
                 ray = direction(float(pose[2]) + angle + offset)
@@ -532,6 +573,13 @@ class CoverageGrid:
                     origin, ray, reach if echo is not None else min(reach, NO_ECHO_FREE_CM), walls_seen
                 )
                 rays.append((ray, ray_reach, echo if offset == 0.0 else None))
+        if lidar:
+            # Between neighbouring lidar readings, clear space out to the
+            # nearer one, so far floor is not left in unswept slivers.
+            ordered = sorted(readings)
+            for (first, near), (second, far) in zip(ordered, ordered[1:]):
+                if second - first <= 3.0:
+                    rays.append((direction(float(pose[2]) + (first + second) / 2), min(near, far, model.max_cm), None))
         footprint = np.array(pose[:2], dtype=float)
         ends = [origin + ray * (echo + LOOK_BEHIND_ECHO_CM if echo is not None else reach) for ray, reach, echo in rays]
         ends += [footprint + ROBOT_RADIUS_CM, footprint - ROBOT_RADIUS_CM, origin]
@@ -661,7 +709,7 @@ class CoverageGrid:
         step = math.radians(GAIN_RAY_STEP_DEGREES)
         half = math.radians(GAIN_HALF_VIEW_DEGREES)
         angles = math.radians(heading_deg) + np.arange(-half, half + 1e-9, step)
-        steps = np.arange(self.cell, SONAR_MAX_RANGE_CM, self.cell)
+        steps = np.arange(self.cell, self.view_range_cm, self.cell)
         xs = point[0] + np.outer(-np.sin(angles), steps)
         ys = point[1] + np.outer(np.cos(angles), steps)
         columns = np.floor((xs - self.origin[0]) / self.cell).astype(int)
@@ -809,13 +857,14 @@ class CoverageGrid:
         20 cm and 8 degrees; `good` (a clear winner) picks out ones that do."""
         if not self.log_odds.size:
             return None
+        model = scan_model(scan)
         readings = [
             (float(item["angle_deg"]), float(value))
             for item in scan
             if isinstance(value := item.get("distance_cm"), (int, float))
             and not isinstance(value, bool)
             and math.isfinite(value)
-            and 3.0 <= value <= SONAR_MAX_RANGE_CM
+            and max(3.0, model.min_cm) <= value <= model.max_cm
         ]
         if len(readings) < MATCH_MIN_POINTS:
             return None
@@ -825,8 +874,18 @@ class CoverageGrid:
         if not obstacles.any():
             return None
         gap = cv2.distanceTransform((~obstacles).astype(np.uint8), cv2.DIST_L2, 5) * self.cell
-        closeness = np.where(gap <= MATCH_HIT_CM, np.exp(-0.5 * (gap / MATCH_SPREAD_CM) ** 2), 0.0)
-        context = (angles, ranges, closeness, self.free())
+        # A lidar point lands within a few cm of where it should, so it is
+        # judged more strictly (which also makes a wrong fit stand out).
+        hit_cm, spread_cm = (LIDAR_MATCH_HIT_CM, LIDAR_MATCH_SPREAD_CM) if model is LIDAR else (MATCH_HIT_CM, MATCH_SPREAD_CM)
+        closeness = np.where(gap <= hit_cm, np.exp(-0.5 * (gap / spread_cm) ** 2), 0.0)
+        # A sonar echo may come from anywhere across its beam; a lidar
+        # reading from its centre line.
+        beam = (
+            np.zeros(1)
+            if model is LIDAR
+            else np.radians(np.linspace(-1.0, 1.0, MATCH_BEAM_RAYS) * MATCH_BEAM_HALF_DEG)
+        )
+        context = (angles, ranges, closeness, self.free(), beam, model is LIDAR)
 
         searched = self._match_poses(pose, search_cm, search_deg, MATCH_SEARCH_STEP_CM, MATCH_SEARCH_STEP_DEG)
         searched_scores, _, _ = self._score_poses(searched, *context)
@@ -850,6 +909,7 @@ class CoverageGrid:
             int(judged[best]),
             float(prior_score[0]),
             score - float(searched_scores[far].max(initial=0.0)),
+            len(readings),
         )
 
     @staticmethod
@@ -873,13 +933,16 @@ class CoverageGrid:
         ranges: np.ndarray,
         closeness: np.ndarray,
         free: np.ndarray,
+        beam: np.ndarray | None = None,
+        every_echo: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """(score, hits, judged) for each pose. Each echo's end is tried
         across the middle of the beam and scored by how close the best try
         lands to a mapped obstacle; an echo whose every try lands on clear
         floor is a miss, and one ending in unexplored space is not judged."""
         rows, columns = free.shape
-        beam = np.radians(np.linspace(-1.0, 1.0, MATCH_BEAM_RAYS) * MATCH_BEAM_HALF_DEG)  # B
+        if beam is None:
+            beam = np.radians(np.linspace(-1.0, 1.0, MATCH_BEAM_RAYS) * MATCH_BEAM_HALF_DEG)  # B
         scores = np.zeros(len(poses))
         hits = np.zeros(len(poses), dtype=int)
         judged = np.zeros(len(poses), dtype=int)
@@ -900,8 +963,13 @@ class CoverageGrid:
             count = hit.sum(axis=1) + miss.sum(axis=1)
             judged[start : start + len(chunk)] = count
             hits[start : start + len(chunk)] = hit.sum(axis=1)
+            # A sonar sweep is judged on the echoes the map can say anything
+            # about. A lidar sweep has points to spare, so all of them count:
+            # one ending in unexplored space earns nothing, and a fit cannot
+            # win by pushing most of the sweep off the map.
+            divisor = np.full(len(chunk), len(angles)) if every_echo else np.maximum(count, 1)
             scores[start : start + len(chunk)] = np.where(
-                count >= MATCH_MIN_POINTS, agreement.sum(axis=1) / np.maximum(count, 1), 0.0
+                count >= MATCH_MIN_POINTS, agreement.sum(axis=1) / divisor, 0.0
             )
         return scores, hits, judged
 

@@ -34,9 +34,10 @@ from robocar.mapping import (
     plan_explore_step,
     estimate_camera_yaw_change,
     forward_clearance,
+    fuse_pose,
 )
 from robocar.exploration import CoverageGrid, Frontier, Waypoint
-from robocar.localization import RegistrationResult, compose, relative
+from robocar.localization import RegistrationResult, compose, relative, wrap_degrees
 from robocar.vision_debug import render_matches
 from robocar.range_sensor import RangeSensorController
 from camera_scene import PanoramaScene
@@ -754,12 +755,14 @@ class MappingTests(unittest.TestCase):
     def test_mapping_stops_take_a_strip_and_show_it_as_a_panorama(self):
         mapping, drive, pan_driver, true_heading = self.turning_rig()
         mapping._run_id = "survey"
+        mapping._capture_observation(mode="hunt")
+        self.assertIsNone(mapping._sweep_strip)  # the hunt's camera watcher sees during its sweeps
         # Centred on straight ahead even with the head left looking right.
         mapping._pan_tilt.set_angles(150, 100)
-        mapping._capture_observation(mode="hunt")
-        self.assertEqual(sorted(mapping._sweep_strip.pictures), self.strip_pans())
+        mapping._capture_observation(mode="survey")
         self.assertEqual(min(mapping._sweep_strip.pictures), 30)
         self.assertEqual(max(mapping._sweep_strip.pictures), 150)
+        mapping._pan_tilt.set_angles(90, 100)
         mapping._capture_observation(mode="survey")
         self.assertEqual(sorted(mapping._sweep_strip.pictures), self.strip_pans())
         self.assertEqual(mapping._sweep_strip.odometry, drive.odometry())
@@ -927,25 +930,255 @@ class LocalizedTests(unittest.TestCase):
         mapping._capture_observation(mode="explore")
         self.assertTrue(mapping._move_burst(1.0, 0.15))
         mapping._capture_observation(mode="explore")
-        good = SimpleNamespace(
-            good=True,
-            pose=(1.0, 2.0, 3.0),
-            summary=lambda: {"good": True},
-        )
         rejected = lambda echoes, pose, covariance, surface_map: RegistrationResult(
             tuple(pose), covariance, False, 0, 0.0, (0.0, 0.0, 0.0), "test: walls too cluttered"
         )
+
+        def fit_near(scan, prior_pose, prior_covariance):
+            return SimpleNamespace(
+                good=True,
+                pose=(prior_pose[0] + 6.0, prior_pose[1] - 4.0, prior_pose[2] + 2.0),
+                summary=lambda: {"good": True},
+            )
+
         with mapping._lock:
             mapping._stops_since_fix = None
+            # Unsure, as after a restart.
+            mapping._pose_covariance = np.diag([25.0**2, 25.0**2, math.radians(20.0) ** 2])
         with patch("robocar.mapping.register_scan", side_effect=rejected), patch.object(
-            mapping, "_match_to_grid", return_value=good
+            mapping, "_match_to_grid", side_effect=fit_near
         ):
             mapping._capture_observation(mode="hunt")
         here = mapping.localized()
         self.assertEqual(here["stops_since_fix"], 0)
         self.assertLessEqual(here["sigma_cm"], 12.5)
+        self.assertTrue(here["known"], here)
         latest = mapping.observations()[-1]
-        self.assertEqual(latest["estimate"]["grid_match"], {"good": True})
+        self.assertEqual(latest["estimate"]["grid_match"], {"good": True, "used": True})
+
+    def test_a_grid_fit_far_from_a_confident_estimate_is_not_used(self):
+        mapping, drive, pan_driver = self.room_rig()
+        mapping._run_id = "map"
+        mapping._capture_observation(mode="explore")
+        self.assertTrue(mapping._move_burst(1.0, 0.15))
+        mapping._capture_observation(mode="explore")
+        rejected = lambda echoes, pose, covariance, surface_map: RegistrationResult(
+            tuple(pose), covariance, False, 0, 0.0, (0.0, 0.0, 0.0), "test: walls too cluttered"
+        )
+        twisted = lambda scan, prior_pose, prior_covariance: SimpleNamespace(
+            good=True, pose=(prior_pose[0] + 10.0, prior_pose[1], prior_pose[2] + 25.0), summary=lambda: {"good": True}
+        )
+        with mapping._lock:
+            mapping._pose_covariance = np.diag([8.0**2, 8.0**2, math.radians(4.0) ** 2])
+            before = mapping._stops_since_fix
+        with patch("robocar.mapping.register_scan", side_effect=rejected), patch.object(
+            mapping, "_match_to_grid", side_effect=twisted
+        ):
+            mapping._capture_observation(mode="hunt")
+        latest = mapping.observations()[-1]
+        self.assertEqual(latest["estimate"]["grid_match"], {"good": True, "used": False})
+        self.assertEqual(mapping.localized()["stops_since_fix"], None if before is None else before + 1)
+
+
+class FixedCameraTests(unittest.TestCase):
+    """The camera fixed facing forward on the chassis, not on the pan head."""
+
+    def setUp(self):
+        fast_sweeps(self)
+
+    def controller(self):
+        drive = DriveController(SimulatedDriver(), max_duty=4095, command_timeout=1, physical=True)
+        pan_driver = SimulatedPanTilt()
+        pan_tilt = PanTiltController(pan_driver, physical=True)
+        room = SonarRoom()
+
+        class RoomSensor(FakeRangeSensor):
+            def get_distance(self) -> float | None:
+                return room.distance(drive.odometry(), 90 - pan_driver.pan)
+
+        range_sensor = RangeSensorController(RoomSensor(), physical=True, sample_interval=0.5)
+        mapping = MappingController(
+            FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")), camera_on_head=False
+        )
+        for resource in (range_sensor, pan_tilt, drive, mapping):
+            self.addCleanup(resource.close)
+        return mapping
+
+    def test_stops_take_no_head_pictures_and_pictures_face_ahead(self):
+        mapping = self.controller()
+        mapping._run_id = "fixed"
+        mapping._pan_tilt.set_angles(150, 100)
+        with patch.object(mapping, "_recognize", wraps=mapping._recognize) as recognize:
+            mapping._capture_observation(mode="survey")
+        self.assertIsNone(mapping._sweep_strip)  # no strip: the camera does not pan
+        self.assertEqual(recognize.call_args.args[1], 0.0)  # the picture looks ahead
+        self.assertEqual(mapping._picture_bearing(30), 0.0)
+
+    def test_turns_go_by_the_wheels_and_calibration_says_why_it_is_unavailable(self):
+        mapping = self.controller()
+        with patch.object(mapping, "_turn_by", return_value=True) as turn, patch.object(mapping, "_capture_views") as views:
+            self.assertTrue(mapping._turn_and_align(30.0))
+        turn.assert_called_once_with(30.0)
+        views.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "fixed facing forward"):
+            mapping.start_calibration(True)
+
+    def test_the_setting_comes_from_the_environment(self):
+        from robocar.config import Config
+
+        with patch.dict("os.environ", {"ROBOCAR_CAMERA_ON_HEAD": "1"}):
+            self.assertTrue(Config.from_env().camera_on_head)
+        with patch.dict("os.environ", {}, clear=False):
+            import os
+
+            os.environ.pop("ROBOCAR_CAMERA_ON_HEAD", None)
+            self.assertFalse(Config.from_env().camera_on_head)
+
+
+class ForwardCameraTests(unittest.TestCase):
+    """A second, forward camera: its places and its sightings during mapping."""
+
+    def setUp(self):
+        fast_sweeps(self)
+
+    def controller(self, forward=None):
+        drive = DriveController(SimulatedDriver(), max_duty=4095, command_timeout=1, physical=True)
+        pan_driver = SimulatedPanTilt()
+        pan_tilt = PanTiltController(pan_driver, physical=True)
+        room = SonarRoom()
+
+        class RoomSensor(FakeRangeSensor):
+            def get_distance(self) -> float | None:
+                return room.distance(drive.odometry(), 90 - pan_driver.pan)
+
+        range_sensor = RangeSensorController(RoomSensor(), physical=True, sample_interval=0.5)
+        mapping = MappingController(
+            FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")), hunt_camera=forward
+        )
+        for resource in (range_sensor, pan_tilt, drive, mapping):
+            self.addCleanup(resource.close)
+        mapping._run_id = "forward"
+        return mapping, drive
+
+    def stub_keyframe(self, observation_id, run_id, jpeg, pan_offset, hfov_deg=53.5):
+        from robocar.places import Keyframe
+
+        return Keyframe(observation_id, run_id, pan_offset, 640, 480, np.zeros((40, 2), np.float32), np.zeros((40, 32), np.uint8), hfov_deg)
+
+    def test_stops_keep_forward_places_and_recognize_furniture_in_the_forward_picture(self):
+        class ForwardCamera:
+            def capture_snapshot(self):
+                return b"forward-jpeg"
+
+        mapping, _ = self.controller(ForwardCamera())
+        with patch("robocar.mapping.make_keyframe", side_effect=self.stub_keyframe), patch.object(
+            mapping, "_recognize", return_value=[]
+        ) as recognize:
+            mapping._capture_observation(mode="survey")
+        self.assertEqual(recognize.call_args.args[:2], (b"forward-jpeg", 0.0))
+        forward = mapping._store.forward_keyframes()
+        self.assertEqual(len(forward), 1)
+        self.assertEqual(len(mapping._forward_places.keyframes), 1)
+        self.assertEqual(mapping.status()["forward_places"], 1)
+
+    def test_one_camera_keeps_no_separate_forward_places(self):
+        mapping, _ = self.controller()
+        with patch("robocar.mapping.make_keyframe", side_effect=self.stub_keyframe):
+            mapping._capture_observation(mode="survey")
+        self.assertEqual(mapping._store.forward_keyframes(), [])
+        self.assertIs(mapping._hunt_recognizer(), mapping._places.recognizer)
+
+    def placed(self, fix_position, heading=0.0, places=(1, 2, 3)):
+        from robocar.places import CameraFix
+
+        mapping, drive = self.controller()
+        mapping._capture_observation(mode="survey")
+        with mapping._lock:
+            mapping._stops_since_fix = None
+            mapping._pose_covariance = np.diag([10.0**2, 10.0**2, math.radians(4.0) ** 2])
+        fix = CameraFix(heading, fix_position, tuple(places), 300)
+        with patch("robocar.mapping.make_keyframe", side_effect=self.stub_keyframe), patch(
+            "robocar.mapping.locate_from_places", return_value=fix
+        ):
+            result = mapping.place_fix_from_picture(b"jpeg", 0.0, drive.odometry())
+        return mapping, result
+
+    def test_a_camera_fix_corrects_the_pose_and_counts_as_matching_the_map(self):
+        mapping, result = self.placed((6.0, -4.0), heading=2.0)
+        self.assertTrue(result["used"])
+        here = mapping.localized()
+        self.assertEqual(here["stops_since_fix"], 0)
+        with mapping._lock:
+            pose = mapping._pose
+        self.assertGreater(pose[0], 1.0)  # pulled toward the fix
+        self.assertEqual(mapping.status()["camera_place_fixes"]["used"], 1)
+
+    def test_a_camera_fix_far_from_a_confident_estimate_is_refused(self):
+        mapping, result = self.placed((150.0, 120.0), heading=40.0)
+        self.assertFalse(result["used"])
+        self.assertIsNone(mapping.localized()["stops_since_fix"])
+        self.assertEqual(mapping.status()["camera_place_fixes"]["refused"], 1)
+
+    def test_the_forward_camera_is_watched_while_mapping_only_when_separate(self):
+        class ForwardCamera:
+            def capture_frame(self):
+                return np.zeros((48, 64, 3), np.uint8)
+
+            def capture_snapshot(self):
+                return None
+
+        class Detector:
+            def detect(self, frame):
+                return []
+
+        mapping, _ = self.controller(ForwardCamera())
+        mapping._detector = Detector()
+        mapping._start_mapping_watch()
+        self.assertIsNotNone(mapping._mapping_watcher)
+        self.assertIsNotNone(mapping._mapping_watcher.wait_for(0.0, 2.0))
+        mapping._stop_mapping_watch()
+        self.assertIsNone(mapping._mapping_watcher)
+        single, _ = self.controller()
+        single._detector = Detector()
+        single._start_mapping_watch()
+        self.assertIsNone(single._mapping_watcher)  # one camera: mapping has it to itself
+
+    def test_the_cat_seen_while_mapping_is_remembered_for_the_hunt(self):
+        from robocar.hunt import CatView, Look, Sighting
+
+        class ForwardCamera:
+            def capture_snapshot(self):
+                return None
+
+        mapping, drive = self.controller(ForwardCamera())
+        mapping._capture_observation(mode="survey")
+        spots = len(mapping._hunt_memory.cat_spots)
+        cat = CatView(0.0, mapping._hunt_memory.size_scale / 100.0, 0.9, (300, 200, 80, 60), 640)  # about 100 cm ahead
+        mapping._mapping_sighting(Sighting(10.0, 90, drive.odometry(), Look(cat), False))
+        self.assertEqual(len(mapping._hunt_memory.cat_spots), spots + 1)
+        x, y, _ = mapping._hunt_memory.cat_spots[-1]
+        with mapping._lock:
+            pose = mapping._pose
+        self.assertAlmostEqual(math.hypot(x - pose[0], y - pose[1]), 100.0, delta=15.0)
+        mapping._mapping_sighting(Sighting(11.0, 90, drive.odometry(), Look(cat), False))
+        self.assertEqual(mapping.status()["cats_seen_while_mapping"], 1)  # not again within seconds
+
+
+class FusePoseTests(unittest.TestCase):
+    def test_a_measurement_pulls_the_estimate_by_how_sure_each_is(self):
+        prior = np.diag([10.0**2, 10.0**2, math.radians(5.0) ** 2])
+        measured = np.diag([10.0**2, 10.0**2, math.radians(5.0) ** 2])
+        pose, covariance = fuse_pose((0.0, 0.0, 0.0), prior, (8.0, -4.0, 4.0), measured, 11.34)
+        self.assertAlmostEqual(pose[0], 4.0, places=6)
+        self.assertAlmostEqual(pose[1], -2.0, places=6)
+        self.assertAlmostEqual(pose[2], 2.0, places=6)
+        self.assertAlmostEqual(covariance[0, 0], 50.0, places=6)  # halved
+
+    def test_headings_wrap_and_wild_measurements_are_refused(self):
+        prior = np.diag([10.0**2, 10.0**2, math.radians(5.0) ** 2])
+        pose, _ = fuse_pose((0.0, 0.0, 179.0), prior, (0.0, 0.0, -179.0), prior, 11.34)
+        self.assertAlmostEqual(abs(wrap_degrees(pose[2])), 180.0, delta=1e-6)
+        self.assertIsNone(fuse_pose((0.0, 0.0, 0.0), prior, (0.0, 0.0, 30.0), prior, 11.34))
 
 
 class SlippingRoomTests(unittest.TestCase):
