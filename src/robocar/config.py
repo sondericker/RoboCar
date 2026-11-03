@@ -45,6 +45,17 @@ class Config:
     # on: expected (reported as a fault when missing); off: not used.
     lidar: str = "auto"
     lidar_bus: int = 1
+    # The gyro and accelerometer (MPU-6500 family), on an I2C bus of its own
+    # so it cannot upset the motor board's. auto: used when found; on:
+    # expected (a fault when missing); off: not used. No bus number: the
+    # usual extra buses are searched (2 first: GPIO12/13 with the
+    # i2c2-pi5 overlay).
+    imu: str = "auto"
+    imu_bus: int | None = None
+    # The ultrasonic: auto uses it only without a working lidar (the lidar
+    # does everything better, and the sonar's pings are within a cat's
+    # hearing); on: always (it sees glass and mirrors the lidar misses); off.
+    sonar: str = "auto"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -88,6 +99,13 @@ class Config:
         lidar = os.getenv("ROBOCAR_LIDAR", "auto").strip().lower()
         if lidar not in {"auto", "on", "off"}:
             raise ValueError("ROBOCAR_LIDAR must be 'auto', 'on' or 'off'")
+        imu = os.getenv("ROBOCAR_IMU", "auto").strip().lower()
+        if imu not in {"auto", "on", "off"}:
+            raise ValueError("ROBOCAR_IMU must be 'auto', 'on' or 'off'")
+        imu_bus = os.getenv("ROBOCAR_IMU_BUS", "").strip()
+        sonar = os.getenv("ROBOCAR_SONAR", "auto").strip().lower()
+        if sonar not in {"auto", "on", "off"}:
+            raise ValueError("ROBOCAR_SONAR must be 'auto', 'on' or 'off'")
 
         return cls(
             host=os.getenv("ROBOCAR_HOST", "127.0.0.1"),
@@ -117,4 +135,7 @@ class Config:
             battery_cells=battery_cells,
             lidar=lidar,
             lidar_bus=int(os.getenv("ROBOCAR_LIDAR_BUS", "1")),
+            imu=imu,
+            imu_bus=int(imu_bus) if imu_bus else None,
+            sonar=sonar,
         )

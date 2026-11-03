@@ -24,6 +24,8 @@ The pieces it uses:
 - hunt, calibration, watch: those engines, and the hunt camera's watcher
 """
 
+import copy
+import json
 import logging
 import math
 import statistics
@@ -37,25 +39,30 @@ from typing import Callable, Protocol, Sequence
 import cv2
 import numpy as np
 
-from robocar.calibration import Calibration, CalibrationStore, run_calibration
+from robocar.calibration import Calibration, CalibrationStore, run_calibration, seconds_for
 from robocar.drive import (
     FORWARD_CM_PER_SECOND_AT_FULL_DUTY,
     MOTOR_DEADBAND_FRACTION,
     MOTOR_RAMP_SECONDS,
     TURN_DEGREES_PER_SECOND_AT_FULL_DUTY,
     PAN_LIMITS,
+    CoastModel,
     DriveController,
+    TurnPower,
+    bearing_pan,
     pan_bearing,
+    pan_scale,
+    set_pan_scale,
 )
 from robocar.exploration import SPIN_AWAY_CM, CoverageGrid, load_learner, save_learner
 from robocar.explore_plan import (
     AUTO_HEADING_TOLERANCE_DEGREES,
-    AUTO_LONG_STEP_CM,
     AUTO_MIN_STEP_CM,
     AUTO_TURN_MIN_CLEARANCE_CM,
     AUTO_WALL_STANDOFF_CM,
     CELL_AREA_M2,
     direction_clearances,
+    forward_clearance,
     hazard_within,
     is_lidar_scan,
     plan_explore_step,
@@ -96,19 +103,19 @@ from robocar.places import (
 )
 from robocar.range_sensor import RangeSensorController
 from robocar.pointcloud import CLOUD_CELL_CM, PointCloud, lidar_points
+from robocar.room_plan import MethodRecords
+from robocar.room_plan import choose as choose_option
+from robocar.room_plan import options as room_options
 from robocar.ranging import (
     LIDAR_SAMPLE_INTERVAL_SECONDS,
     LIDAR_SAMPLE_SPREAD_CM,
     LIDAR_SAMPLES_PER_ANGLE,
     LIDAR_SCAN_ANGLES,
     LIDAR_STEP_SETTLE_SECONDS,
-    SCAN_ANGLES,
     SCAN_FIRST_SETTLE_SECONDS,
     SCAN_LEAD_IN_PAN,
-    SCAN_SAMPLE_INTERVAL_SECONDS,
-    SCAN_SAMPLES_PER_ANGLE,
-    SCAN_STEP_SETTLE_SECONDS,
     HeadRanging,
+    estimate_pan_scale,
 )
 from robocar.store import MappingStore
 from robocar.semantics import (
@@ -121,7 +128,7 @@ from robocar.semantics import (
     sightings_from,
     static_scan,
 )
-from robocar.surfaces import IntegrationReport, SurfaceMap, extract_echoes, pose_rotation
+from robocar.surfaces import IntegrationReport, SurfaceMap, extract_echoes, pose_rotation, sweep_seen_from
 from robocar.vision_debug import render_detections, render_features, render_lidar_overlay, render_matches, render_panorama
 from robocar.watch import Watcher
 
@@ -144,7 +151,7 @@ SIDE_MIN_ANGLE_DEGREES = 30
 STOP_SETTLE_SECONDS = 0.75
 AUTO_MAX_SECONDS = 240
 AUTO_MAX_MOVES = 60
-EXPLORE_STRATEGIES = ("frontier", "spin")
+EXPLORE_STRATEGIES = ("room", "frontier", "spin")
 # Spin-and-roam: four sweeps a quarter turn apart make a full circle (each
 # sweep sees 60 degrees either side, so neighbours overlap by 30 degrees and
 # each can be fitted to the last). A quarter whose view the map already
@@ -157,6 +164,21 @@ SPIN_QUARTERS = (90.0, 180.0, 270.0)
 SPIN_TURN_RADIUS_CM = 20.0
 SPIN_SKIP_GAIN_CELLS = 60.0
 SPIN_SWEEP_EVERY_CM = 120.0
+# With turns and distances measured (gyro and accelerometer) the wheels'
+# guess is not what places the car, so it can go further between sweeps.
+SPIN_SWEEP_EVERY_MEASURED_CM = 300.0
+# Long drives are one burst, watched all the way (see _move_burst): stopped
+# when anything ahead comes within the stand-off plus this (the car's
+# stopping distance), when the car veers this far off its line, or when it
+# has not been moving for this long although driving.
+WATCH_STOP_MARGIN_CM = 15.0
+WATCH_MAX_VEER_DEGREES = 20.0
+WATCH_STALL_SECONDS = 1.5
+WATCH_STALL_SPEED_CM_S = 3.0
+TRAVEL_MAX_SECONDS = 8.0
+# Bursts this short use the step timing (calibrated); longer ones the line
+# through measured bursts, or the wheels' speed.
+TRAVEL_FROM_STEPS_CM = 30.0
 SPIN_ARRIVED_CM = 25.0
 SPIN_MAX_LEGS = 12
 SPIN_MAX_SECONDS = 900
@@ -184,6 +206,72 @@ MAPPING_CAT_EVERY_SECONDS = 5.0
 AUTO_TURN_COMMAND = 1.0
 AUTO_TURN_PIECE_DEGREES = 50.0
 AUTO_MAX_TURN_SECONDS = 3.0
+# With a gyro, turns are measured as they happen. After each turn the car
+# waits for it to settle, learns how far it coasted after the motors were
+# cut, and corrects anything left over beyond the tolerance with gentler
+# turns. A turn that has not got going after a while is stuck (a wheel
+# against something) and is given up.
+GYRO_TURN_TOLERANCE_DEGREES = 1.5
+GYRO_TURN_MAX_CORRECTIONS = 3
+# Gyro turns ask for a turn rate and get the power for it from what the gyro
+# has seen (drive.TurnPower): full power spins the car at hundreds of degrees
+# a second within a quarter second, far too fast to stop on a small turn,
+# while too little does not turn it at all. Bigger turns go faster; the
+# corrections afterwards slowly. A turn the gyro sees not starting gets more
+# power, a step at a time.
+GYRO_TURN_RATE_DPS = 150.0
+GYRO_BIG_TURN_RATE_DPS = 220.0
+GYRO_BIG_TURN_DEGREES = 60.0
+GYRO_CORRECTION_RATE_DPS = 50.0
+GYRO_STALL_POWER_STEP = 0.15
+# A turn this long has reached its speed: its peak rate shows what its power does.
+GYRO_LEARN_POWER_SECONDS = 0.6
+# After a gyro turn the car is settled once it turns less than this in a
+# tenth of a second (waiting at most the longer time).
+GYRO_SETTLED_DEGREES = 0.2
+GYRO_SETTLE_MAX_SECONDS = 0.6
+GYRO_STALL_SECONDS = 0.6
+GYRO_STALL_DEGREES = 3.0
+# Rotation scales learned while mapping are kept within these bounds: the
+# wheels' guess may be far out, a gyro's scale only by a few percent.
+WHEEL_ROTATION_SCALE_LIMITS = (0.5, 2.0)
+GYRO_ROTATION_SCALE_LIMITS = (0.9, 1.1)
+# A move ends early when the IMU feels a knock this hard (in g), after its
+# start: on the car a full-power start alone measured 1.4-1.5 g, as did
+# stopping, so only a real crash goes past this. Knocks over KNOCK_G are
+# still reported, for tuning.
+BUMP_STOP_G = 2.5
+BUMP_IGNORE_START_SECONDS = 0.5
+# The learned coast is saved after this many more measured turns.
+COAST_SAVE_EVERY = 5
+# After a burst the car is given this long to come to rest before the
+# accelerometer's sum is closed; the latest measured forward bursts (this
+# many) time the next ones, once there are enough of different lengths.
+MOVE_SETTLE_SECONDS = 0.15
+BURSTS_KEPT = 30
+BURSTS_NEEDED = 4
+# Translation scales learned while mapping stay within these: the wheels'
+# guess may be far out, measured moves only by a little.
+WHEEL_TRANSLATION_SCALE_LIMITS = (0.5, 2.0)
+MEASURED_TRANSLATION_SCALE_LIMITS = (0.85, 1.15)
+# Spin and roam: a station's sweeps, joined into one full circle by the
+# gyro's turns, are fitted to the map as it was before the station (a whole
+# circle fits far more surely than a quarter) and the station is tied to the
+# stop before it by the result, trusted to about this much.
+CIRCLE_FIT_MIN_SWEEPS = 3
+CIRCLE_FIT_SIGMA = (3.0, 3.0, 1.0)
+# With only the lidar (its beam is 2 degrees wide), the way ahead is checked
+# with readings this far either side of straight ahead, this far apart: a
+# car-wide corridor 45 cm out is about 18 degrees either side.
+LIDAR_FAN_HALF_DEGREES = 20
+LIDAR_FAN_STEP_DEGREES = 2
+LIDAR_FAN_SETTLE_SECONDS = 0.03
+# The pan servo's scale is learned from lidar sweeps either side of a gyro
+# turn on the spot (moved at most this far, turned this much), blended in
+# this much at a time.
+PAN_SCALE_MAX_MOVE_CM = 2.0
+PAN_SCALE_TURN_RANGE_DEG = (15.0, 100.0)
+PAN_SCALE_BLEND = 0.3
 # Before each turn the camera photographs a strip across the pan, from
 # straight ahead to past the destination. Afterwards the new forward view is
 # matched against every strip picture to measure the turn actually made, and
@@ -344,6 +432,26 @@ def _guess_step_seconds(distance_cm: float) -> float:
     return max(0.05, min(0.8, 2 * distance_cm / speed - MOTOR_RAMP_SECONDS))
 
 
+def _load_turning(path) -> dict[str, object]:
+    """What turning and moving have learned (see MappingController._save_learned)."""
+    if path is None or not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        logger.warning("Ignoring unreadable turning file %s: %s", path, exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _coast_from(data: dict[str, object], path) -> CoastModel:
+    try:
+        return CoastModel.from_json(data.get("coast", data))
+    except (ValueError, TypeError, KeyError, IndexError, AttributeError) as exc:
+        logger.info("Turn coast in %s not used: %s", path, exc)
+        return CoastModel()
+
+
 class MappingController:
     def __init__(
         self,
@@ -414,6 +522,44 @@ class MappingController:
             store_path.parent / "hunt.json" if store_path is not None and str(store_path) != ":memory:" else None
         )
         self._hunt_memory = load_memory(self._hunt_memory_path)
+        # How turns coast, learned from the gyro, kept beside the database.
+        self._coast_path = (
+            store_path.parent / "turning.json" if store_path is not None and str(store_path) != ":memory:" else None
+        )
+        learned = _load_turning(self._coast_path)
+        self._coast = _coast_from(learned, self._coast_path)
+        try:
+            self._turn_power = TurnPower.from_json(learned["turn_power"]) if learned.get("turn_power") else TurnPower()
+        except (ValueError, TypeError, KeyError) as exc:
+            logger.info("Turn power in %s not used: %s", self._coast_path, exc)
+            self._turn_power = TurnPower()
+        # The pan servo's scale: kept with the car's own servo only.
+        self._pan_scale_learned: float | None = None
+        self._pan_scale_samples = 0
+        saved_scale = learned.get("pan_scale")
+        if isinstance(saved_scale, (int, float)) and self._pan_tilt.status()["mode"] == "hardware":
+            self._pan_scale_learned = set_pan_scale(saved_scale)
+        # Moves measured by the accelerometer: the board's forward direction,
+        # and (seconds, centimetres) of forward bursts, for timing the next.
+        imu = self._drive.imu
+        forward = learned.get("forward_axis")
+        if imu is not None and isinstance(forward, list) and len(forward) == 3:
+            imu.set_forward_axis(forward)
+        boost = learned.get("learned_boost")
+        if isinstance(boost, (int, float)):
+            self._drive.set_learned_boost(boost)
+        self._bursts: list[tuple[float, float]] = [
+            (float(seconds), float(cm)) for seconds, cm in learned.get("bursts", []) if isinstance(seconds, (int, float))
+        ][-BURSTS_KEPT:]
+        self._last_move: dict[str, object] | None = None
+        self._move_abort: str | None = None
+        # Room mapping: what each way of mapping has delivered, and its latest choices.
+        try:
+            self._records = MethodRecords.from_json(dict(learned.get("mapping_methods") or {}))
+        except (TypeError, ValueError):
+            self._records = MethodRecords()
+        self._room_choices: list[dict[str, object]] = []
+        self._last_scan: list[dict[str, object]] | None = None
         self._hunt_status: dict[str, object] | None = None
         self._hunt_frame: bytes | None = None
         self._hunt_frame_at: float = 0.0
@@ -462,12 +608,20 @@ class MappingController:
         self._pose_covariance = np.zeros((3, 3))
         self._last_odometry: Pose | None = None
         self._last_camera_views: dict[ViewKey, tuple[bytes, ...]] | None = None
-        calibration = getattr(self, "_calibration", None)
         # Start from what calibration measured; each session keeps refining it.
+        # The rotation scale is for whatever the heading follows now (the
+        # gyro or the wheels), and starts again should that change.
+        self._rotation_source = self._drive.heading_source()
+        # Likewise distances: measured by the accelerometer, or the wheels'.
+        self._translation_source = "accelerometer" if self._drive.measures_distance() else "wheels"
         self._odometry_scale = (
-            (calibration.forward_ratio if calibration and calibration.forward_ratio else 1.0),
-            (calibration.mean_turn_ratio() if calibration and calibration.mean_turn_ratio() else 1.0),
+            self._initial_translation_scale(self._translation_source),
+            self._initial_rotation_scale(self._rotation_source),
         )
+        # How far turns coast after the motors are cut (learned from the
+        # gyro, and kept from session to session while the service runs).
+        self._coast = getattr(self, "_coast", None) or CoastModel()
+        self._last_bump: dict[str, object] | None = None
         self._last_localization: dict[str, object] | None = None
         # Camera-verified rotation since the last stop, for turns too large
         # for stop-to-stop image comparison.
@@ -483,12 +637,13 @@ class MappingController:
     def start(self) -> None:
         self._start("survey", self._run_survey)
 
-    def start_autonomous(self, attended: bool, strategy: str = "frontier") -> None:
-        """Explore on its own (attended). "frontier": a sweep ahead, then a
-        move toward the most promising unexplored edge, again and again.
-        "spin": turn a full circle on the spot sweeping, then drive to the
-        open place a full turn would show the most new floor from, and spin
-        again (see _run_spin_explore)."""
+    def start_autonomous(self, attended: bool, strategy: str = "room") -> None:
+        """Explore on its own (attended). "room" (the main way): turn a full
+        circle on the spot sweeping, drive straight across to the farthest
+        open place it showed, and spin again; frontier steps where there is
+        nowhere to spin. "frontier": only frontier steps (a sweep ahead, then
+        a move toward the most promising unexplored edge). "spin": spin and
+        roam without the frontier steps (see _run_spin_explore)."""
         if strategy not in EXPLORE_STRATEGIES:
             raise ValueError(f"strategy must be one of {', '.join(EXPLORE_STRATEGIES)}")
         if attended is not True:
@@ -503,11 +658,16 @@ class MappingController:
             for axis in ("throttle", "strafe", "steering")
         ):
             raise RuntimeError("Stop the car before starting autonomous exploration")
-        if not self._ranging.enabled():
-            raise RuntimeError("Autonomous exploration requires a working range sensor (lidar or ultrasonic)")
+        if not self._ranging.lidar_ready():
+            raise RuntimeError("Mapping needs the lidar working (sweeps are lidar sweeps)")
         with self._lock:
             self._strategy = strategy
-        self._start("explore", self._run_spin_explore if strategy == "spin" else self._run_autonomous)
+        runners = {
+            "room": self._run_room_mapping,
+            "spin": self._run_spin_explore,
+            "frontier": self._run_autonomous,
+        }
+        self._start("explore", runners[strategy])
 
     def start_hunt(self, attended: bool) -> None:
         """Hunt for the cat in the mapped room and play with it (attended)."""
@@ -520,8 +680,8 @@ class MappingController:
             raise RuntimeError("The hunt requires hardware mode")
         if any(abs(float(drive_status[axis])) > 0.01 for axis in ("throttle", "strafe", "steering")):
             raise RuntimeError("Stop the car before starting the hunt")
-        if not self._ranging.enabled():
-            raise RuntimeError("The hunt requires a working range sensor (lidar or ultrasonic)")
+        if not self._ranging.lidar_ready():
+            raise RuntimeError("The hunt needs the lidar working")
         if self._detector is None or not getattr(self._detector, "available", True):
             raise RuntimeError("The hunt needs object detection to spot the cat")
         if self._store.count() == 0:
@@ -557,6 +717,8 @@ class MappingController:
                 save_memory(self._hunt_memory_path, self._hunt_memory)
             except OSError as exc:
                 logger.warning("Could not save what the hunt learned: %s", exc)
+            # What its turns taught about turning power.
+            self._save_learned()
             self._set_enabled_false()
             self._hold_camera(False)
 
@@ -624,8 +786,8 @@ class MappingController:
             raise RuntimeError("Calibration requires hardware mode")
         if any(abs(float(drive_status[axis])) > 0.01 for axis in ("throttle", "strafe", "steering")):
             raise RuntimeError("Stop the car before calibrating")
-        if not self._ranging.enabled():
-            raise RuntimeError("Calibration requires a working range sensor (lidar or ultrasonic)")
+        if not self._ranging.lidar_ready():
+            raise RuntimeError("Calibration needs the lidar working")
         self._start("calibrate", self._run_calibration)
 
     def calibration(self) -> dict[str, object] | None:
@@ -641,7 +803,15 @@ class MappingController:
                 previous = self._calibration
             from robocar.bodies import CarCalibrationRig  # bodies builds on this module
 
-            result = run_calibration(CarCalibrationRig(self), previous, _guess_step_seconds)
+            with self._lock:
+                self._last_move = None
+            result = run_calibration(
+                CarCalibrationRig(self),
+                previous,
+                _guess_step_seconds,
+                self._drive.heading_source(),
+                feel_steps=self._drive.gyro_ready(),
+            )
             if self._stop_event.is_set():
                 return
             if result.turn_ratios or result.step_durations:
@@ -649,6 +819,7 @@ class MappingController:
                 with self._lock:
                     self._calibration = result
                     self._state = "calibrated"
+                    self._rotation_source = result.turn_source
                     self._odometry_scale = (
                         result.forward_ratio or self._odometry_scale[0],
                         result.mean_turn_ratio() or self._odometry_scale[1],
@@ -761,6 +932,7 @@ class MappingController:
                 self._thread = None
 
     def status(self) -> dict[str, object]:
+        self._follow_heading_source()
         with self._lock:
             position_sigma, heading_sigma = pose_sigma(self._pose_covariance)
             status = {
@@ -773,6 +945,8 @@ class MappingController:
                 "mode": self._mode,
                 "strategy": self._strategy,
                 "spin": dict(self._spin_progress) if self._spin_progress else None,
+                "room_choices": list(self._room_choices[-3:]),
+                "mapping_methods": self._records.to_json(),
                 "run_id": self._run_id,
                 "pose_model": "wheel odometry + camera yaw/travel + sonar surface registration",
                 "move_count": self._move_count,
@@ -787,6 +961,15 @@ class MappingController:
                 "pose_sigma_cm": round(position_sigma, 1),
                 "heading_sigma_deg": round(heading_sigma, 1),
                 "odometry_scale": [round(value, 3) for value in self._odometry_scale],
+                "turns_measured_by": self._rotation_source,
+                "distances_measured_by": self._translation_source,
+                "last_move": self._last_move,
+                "bursts_measured": len(self._bursts),
+                "coast": self._coast.summary(),
+                "turn_power": self._turn_power.summary(),
+                "pan_scale": round(pan_scale(), 3),
+                "pan_scale_samples": self._pan_scale_samples,
+                "last_bump": self._last_bump,
                 "localization": self._last_localization,
                 "places": dict(self._place_counts),
                 "last_place": self._last_place,
@@ -993,6 +1176,7 @@ class MappingController:
                     "bounds": [round(value, 1) for value in self._grid.bounds()],
                     "explored": round(self._grid.explored_fraction(), 3),
                 }
+                data["room"] = self._grid.known_room()
             data["cloud_points"] = len(self._cloud)
             data["stations"] = [[round(x, 1), round(y, 1)] for x, y in self._stations]
             data["frontier_target"] = (
@@ -1053,6 +1237,8 @@ class MappingController:
 
     def close(self) -> None:
         self.stop()
+        if self._coast.observations or self._pan_scale_samples or self._bursts or self._turn_power.observations:
+            self._save_learned()
         self._store.close()
 
     def _replay_latest_run(self) -> None:
@@ -1158,100 +1344,15 @@ class MappingController:
             self._hold_camera(False)
 
     def _run_autonomous(self) -> None:
+        """Frontier exploring on its own (strategy "frontier")."""
         started_at = time.monotonic()
-        turns_without_progress = 0
-        backup_bursts = 0
-        just_backed_up = False
         self._learner.start_run()
         self._hold_camera(True)
         self._start_mapping_watch()
         try:
-            while not self._stop_event.is_set():
-                if time.monotonic() - started_at >= AUTO_MAX_SECONDS:
-                    self._set_state("time_limit")
-                    break
-                with self._lock:
-                    if self._move_count >= AUTO_MAX_MOVES:
-                        self._state = "move_limit"
-                        break
-                if not self._drive.set_inhibited(True):
-                    raise RuntimeError("Drive was not stopped before a range scan")
-                self._set_state("scanning")
-                scan = self._capture_observation(mode="explore")
-                if self._stop_event.is_set():
-                    break
-                if not any(item["distance_cm"] is not None for item in scan):
-                    self._set_state("sensor_fault")
-                    raise RuntimeError("No valid ultrasonic readings; motors remain stopped")
-                # A missing straight-ahead echo (often a smooth wall at a steep
-                # angle) counts as blocked: the planner turns rather than drives.
-                with self._lock:
-                    pose = self._pose
-                    hazards = list(self._hazards)
-                with self._map_lock:
-                    step = plan_explore_step(
-                        scan,
-                        pose,
-                        self._grid,
-                        turns_without_progress,
-                        backup_bursts,
-                        just_backed_up,
-                        self._explore_target,
-                        self._learner,
-                        hazards,
-                    )
-                    self._explore_target = step.target
-                with self._lock:
-                    self._plan = step.reason
-                if step.action == "done":
-                    self._set_state("explored")
-                    break
-                if step.action == "blocked":
-                    self._set_state("blocked")
-                    break
-
-                self._drive.set_inhibited(False)
-                if step.action == "forward":
-                    self._set_state("moving")
-                    if not self._move_burst(AUTO_FORWARD_COMMAND, self._step_seconds(step.distance_cm)):
-                        break
-                    turns_without_progress = 0
-                    just_backed_up = False
-                elif step.action == "turn":
-                    self._set_state("turning")
-                    pieces = max(1, math.ceil(abs(step.degrees) / AUTO_TURN_PIECE_DEGREES - 1e-9))
-                    if not all(self._turn_and_align(step.degrees / pieces) for _ in range(pieces)):
-                        break
-                    turns_without_progress += 1
-                    # Only a change of direction earns another backing-up.
-                    backup_bursts = 0
-                    just_backed_up = False
-                    if step.distance_cm > 0:
-                        # Lined up with a waypoint the map shows clear: one
-                        # ping straight ahead must agree before driving on.
-                        ahead = self._ping_ahead()
-                        if ahead is not None and ahead - step.distance_cm >= AUTO_WALL_STANDOFF_CM:
-                            self._set_state("moving")
-                            if not self._move_burst(AUTO_FORWARD_COMMAND, self._step_seconds(step.distance_cm)):
-                                break
-                            turns_without_progress = 0
-                elif step.action == "strafe":
-                    self._set_state("sliding")
-                    seconds = AUTO_FORWARD_SECONDS * abs(step.distance_cm) / AUTO_STEP_CM
-                    if not self._move_burst(0, seconds, strafe=math.copysign(AUTO_FORWARD_COMMAND, step.distance_cm)):
-                        break
-                else:
-                    self._set_state("backing_up")
-                    if not self._move_burst(-AUTO_FORWARD_COMMAND, AUTO_FORWARD_SECONDS):
-                        break
-                    backup_bursts += 1
-                    turns_without_progress = 0
-                    just_backed_up = True
-                self._count_move()
-                self._drive.set_inhibited(True)
-                self._set_state("scanning")
-                if self._stop_event.wait(0.1):
-                    break
+            outcome = self._frontier_explore(lambda: self._frontier_limits_reached(started_at))
+            if outcome in ("explored", "blocked"):
+                self._set_state(outcome)
         except Exception as exc:
             if not self._stop_event.is_set():
                 logger.exception("Autonomous mapping stopped after an error")
@@ -1262,18 +1363,132 @@ class MappingController:
                     self._state = "error"
                     self._error = f"{type(exc).__name__}: {exc}"
         finally:
-            self._drive.stop()
-            if not self._stop_event.is_set():
-                self._drive.set_inhibited(False)
-            self._set_enabled_false()
-            self._stop_mapping_watch()
-            self._hold_camera(False)
+            self._finish_exploring()
+
+    def _frontier_limits_reached(self, started_at: float) -> bool:
+        if time.monotonic() - started_at >= AUTO_MAX_SECONDS:
+            self._set_state("time_limit")
+            return True
+        with self._lock:
+            if self._move_count >= AUTO_MAX_MOVES:
+                self._state = "move_limit"
+                return True
+        return False
+
+    def _finish_exploring(self) -> None:
+        self._drive.stop()
+        if not self._stop_event.is_set():
+            self._drive.set_inhibited(False)
+        self._set_enabled_false()
+        self._stop_mapping_watch()
+        self._hold_camera(False)
+        with self._map_lock:
+            self._learner.finish(self._grid.known_count())
+        try:
+            save_learner(self._learner_path, self._learner)
+        except OSError as exc:
+            logger.warning("Could not save exploration learning: %s", exc)
+
+    def _frontier_explore(
+        self,
+        limits_reached: Callable[[], bool],
+        max_moves: int | None = None,
+        until: Callable[[], bool] | None = None,
+    ) -> str:
+        """Frontier steps: a sweep ahead, then a move toward the most promising
+        unexplored edge, again and again. Ends "explored" (nothing left),
+        "blocked", "limit" (`limits_reached`, or `max_moves` made), "found"
+        (`until` became true: room mapping goes back to spinning) or
+        "stopped"."""
+        turns_without_progress = 0
+        backup_bursts = 0
+        just_backed_up = False
+        moves = 0
+        while not self._stop_event.is_set():
+            if limits_reached():
+                return "limit"
+            if max_moves is not None and moves >= max_moves:
+                return "limit"
+            if not self._drive.set_inhibited(True):
+                raise RuntimeError("Drive was not stopped before a range scan")
+            self._set_state("scanning")
+            scan = self._capture_observation(mode="explore")
+            if self._stop_event.is_set():
+                break
+            if not any(item["distance_cm"] is not None for item in scan):
+                self._set_state("sensor_fault")
+                raise RuntimeError("No valid range readings; motors remain stopped")
+            if until is not None and moves and until():
+                return "found"
+            # A missing straight-ahead echo (often a smooth wall at a steep
+            # angle) counts as blocked: the planner turns rather than drives.
+            with self._lock:
+                pose = self._pose
+                hazards = list(self._hazards)
             with self._map_lock:
-                self._learner.finish(self._grid.known_count())
-            try:
-                save_learner(self._learner_path, self._learner)
-            except OSError as exc:
-                logger.warning("Could not save exploration learning: %s", exc)
+                step = plan_explore_step(
+                    scan,
+                    pose,
+                    self._grid,
+                    turns_without_progress,
+                    backup_bursts,
+                    just_backed_up,
+                    self._explore_target,
+                    self._learner,
+                    hazards,
+                )
+                self._explore_target = step.target
+            with self._lock:
+                self._plan = step.reason
+            if step.action == "done":
+                return "explored"
+            if step.action == "blocked":
+                return "blocked"
+
+            self._drive.set_inhibited(False)
+            if step.action == "forward":
+                self._set_state("moving")
+                if not self._move_burst(AUTO_FORWARD_COMMAND, self._travel_seconds(step.distance_cm), watch=True):
+                    break
+                turns_without_progress = 0
+                just_backed_up = False
+            elif step.action == "turn":
+                self._set_state("turning")
+                pieces = max(1, math.ceil(abs(step.degrees) / AUTO_TURN_PIECE_DEGREES - 1e-9))
+                if not all(self._turn_and_align(step.degrees / pieces) for _ in range(pieces)):
+                    break
+                turns_without_progress += 1
+                # Only a change of direction earns another backing-up.
+                backup_bursts = 0
+                just_backed_up = False
+                if step.distance_cm > 0:
+                    # Lined up with a waypoint the map shows clear: one
+                    # check ahead must agree before driving on.
+                    ahead = self._ping_ahead()
+                    if ahead is not None and ahead - step.distance_cm >= AUTO_WALL_STANDOFF_CM:
+                        self._set_state("moving")
+                        if not self._move_burst(AUTO_FORWARD_COMMAND, self._travel_seconds(step.distance_cm), watch=True):
+                            break
+                        turns_without_progress = 0
+            elif step.action == "strafe":
+                self._set_state("sliding")
+                seconds = AUTO_FORWARD_SECONDS * abs(step.distance_cm) / AUTO_STEP_CM
+                if not self._move_burst(0, seconds, strafe=math.copysign(AUTO_FORWARD_COMMAND, step.distance_cm)):
+                    break
+            else:
+                self._set_state("backing_up")
+                if not self._move_burst(-AUTO_FORWARD_COMMAND, AUTO_FORWARD_SECONDS):
+                    break
+                backup_bursts += 1
+                turns_without_progress = 0
+                just_backed_up = True
+            self._count_move()
+            moves += 1
+            self._drive.set_inhibited(True)
+            self._set_state("scanning")
+            if self._stop_event.wait(0.1):
+                break
+        return "stopped"
 
     # -- spin and roam ----------------------------------------------------
 
@@ -1335,12 +1550,21 @@ class MappingController:
         with self._map_lock:
             return self._grid.clear_all_round(pose, SPIN_TURN_RADIUS_CM)
 
-    def _spin(self, scan: list[dict[str, object]]) -> bool:
+    def _station_base(self) -> tuple[CoverageGrid, int | None]:
+        """The map and the latest stop as they are before a station's sweeps."""
+        with self._map_lock:
+            grid = copy.deepcopy(self._grid)
+        with self._lock:
+            return grid, self._last_node
+
+    def _spin(self, scan: list[dict[str, object]], base: tuple[CoverageGrid, int | None] | None = None) -> bool:
         """Turn a full circle where the car stands, sweeping a quarter turn
-        apart. `scan` is the sweep already taken facing the first quarter.
+        apart. `scan` is the sweep already taken facing the first quarter;
+        `base` the map and stop from before it, to fit the whole circle to.
         False if stopped."""
         with self._lock:
             start = self._pose
+            sweeps = [(self._last_node, scan)]
         here = (start[0], start[1])
         swept = 1
         skipped = 0
@@ -1349,7 +1573,12 @@ class MappingController:
                 return False
             heading = start[2] + quarter
             with self._map_lock:
-                gain = self._grid.information_gain(here, heading, self._grid.worth_seeing(), self._grid._blocked())
+                # With nothing mapped yet every way is new.
+                gain = (
+                    self._grid.information_gain(here, heading, self._grid.worth_seeing(), self._grid._blocked())
+                    if self._grid.log_odds.size
+                    else math.inf
+                )
             if gain < SPIN_SKIP_GAIN_CELLS:
                 skipped += 1
                 continue
@@ -1365,15 +1594,77 @@ class MappingController:
             scan = self._sweep_here()
             if scan is None:
                 return False
+            with self._lock:
+                sweeps.append((self._last_node, scan))
             swept += 1
+        fit = self._fit_circle(base, sweeps) if base is not None else None
         with self._lock:
-            self._spin_progress = {**(self._spin_progress or {}), "swept": swept, "skipped": skipped}
+            self._spin_progress = {**(self._spin_progress or {}), "swept": swept, "skipped": skipped, "circle_fit": fit}
         return True
+
+    def _fit_circle(
+        self, base: tuple[CoverageGrid, int | None], sweeps: list[tuple[int | None, list[dict[str, object]]]]
+    ) -> dict[str, object] | None:
+        """Fit a station's sweeps, as one circle, to the map from before it;
+        if it fits, tie the station to the stop before it and redraw the map.
+        A summary for the status, or None when there was nothing to fit to."""
+        grid, base_node = base
+        nodes = [node for node, _ in sweeps if node is not None]
+        if base_node is None or len(nodes) < CIRCLE_FIT_MIN_SWEEPS or int(grid.occupied().sum()) < LOCALIZED_MIN_OCCUPIED_CELLS:
+            return None
+        with self._places_lock:
+            poses = {node: self._places.graph.nodes.get(node) for node in nodes}
+            base_pose = self._places.graph.nodes.get(base_node)
+        if base_pose is None or any(pose is None for pose in poses.values()):
+            return None
+        last = nodes[-1]
+        frame = poses[last]
+        circle: list[dict[str, object]] = []
+        for node, scan in sweeps:
+            if node is not None:
+                # Placed relative to the last by the gyro's turns between them.
+                circle += sweep_seen_from(static_scan(scan), poses[node], frame)
+        with self._lock:
+            covariance = self._pose_covariance.copy()
+            run_id = self._run_id
+        position_sigma, heading_sigma = pose_sigma(covariance)
+        reach_cm = min(GRID_MATCH_MAX_REACH_CM, max(GRID_MATCH_MIN_REACH_CM, 2.0 * position_sigma))
+        reach_deg = min(GRID_MATCH_MAX_REACH_DEG, max(GRID_MATCH_MIN_REACH_DEG, 2.0 * heading_sigma))
+        try:
+            match = grid.match_scan(circle, frame, reach_cm, reach_deg)
+        except Exception:  # a failed fit must never stop exploring
+            logger.warning("Fitting the full circle to the map failed", exc_info=True)
+            return None
+        summary: dict[str, object] = {"sweeps": len(nodes), "score": None if match is None else round(match.score, 2), "used": False}
+        if match is None or not match.good:
+            return summary
+        with self._places_lock:
+            tied = self._places.add_constraint(
+                base_node, last, relative(base_pose, match.pose), CIRCLE_FIT_SIGMA, "circle", match.hits
+            )
+            settled = self._places.graph.nodes[last]
+        if not tied or run_id is None:
+            return summary
+        self._rebuild_map(last, run_id)
+        moved = relative(frame, settled)
+        with self._lock:
+            self._pose = settled
+            self._pose_covariance = np.diag(
+                [CIRCLE_FIT_SIGMA[0] ** 2, CIRCLE_FIT_SIGMA[1] ** 2, math.radians(CIRCLE_FIT_SIGMA[2]) ** 2]
+            )
+            self._stops_since_fix = 0
+            self._travel_since_fix = (0.0, 0.0)
+        logger.info(
+            "Full circle of %d sweeps fitted the map (score %.2f): station moved %.1f cm, %+.1f degrees",
+            len(nodes), match.score, math.hypot(moved[0], moved[1]), moved[2],
+        )
+        return {**summary, "used": True, "moved_cm": round(math.hypot(moved[0], moved[1]), 1), "turned_deg": round(moved[2], 1)}
 
     def _drive_to_station(self, goal: tuple[float, float], started_at: float) -> str:
         """Drive to a station along the map's route: "arrived", "blocked"
         (no way, or something in the way), or "stopped"."""
         travelled = 0.0
+        sweep_every = SPIN_SWEEP_EVERY_MEASURED_CM if self._drive.measures_distance() and self._drive.gyro_ready() else SPIN_SWEEP_EVERY_CM
         for _ in range(SPIN_MAX_LEGS):
             if self._stop_event.is_set():
                 return "stopped"
@@ -1382,7 +1673,7 @@ class MappingController:
             pose = self._current_pose()
             if math.hypot(goal[0] - pose[0], goal[1] - pose[1]) <= SPIN_ARRIVED_CM:
                 return "arrived"
-            if travelled >= SPIN_SWEEP_EVERY_CM:
+            if travelled >= sweep_every:
                 # Long enough on the wheels alone: sweep ahead to stay placed.
                 if self._sweep_here() is None:
                     return "stopped"
@@ -1406,10 +1697,12 @@ class MappingController:
             ahead = self._ping_ahead()
             facing = self._current_pose()
             with self._map_lock:
-                mapped = self._grid.clear_run(facing, AUTO_LONG_STEP_CM)
+                mapped = self._grid.clear_run(facing, length)
             if ahead is None:
                 return "blocked"
-            step = min(length, AUTO_LONG_STEP_CM, ahead - AUTO_WALL_STANDOFF_CM, mapped)
+            # As far as the way runs straight, the lidar saw clear and the map
+            # knows is open: across the room in one go if it is all open.
+            step = min(length, ahead - AUTO_WALL_STANDOFF_CM, mapped)
             if step < AUTO_MIN_STEP_CM:
                 return "blocked"
             self._drive.set_inhibited(False)
@@ -1417,18 +1710,145 @@ class MappingController:
                 self._set_state("moving")
                 with self._lock:
                     self._plan = f"driving {step:.0f} cm toward the next place to spin ({math.hypot(goal[0] - facing[0], goal[1] - facing[1]):.0f} cm away)"
-                if not self._move_burst(AUTO_FORWARD_COMMAND, self._step_seconds(step)):
+                if not self._move_burst(AUTO_FORWARD_COMMAND, self._travel_seconds(step), watch=True):
                     return "stopped"
             finally:
                 self._drive.set_inhibited(True)
             self._count_move()
-            travelled += step
+            now = self._current_pose()
+            travelled += math.hypot(now[0] - facing[0], now[1] - facing[1])
+            if self._move_abort is not None:
+                with self._lock:
+                    self._plan = f"stopped short ({self._move_abort}); looking again"
         return "arrived" if math.hypot(goal[0] - self._current_pose()[0], goal[1] - self._current_pose()[1]) <= SPIN_ARRIVED_CM * 2 else "blocked"
+
+    def _run_room_mapping(self) -> None:
+        """Room mapping, the main way: a full circle where it stands, then
+        again and again whichever of the ways of carrying on promises the
+        most new floor for the time (see room_plan): a full circle across
+        the room (preferred), a full circle nearby, or a step toward an
+        unexplored edge. Each way's promises are checked against what it
+        really brought, and the timings against what things really took."""
+        started_at = time.monotonic()
+        self._learner.start_run()
+        self._hold_camera(True)
+        self._start_mapping_watch()
+        with self._lock:
+            self._stations = []
+            self._spin_progress = {"stations": 0}
+            self._room_choices = []
+        unreachable: list[tuple[float, float]] = []
+        frontier_spent = False
+        limits = lambda: self._spin_limits_reached(started_at)
+        best_rate = 0.0  # the most new floor a second any action has brought this run
+        try:
+            base = self._station_base()
+            began = time.monotonic()
+            scan = self._sweep_here()
+            if scan is None:
+                return
+            self._records.note_timing("sweep_seconds", time.monotonic() - began)
+            if not self._spin_station_here(scan, base, started_at):
+                return
+            # Rates go by the expected times (learned from real ones), as the
+            # options are judged by them.
+            with self._map_lock:
+                best_rate = self._grid.known_count() / self._records.spin_seconds
+            while not self._stop_event.is_set() and not limits():
+                with self._map_lock:
+                    found = room_options(
+                        self._grid, self._current_pose(), [*self._stations, *unreachable], self._learner, self._records, frontier_spent
+                    )
+                option = choose_option(found, self._records, best_rate)
+                self._note_choice(option, found)
+                if option is None:
+                    self._set_state("explored")
+                    with self._lock:
+                        self._plan = "nothing left that would show much new floor: the room is mapped"
+                    break
+                with self._lock:
+                    self._plan = f"next: {option.describe()}"
+                    self._explore_target = option.station.target if option.station else option.frontier.target if option.frontier else None
+                with self._map_lock:
+                    known_before = self._grid.known_count()
+                began = time.monotonic()
+                if option.method == "frontier":
+                    outcome = self._frontier_explore(limits, max_moves=1)
+                    if outcome in ("explored", "blocked"):
+                        # Nothing for it to do from here; it may be offered
+                        # again once the map has grown.
+                        frontier_spent = True
+                    elif outcome == "stopped":
+                        break
+                    else:
+                        self._records.note_timing("sweep_seconds", time.monotonic() - began)
+                else:
+                    assert option.station is not None
+                    start = self._current_pose()
+                    outcome = self._drive_to_station(option.station.target, started_at)
+                    if outcome == "stopped":
+                        break
+                    driven = math.hypot(self._current_pose()[0] - start[0], self._current_pose()[1] - start[1])
+                    if outcome == "blocked":
+                        unreachable.append(option.station.target)
+                    elif driven > 20.0:
+                        self._records.note_timing("drive_cm_per_second", driven / max(time.monotonic() - began, 1e-3))
+                    base = self._station_base()
+                    scan = self._sweep_here()
+                    if scan is None:
+                        break
+                    with self._lock:
+                        here = (self._pose[0], self._pose[1])
+                        new_place = all(math.hypot(here[0] - x, here[1] - y) >= SPIN_AWAY_CM for x, y in self._stations)
+                    if new_place:
+                        spun_at = time.monotonic()
+                        if not self._spin_station_here(scan, base, started_at):
+                            break
+                        self._records.note_timing("spin_seconds", time.monotonic() - spun_at)
+                    frontier_spent = False
+                with self._map_lock:
+                    delivered = self._grid.known_count() - known_before
+                self._records.note(option.method, option.gain, delivered)
+                best_rate = max(best_rate, delivered / option.seconds)
+        except Exception as exc:
+            if not self._stop_event.is_set():
+                logger.exception("Room mapping stopped after an error")
+            self._drive.stop()
+            if not self._stop_event.is_set():
+                with self._lock:
+                    self._enabled = False
+                    self._state = "error"
+                    self._error = f"{type(exc).__name__}: {exc}"
+        finally:
+            self._save_learned()
+            self._finish_exploring()
+
+    def _spin_station_here(self, scan: list[dict[str, object]], base, started_at: float) -> bool:
+        """A full circle where the car stands (already swept once); False if stopped."""
+        if self._spin_limits_reached(started_at):
+            return False
+        with self._lock:
+            self._stations.append((self._pose[0], self._pose[1]))
+            self._spin_progress = {**(self._spin_progress or {}), "stations": len(self._stations), "swept": 1}
+        return self._spin(scan, base)
+
+    def _note_choice(self, option, found) -> None:
+        """Keep the latest choices (and what was weighed) for the status."""
+        entry = {
+            "chose": option.method if option else None,
+            "options": [
+                {"method": other.method, "cells": round(other.gain), "seconds": round(other.seconds, 1), "score": round(other.score, 2)}
+                for other in found[:3]
+            ],
+        }
+        with self._lock:
+            self._room_choices = (self._room_choices + [entry])[-12:]
 
     def _run_spin_explore(self) -> None:
         """Spin and roam: turn a full circle sweeping, pick the open place
         that a full turn would show the most new floor from (for the driving
         it takes), drive there, and spin again, until nowhere is worth it.
+
 
         A full circle at each station maps the place all round and gives the
         sweeps plenty of overlap to fit to the map; a station is chosen only
@@ -1442,6 +1862,7 @@ class MappingController:
             self._spin_progress = {"stations": 0}
         unreachable: list[tuple[float, float]] = []
         try:
+            base = self._station_base()
             scan = self._sweep_here()
             spin_here = True
             while scan is not None and not self._stop_event.is_set():
@@ -1451,7 +1872,7 @@ class MappingController:
                     with self._lock:
                         self._stations.append((self._pose[0], self._pose[1]))
                         self._spin_progress = {"stations": len(self._stations), "swept": 1}
-                    if not self._spin(scan):
+                    if not self._spin(scan, base):
                         break
                 with self._map_lock:
                     station = self._grid.spin_station(self._current_pose(), avoid=[*self._stations, *unreachable])
@@ -1471,6 +1892,7 @@ class MappingController:
                     break
                 if outcome == "blocked":
                     unreachable.append(station.target)
+                base = self._station_base()
                 scan = self._sweep_here()
                 if scan is None:
                     break
@@ -1502,30 +1924,66 @@ class MappingController:
                 logger.warning("Could not save exploration learning: %s", exc)
 
     def _ping_ahead(self) -> float | None:
-        """Median of a few sonar readings straight ahead, drive locked meanwhile."""
+        """How far ahead is clear, drive locked meanwhile: a fan of lidar
+        readings across the car's width (its beam is narrow), and the sonar's
+        reading too when it is switched on (glass). None without the lidar."""
         if not self._drive.set_inhibited(True):
             return None
         status = self._pan_tilt.status()
         centre, tilt = int(status["pan"]), int(status["tilt"])
         self._pan_tilt.set_inhibited(True)
         try:
-            self._pan_tilt.set_angles(centre, tilt, override=True)
-            readings = []
-            for _ in range(3):
-                if self._stop_event.wait(max(0.03, self._ranging.settle_seconds())):
-                    return None
-                reading = self._ranging.now()
-                if reading is not None:
-                    readings.append(reading)
-            return statistics.median(readings) if readings else None
+            if not self._ranging.lidar_ready():
+                return None
+            clear = self._lidar_fan_ahead(centre, tilt)
+            if clear is not None and self._ranging.sonar_ready():
+                # The sonar, when switched on, sees glass the lidar misses.
+                sonar = self._ranging.read(self._range_sensor)
+                if sonar is not None:
+                    clear = min(clear, sonar)
+            return clear
         finally:
             self._pan_tilt.set_inhibited(False)
             self._drive.set_inhibited(False)
 
+    def _lidar_fan_ahead(self, centre: int, tilt: int) -> float | None:
+        """Clear distance in a car-wide corridor ahead, from lidar readings
+        every few degrees across it; None if straight ahead gave nothing."""
+        assert self._lidar is not None
+        pans = sorted(
+            {
+                min(PAN_LIMITS[1], max(PAN_LIMITS[0], int(round(bearing_pan(bearing)))))
+                for bearing in range(-LIDAR_FAN_HALF_DEGREES, LIDAR_FAN_HALF_DEGREES + 1, LIDAR_FAN_STEP_DEGREES)
+            }
+            | {90}
+        )
+        items = []
+        try:
+            # Approached from one side, as sweeps are, so backlash is the same.
+            self._pan_tilt.set_angles(max(PAN_LIMITS[0], pans[0] - 4), tilt, override=True)
+            if self._stop_event.wait(SCAN_FIRST_SETTLE_SECONDS / 2):
+                return None
+            for pan in pans:
+                self._pan_tilt.set_angles(pan, tilt, override=True)
+                if self._stop_event.wait(LIDAR_FAN_SETTLE_SECONDS):
+                    return None
+                items.append(
+                    {"angle_deg": pan_bearing(pan), "distance_cm": self._ranging.read(self._lidar), "sensor": "lidar"}
+                )
+        finally:
+            self._pan_tilt.set_angles(centre, tilt, override=True)
+        return forward_clearance(items)
+
     def _step_seconds(self, distance_cm: float = AUTO_STEP_CM) -> float:
-        """Burst length for an exploration step, from calibration when there is one."""
+        """Burst length for an exploration step: from the forward bursts the
+        accelerometer has measured, else from calibration when there is one."""
         with self._lock:
             calibration = self._calibration
+            bursts = list(self._bursts)
+        if len(bursts) >= BURSTS_NEEDED:
+            learned = seconds_for(bursts, distance_cm)
+            if learned is not None:
+                return learned
         measured = calibration.step_duration(distance_cm) if calibration else None
         # Uncalibrated, scale the basic step; ramps make longer bursts go a
         # little further than this, which errs short.
@@ -1533,8 +1991,9 @@ class MappingController:
 
     def _turn_and_align(self, degrees: float) -> bool:
         """Turn by `degrees`, then use the camera to measure and correct the turn."""
-        if not self.camera_on_head:
-            # Measuring needs pictures across the turn from the panning head.
+        if not self.camera_on_head or self._drive.gyro_ready():
+            # Measuring needs pictures across the turn from the panning head;
+            # with a gyro the turn is measured (and corrected) as it happens.
             return self._turn_by(degrees)
         pan_status = self._pan_tilt.status()
         centre_pan, tilt = int(pan_status["pan"]), int(pan_status["tilt"])
@@ -1587,7 +2046,8 @@ class MappingController:
             self._verified_turn = (self._verified_turn or 0.0) + actual
             translation_scale, rotation_scale = self._odometry_scale
             if abs(odometry_turned) > 5.0 and 0.3 <= actual / odometry_turned <= 3.0:
-                rotation_scale = min(2.0, max(0.5, 0.7 * rotation_scale + 0.3 * actual / odometry_turned))
+                low, high = WHEEL_ROTATION_SCALE_LIMITS
+                rotation_scale = min(high, max(low, 0.7 * rotation_scale + 0.3 * actual / odometry_turned))
                 self._odometry_scale = (translation_scale, rotation_scale)
         return True
 
@@ -1852,14 +2312,75 @@ class MappingController:
             finally:
                 self._pan_tilt.set_inhibited(False)
 
+    def _save_learned(self) -> None:
+        """Keep what turning and moving have learned, beside the database."""
+        if self._coast_path is None:
+            return
+        imu = self._drive.imu
+        forward = imu.forward_axis() if imu is not None else None
+        data = {
+            "coast": self._coast.to_json(),
+            "turn_power": self._turn_power.to_json(),
+            "learned_boost": round(self._drive.learned_boost(), 3),
+            "mapping_methods": self._records.to_json(),
+            "pan_scale": self._pan_scale_learned,
+            "forward_axis": list(forward) if forward is not None else None,
+            "bursts": [[round(seconds, 3), round(cm, 1)] for seconds, cm in self._bursts],
+        }
+        try:
+            temporary = self._coast_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(data))
+            temporary.replace(self._coast_path)
+        except OSError as exc:
+            logger.warning("Could not save what turning learned: %s", exc)
+
+    def _initial_rotation_scale(self, source: str) -> float:
+        """Real degrees per odometry degree to start from, for turns measured
+        by `source` ("gyro" or "wheels"): calibration's, if it measured that."""
+        calibration = getattr(self, "_calibration", None)
+        if source == "wheels" and calibration is not None and calibration.turn_source == source and calibration.mean_turn_ratio():
+            return float(calibration.mean_turn_ratio())
+        # A gyro's own scale is right to a few percent; lidar fits refine it.
+        return 1.0
+
+    def _follow_heading_source(self) -> str:
+        """What measures turns now; the rotation scale starts again when that
+        changes (and likewise distances and the translation scale)."""
+        source = self._drive.heading_source()
+        moves = "accelerometer" if self._drive.measures_distance() else "wheels"
+        with self._lock:
+            if source != self._rotation_source:
+                logger.info("Turns are now measured by the %s", source)
+                self._rotation_source = source
+                self._odometry_scale = (self._odometry_scale[0], self._initial_rotation_scale(source))
+            if moves != self._translation_source:
+                logger.info("Distances are now measured by the %s", moves)
+                self._translation_source = moves
+                self._odometry_scale = (self._initial_translation_scale(moves), self._odometry_scale[1])
+        return source
+
+    def _initial_translation_scale(self, source: str) -> float:
+        calibration = getattr(self, "_calibration", None)
+        if source == "wheels" and calibration is not None and calibration.forward_ratio:
+            return float(calibration.forward_ratio)
+        return 1.0
+
+    def _rotation_limits(self) -> tuple[float, float]:
+        with self._lock:
+            source = self._rotation_source
+        return GYRO_ROTATION_SCALE_LIMITS if source == "gyro" else WHEEL_ROTATION_SCALE_LIMITS
+
     def _rotation_ratio(self, degrees: float) -> float:
         """Real degrees per odometry degree for a turn of this size and direction:
         the calibrated ratio, nudged by what this session has learned since."""
+        source = self._follow_heading_source()
         with self._lock:
             session = self._odometry_scale[1]
             calibration = self._calibration
-        reference = calibration.mean_turn_ratio() if calibration else None
-        measured = calibration.turn_ratio(degrees) if calibration else None
+        if source == "gyro" or calibration is None or calibration.turn_source != source:
+            return session
+        reference = calibration.mean_turn_ratio()
+        measured = calibration.turn_ratio(degrees)
         if measured is not None and reference:
             return measured * session / reference
         return session
@@ -1885,46 +2406,118 @@ class MappingController:
             if self._stop_event.wait(min(remaining, 0.02)):
                 return True
 
-    def _turn_by(self, degrees: float, rotation_scale: float | None = None) -> bool:
-        """Rotate in place by about `degrees` (counterclockwise), closed loop on wheel odometry."""
+    def _turn_by(self, degrees: float, rotation_scale: float | None = None, *, correct: bool = True) -> bool:
+        """Rotate in place by about `degrees` (counterclockwise), closed loop on
+        the odometry's heading. With a gyro that heading is measured, so what
+        is left after the turn settles is corrected with gentler turns
+        (unless `correct` is off: a quick turn, as the hunt makes)."""
         if self._stop_event.is_set():
             return False
         if rotation_scale is None:
             rotation_scale = self._rotation_ratio(degrees)
         # Odometry under-reads or over-reads turns by the learned scale.
-        target = abs(degrees) / max(rotation_scale, 1e-3)
-        steering = math.copysign(AUTO_TURN_COMMAND, degrees)
+        target = degrees / max(rotation_scale, 1e-3)
+        gyro = self._drive.gyro_ready()
+        start_heading = self._drive.odometry()[2]
+        if gyro:
+            rate = GYRO_BIG_TURN_RATE_DPS if abs(degrees) >= GYRO_BIG_TURN_DEGREES else GYRO_TURN_RATE_DPS
+            command = self._turn_power.command_for(rate)
+        else:
+            command = AUTO_TURN_COMMAND
+        for attempt in range(GYRO_TURN_MAX_CORRECTIONS + 1 if gyro and correct else 1):
+            remaining = target - (self._drive.odometry()[2] - start_heading)
+            if attempt and abs(remaining) * rotation_scale <= GYRO_TURN_TOLERANCE_DEGREES:
+                break
+            outcome = self._turn_once(remaining, command, gyro)
+            if outcome == "stopped":
+                return False
+            if outcome in ("interrupted", "stalled") or not gyro:
+                break
+            command = self._turn_power.command_for(GYRO_CORRECTION_RATE_DPS)
+        return True
+
+    def _wait_until_still(self) -> bool:
+        """Wait for a gyro turn's coast to die away; False if stopped or interrupted."""
+        deadline = time.monotonic() + GYRO_SETTLE_MAX_SECONDS
+        previous = self._drive.odometry()[2]
+        while time.monotonic() < deadline:
+            if self._halt_wait(0.1):
+                return False
+            heading = self._drive.odometry()[2]
+            if abs(heading - previous) < GYRO_SETTLED_DEGREES:
+                return True
+            previous = heading
+        return True
+
+    def _turn_once(self, degrees: float, command: float, gyro: bool) -> str:
+        """One turn by `degrees` of odometry heading: "done", "timeout",
+        "stalled" (the gyro saw it not turning), "interrupted" or "stopped"."""
+        if self._interrupt.is_set():
+            return "interrupted"
+        target = abs(degrees)
+        steering = math.copysign(command, degrees)
         peak_rate = TURN_DEGREES_PER_SECOND_AT_FULL_DUTY * DriveController._wheel_speed_fraction(
-            float(self._drive.status()["max_duty"]) * AUTO_TURN_COMMAND
+            float(self._drive.status()["max_duty"]) * command
         )
         start_heading = self._drive.odometry()[2]
         started = time.monotonic()
         previous_time, previous_heading = started, start_heading
-        if self._interrupt.is_set():
-            return True
+        cut_turned = cut_rate = fastest = 0.0
+        stall_check = (started, start_heading)
+        outcome = "done"
         try:
             self._drive.set_command(0, 0, steering)
             while True:
                 if self._halt_wait(0.01):
                     # A stop fails the turn; an interrupt just ends it early.
-                    return not self._stop_event.is_set()
+                    return "stopped" if self._stop_event.is_set() else "interrupted"
                 now = time.monotonic()
                 heading = self._drive.odometry()[2]
                 rate = abs(heading - previous_heading) / max(now - previous_time, 1e-3)
                 previous_time, previous_heading = now, heading
-                # The motors ramp down from their current speed after the
-                # stop, adding rotation in proportion to how fast it is turning.
-                coast = rate * MOTOR_RAMP_SECONDS * min(1.0, rate / max(peak_rate, 1e-3)) / 2
-                if (
-                    abs(heading - start_heading) + coast >= target
-                    or now - started >= AUTO_MAX_TURN_SECONDS
-                ):
-                    return True
+                turned = abs(heading - start_heading)
+                fastest = max(fastest, rate)
+                if gyro:
+                    # Measured turns: what this car has been seen to coast.
+                    coast = self._coast.predict(rate)
+                    if now - stall_check[0] >= GYRO_STALL_SECONDS:
+                        if abs(heading - stall_check[1]) < GYRO_STALL_DEGREES:
+                            # Not turning at this power: learn it, and push harder.
+                            self._turn_power.note_stall(command)
+                            if command >= TurnPower.MAX_COMMAND - 1e-9:
+                                logger.warning("Turn stuck: the gyro saw %.1f degrees at full power", turned)
+                                return "stalled"
+                            command = min(TurnPower.MAX_COMMAND, command + GYRO_STALL_POWER_STEP)
+                            steering = math.copysign(command, degrees)
+                            logger.info("Turn not starting; power up to %.2f", command)
+                        stall_check = (now, heading)
+                else:
+                    # The motors ramp down from their current speed after the
+                    # stop, adding rotation in proportion to how fast it is turning.
+                    coast = rate * MOTOR_RAMP_SECONDS * min(1.0, rate / max(peak_rate, 1e-3)) / 2
+                if turned + coast >= target:
+                    cut_turned, cut_rate = turned, rate
+                    break
+                if now - started >= AUTO_MAX_TURN_SECONDS:
+                    outcome = "timeout"
+                    break
                 self._drive.set_command(0, 0, steering)
         finally:
-            self._drive.stop()
+            # A gyro turn cuts the motors at once: it stops where measured.
+            self._drive.stop(ramp=not gyro)
             if not self._drive.wait_until_stopped():
                 raise RuntimeError("Drive output did not stop after the ramp-down interval")
+        if gyro:
+            if not self._wait_until_still():
+                return "stopped" if self._stop_event.is_set() else "interrupted"
+            if outcome == "done":
+                coasted = abs(self._drive.odometry()[2] - start_heading) - cut_turned
+                self._coast.learn(cut_rate, max(coasted, 0.0))
+                if time.monotonic() - started >= GYRO_LEARN_POWER_SECONDS and fastest > 0:
+                    self._turn_power.note_turning(command, fastest)
+                if self._coast.observations % COAST_SAVE_EVERY == 0:
+                    self._save_learned()
+        return outcome
 
     def _move_burst(
         self,
@@ -1933,30 +2526,130 @@ class MappingController:
         *,
         steering: float = 0,
         strafe: float = 0,
+        watch: bool = False,
     ) -> bool:
+        """Drive for `duration`; True unless stopped. With `watch` (long
+        drives straight ahead) the lidar, gyro and accelerometer are watched
+        all the way and the move is ended early if anything goes wrong (see
+        WATCH_STOP_MARGIN_CM); why is kept in self._move_abort."""
+        self._move_abort = None
         if self._stop_event.is_set():
             return False
         if self._interrupt.is_set():
             return True
+        with self._lock:
+            self._last_move = None
+        token = self._drive.begin_move()
+        completed = False
+        start_heading = self._drive.odometry()[2]
+        moving_seen = time.monotonic()
         try:
+            started = time.monotonic()
             self._drive.set_command(throttle, strafe, steering)
-            deadline = time.monotonic() + duration
+            deadline = started + duration
             refresh_interval = min(
                 float(self._drive.status()["watchdog_timeout_seconds"]) / 2,
-                0.1,
+                0.05,
             )
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    completed = True
                     return True
                 if self._halt_wait(min(refresh_interval, remaining)):
                     return not self._stop_event.is_set()
+                knock = self._drive.knock_since(started + BUMP_IGNORE_START_SECONDS)
+                if knock >= BUMP_STOP_G:
+                    # Ran into something the sweep did not show (or something
+                    # ran into the car): stop pushing; the move is over.
+                    logger.warning("Bumped into something (%.1f g); move ended early", knock)
+                    with self._lock:
+                        self._last_bump = {
+                            "g": round(knock, 2),
+                            "at": datetime.now(timezone.utc).isoformat(),
+                            "command": [round(throttle, 2), round(strafe, 2), round(steering, 2)],
+                        }
+                    return True
+                if watch:
+                    reason = self._watch_problem(started, start_heading, moving_seen)
+                    if reason == "moving":
+                        moving_seen = time.monotonic()
+                    elif reason is not None:
+                        logger.info("Move ended early: %s", reason)
+                        self._move_abort = reason
+                        return True
                 if time.monotonic() < deadline:
                     self._drive.set_command(throttle, strafe, steering)
         finally:
             self._drive.stop()
             if not self._drive.wait_until_stopped():
                 raise RuntimeError("Drive output did not stop after the ramp-down interval")
+            if token is not None:
+                self._finish_measured_move(token, throttle, strafe, steering, duration if completed else None)
+
+    def _watch_problem(self, started: float, start_heading: float, moving_seen: float) -> str | None:
+        """What is wrong with a watched drive now: None if nothing ("moving"
+        when the IMU sees it going, to note the time)."""
+        ahead = self._ranging.now(precise=True)
+        if ahead is not None and ahead < AUTO_WALL_STANDOFF_CM + WATCH_STOP_MARGIN_CM:
+            return f"something {ahead:.0f} cm ahead"
+        if self._drive.gyro_ready():
+            veer = abs(self._drive.odometry()[2] - start_heading)
+            if veer > WATCH_MAX_VEER_DEGREES:
+                return f"pushed {veer:.0f}° off course"
+        imu = self._drive.imu
+        if imu is not None and imu.ready():
+            now = time.monotonic()
+            if imu.speed_cm_s() >= WATCH_STALL_SPEED_CM_S:
+                return "moving"
+            if now - started >= WATCH_STALL_SECONDS and now - moving_seen >= WATCH_STALL_SECONDS:
+                return "not moving although driving (stuck?)"
+        return None
+
+    def _travel_seconds(self, distance_cm: float) -> float:
+        """Burst length to drive `distance_cm` straight ahead, however far."""
+        if distance_cm <= TRAVEL_FROM_STEPS_CM:
+            return self._step_seconds(distance_cm)
+        with self._lock:
+            bursts = list(self._bursts)
+        seconds = None
+        if len(bursts) >= BURSTS_NEEDED and len({round(s, 3) for s, _ in bursts}) >= 2:
+            count = len(bursts)
+            mean_s = sum(s for s, _ in bursts) / count
+            mean_d = sum(d for _, d in bursts) / count
+            spread = sum((s - mean_s) ** 2 for s, _ in bursts)
+            slope = sum((s - mean_s) * (d - mean_d) for s, d in bursts) / spread if spread > 0 else 0.0
+            if slope > 0:
+                seconds = mean_s + (distance_cm - mean_d) / slope
+        if seconds is None:
+            speed = FORWARD_CM_PER_SECOND_AT_FULL_DUTY * DriveController._wheel_speed_fraction(
+                float(self._drive.status()["max_duty"]) * AUTO_FORWARD_COMMAND
+            )
+            seconds = distance_cm / max(speed, 1.0) + MOTOR_RAMP_SECONDS / 2
+        return min(TRAVEL_MAX_SECONDS, max(0.05, seconds))
+
+    def _finish_measured_move(self, token, throttle: float, strafe: float, steering: float, seconds: float | None) -> None:
+        """Close the accelerometer's measure of a burst once the car is at rest,
+        and learn burst lengths from straight forward ones that ran their
+        whole length (`seconds`, None if cut short)."""
+        self._stop_event.wait(MOVE_SETTLE_SECONDS)
+        straight = abs(steering) < 1e-6
+        before = self._drive.odometry()
+        measure, used = self._drive.finish_move(token, throttle if straight else 0.0, strafe if straight else 0.0)
+        if measure is None:
+            return
+        wheels = math.hypot(before[0] - token[0][0], before[1] - token[0][1])
+        summary = {**measure.summary(), "used": used, "wheels_cm": round(wheels, 1)}
+        with self._lock:
+            self._last_move = summary
+            forward = straight and abs(strafe) < 1e-6 and abs(throttle - AUTO_FORWARD_COMMAND) < 1e-6
+            if used and forward and seconds is not None and measure.ahead_cm:
+                self._bursts = (self._bursts + [(seconds, float(measure.ahead_cm))])[-BURSTS_KEPT:]
+                learned_burst = True
+            else:
+                learned_burst = False
+        if learned_burst or (measure.ahead_cm is None and self._drive.measures_distance()):
+            self._save_learned()
 
     def _capture_observation(self, mode: str = "survey") -> list[dict[str, object]]:
         self._store.ensure_capacity()
@@ -2016,7 +2709,9 @@ class MappingController:
             previous_views is not None
             and (
                 not view_estimates
-                or predict_motion(odometry_delta, combine_view_estimates(view_estimates)).visual_rejected
+                or predict_motion(
+                    odometry_delta, combine_view_estimates(view_estimates), gyro=self._drive.heading_source() == "gyro"
+                ).visual_rejected
                 or any(key != centre_key for key in previous_views)
             )
         )
@@ -2055,7 +2750,9 @@ class MappingController:
             # The turn was too large for the views to overlap, but the camera
             # already measured it against the destination view.
             visual = VisualMotion(verified_turn, None, AUTO_ALIGN_FRAMES, 0.0)
-        prediction = predict_motion(odometry_delta, visual)
+        prediction_source = self._drive.heading_source()
+        self._learn_pan_scale(scan, raw_odometry, prediction_source)
+        prediction = predict_motion(odometry_delta, visual, gyro=prediction_source == "gyro")
         previous_centre = (previous_views or {}).get(centre_key)
         if previous_centre:
             motion_lines = [
@@ -2063,7 +2760,7 @@ class MappingController:
                 "camera turn "
                 + (f"{visual.yaw_deg:+.1f} deg" if visual is not None else "not measurable")
                 + (" (used)" if prediction.visual_used else " (rejected)" if prediction.visual_rejected else "")
-                + f"; wheels {odometry_delta[2]:+.1f} deg",
+                + f"; {self._drive.heading_source()} {odometry_delta[2]:+.1f} deg",
             ]
             self._set_vision(
                 "motion",
@@ -2223,6 +2920,7 @@ class MappingController:
             self._hazards = hazards_from(sightings)
             self._last_node = observation_id
             self._last_odometry = odometry
+            self._last_scan = scan
             self._last_camera_views = views
             self._odometry_scale = scale
             self._place_counts = place_counts
@@ -2230,6 +2928,7 @@ class MappingController:
                 self._last_place = event.summary()
             self._last_localization = {
                 "sensor": "lidar" if is_lidar_scan(scan) else "sonar",
+                "turns_from": prediction_source,
                 "visual_used": prediction.visual_used,
                 "visual_rejected": prediction.visual_rejected,
                 "side_views": bool(side_views),
@@ -2260,9 +2959,8 @@ class MappingController:
     # -- ranging -------------------------------------------------------------
 
     def _scan_angles(self) -> tuple[int, ...]:
-        if self._ranging.lidar_ready():
-            return LIDAR_SCAN_ANGLES
-        return SCAN_ANGLES if self._ranging.sonar_ready() else ()
+        """Sweeps are lidar sweeps: none without a working lidar."""
+        return LIDAR_SCAN_ANGLES if self._ranging.lidar_ready() else ()
 
     def _lidar_sample(self, pan: int) -> dict[str, object]:
         """One lidar sweep reading: the median of a few frames, with the
@@ -2298,7 +2996,8 @@ class MappingController:
             max(samples) - min(samples) <= LIDAR_SAMPLE_SPREAD_CM + 0.03 * min(samples)
         )
         return {
-            "angle_deg": int(pan_bearing(pan)),
+            "angle_deg": round(pan_bearing(pan), 2),
+            "pan": pan,
             "distance_cm": round(statistics.median(samples), 1) if usable else None,
             "samples": len(samples),
             "error": None if usable else (errors[-1] if errors else "frames disagree"),
@@ -2314,15 +3013,13 @@ class MappingController:
         view_pans: Sequence[int],
         strip_pans: Sequence[int] = (),
     ) -> tuple[list[dict[str, object]] | None, dict[ViewKey, tuple[bytes, ...]]]:
-        """Sweep the range sensors (the lidar every degree when fitted, else
-        the ultrasonic every 3), grabbing camera views at the requested pans
-        and turn-strip pictures at `strip_pans` (kept in self._sweep_strip)."""
+        """Sweep the lidar every degree, grabbing camera views at the requested
+        pans and turn-strip pictures at `strip_pans` (kept in self._sweep_strip)."""
         scan: list[dict[str, object]] = []
         views: dict[ViewKey, tuple[bytes, ...]] = {}
         strip: dict[int, tuple[bytes, ...]] = {}
         self._sweep_strip = None
         scan_angles = set(self._scan_angles())
-        lidar = self._ranging.lidar_ready()
         pans = sorted(set(view_pans) | set(strip_pans) | scan_angles)
         # Side views are compared with the previous stop's, so they keep the
         # stop's exposure even if a strip picture needed another one.
@@ -2331,13 +3028,8 @@ class MappingController:
         set_exposure = getattr(self._camera, "set_exposure", None)
         if not pans:
             return scan, views
-        # A sensor that reports a running median needs time to forget the last
-        # direction; such a reading is already a median, so one per angle will do.
-        lag = self._range_sensor.settle_seconds
-        # The lidar steps a degree at a time and reads a frame or two after
-        # each step; the sonar steps three degrees and waits out its median.
-        settle = LIDAR_STEP_SETTLE_SECONDS if lidar else max(SCAN_STEP_SETTLE_SECONDS, lag)
-        samples_per_angle = 1 if lag > 0 else SCAN_SAMPLES_PER_ANGLE
+        # The lidar steps a degree at a time and reads a few frames after each step.
+        settle = LIDAR_STEP_SETTLE_SECONDS
         self._pan_tilt.set_inhibited(True)
         try:
             self._pan_tilt.set_angles(SCAN_LEAD_IN_PAN, tilt, override=True)
@@ -2368,37 +3060,11 @@ class MappingController:
                         views[(pan, tilt)] = (frame,)
                 if pan not in scan_angles:
                     continue
-                if lidar:
-                    if (pan in strip_pans or pan in view_pans) and self._halt_wait(LIDAR_STEP_SETTLE_SECONDS):
-                        return None, views
-                    scan.append(self._lidar_sample(pan))
-                    if self._stop_event.is_set():
-                        return None, views
-                    continue
-                samples: list[float] = []
-                errors: list[str] = []
-                for _ in range(samples_per_angle):
-                    try:
-                        distance = self._range_sensor.sample_now()
-                        if distance is not None:
-                            samples.append(distance)
-                        else:
-                            errors.append("No echo received")
-                    except Exception as exc:
-                        errors.append(f"{type(exc).__name__}: {exc}")
-                        logger.warning("Ultrasonic scan sample failed: %s", exc)
-                    if self._halt_wait(SCAN_SAMPLE_INTERVAL_SECONDS):
-                        return None, views
-                scan.append(
-                    {
-                        "angle_deg": int(pan_bearing(pan)),
-                        "distance_cm": round(statistics.median(samples), 1)
-                        if samples
-                        else None,
-                        "samples": len(samples),
-                        "error": errors[-1] if not samples and errors else None,
-                    }
-                )
+                if (pan in strip_pans or pan in view_pans) and self._halt_wait(LIDAR_STEP_SETTLE_SECONDS):
+                    return None, views
+                scan.append(self._lidar_sample(pan))
+                if self._stop_event.is_set():
+                    return None, views
         finally:
             try:
                 self._pan_tilt.set_angles(original_pan, tilt, override=True)
@@ -2481,6 +3147,34 @@ class MappingController:
             strip[nearest] = sweep_strip.pictures[nearest]
         return strip
 
+    def _learn_pan_scale(self, scan: list[dict[str, object]], raw_odometry: Pose, source: str) -> None:
+        """After a gyro-measured turn on the spot, see how far the lidar's view
+        moved across the pan, and refine the pan servo's scale from it."""
+        with self._lock:
+            previous = self._last_scan
+        if (
+            previous is None
+            or source != "gyro"
+            or self._pan_tilt.status()["mode"] != "hardware"
+            or math.hypot(raw_odometry[0], raw_odometry[1]) > PAN_SCALE_MAX_MOVE_CM
+            or not PAN_SCALE_TURN_RANGE_DEG[0] <= abs(raw_odometry[2]) <= PAN_SCALE_TURN_RANGE_DEG[1]
+        ):
+            return
+        estimate = estimate_pan_scale(previous, scan, raw_odometry[2])
+        if estimate is None:
+            return
+        measured, error, readings = estimate
+        current = pan_scale()
+        updated = set_pan_scale(current + PAN_SCALE_BLEND * (measured - current))
+        with self._lock:
+            self._pan_scale_learned = updated
+            self._pan_scale_samples += 1
+        logger.info(
+            "Pan servo scale %.3f from a %.0f-degree turn (%d readings, %.1f cm); now %.3f",
+            measured, raw_odometry[2], readings, error, updated,
+        )
+        self._save_learned()
+
     def _learned_odometry_scale(
         self,
         raw_odometry: Pose,
@@ -2501,13 +3195,17 @@ class MappingController:
             along_sigma = math.sqrt(max(float(world_unit @ covariance[:2, :2] @ world_unit), 0.0))
             if along_sigma < 0.2 * distance:
                 ratio = float(np.array(actual[:2]) @ unit) / distance
-                translation_scale = min(2.0, max(0.5, 0.8 * translation_scale + 0.2 * ratio))
+                with self._lock:
+                    measured = self._translation_source == "accelerometer"
+                low, high = MEASURED_TRANSLATION_SCALE_LIMITS if measured else WHEEL_TRANSLATION_SCALE_LIMITS
+                translation_scale = min(high, max(low, 0.8 * translation_scale + 0.2 * ratio))
         if (registered or prediction.visual_used) and abs(raw_odometry[2]) > 5.0:
             heading_sigma = math.degrees(math.sqrt(max(float(covariance[2, 2]), 0.0)))
             if heading_sigma < 0.2 * abs(raw_odometry[2]):
                 ratio = wrap_degrees(actual[2]) / raw_odometry[2]
+                low, high = self._rotation_limits()
                 if 0.3 <= ratio <= 3.0:
-                    rotation_scale = min(2.0, max(0.5, 0.8 * rotation_scale + 0.2 * ratio))
+                    rotation_scale = min(high, max(low, 0.8 * rotation_scale + 0.2 * ratio))
         return translation_scale, rotation_scale
 
     def _count_move(self) -> None:

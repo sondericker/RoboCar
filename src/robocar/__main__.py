@@ -1,11 +1,18 @@
 import atexit
 import logging
+import os
 import signal
+import threading
 
 from dotenv import load_dotenv
 
 from robocar.config import Config
 from robocar.web import create_app
+
+logger = logging.getLogger("robocar")
+# Shutting down may take this long before the process is ended anyway (the
+# drive's own watchdog has stopped the motors by then).
+SHUTDOWN_LIMIT_SECONDS = 15.0
 
 
 def main() -> None:
@@ -15,19 +22,43 @@ def main() -> None:
     app = create_app(config)
 
     def close_resources() -> None:
-        app.extensions["robocar_mapping"].close()
-        app.extensions["robocar_power"].close()
-        app.extensions["robocar_drive"].close()
-        app.extensions["robocar_pan_tilt"].close()
-        app.extensions["robocar_range_sensor"].close()
-        if app.extensions["robocar_lidar"] is not None:
-            app.extensions["robocar_lidar"].close()
-        app.extensions["robocar_camera"].close()
-        if app.extensions["robocar_head_camera"] is not app.extensions["robocar_camera"]:
-            app.extensions["robocar_head_camera"].close()
-        # Last, once nothing uses it: HailoRT crashes the process at exit if
-        # its session is left for the interpreter to tear down.
-        app.extensions["robocar_detector"].close()
+        def give_up() -> None:
+            logger.error("Shutdown still not finished after %.0f s; ending the process", SHUTDOWN_LIMIT_SECONDS)
+            logging.shutdown()
+            os._exit(1)
+
+        watchdog = threading.Timer(SHUTDOWN_LIMIT_SECONDS, give_up)
+        watchdog.daemon = True
+        watchdog.start()
+        extensions = app.extensions
+        steps = [
+            ("mapping", extensions["robocar_mapping"]),
+            ("power monitor", extensions["robocar_power"]),
+            ("drive", extensions["robocar_drive"]),
+            ("pan/tilt", extensions["robocar_pan_tilt"]),
+            ("ultrasonic", extensions["robocar_range_sensor"]),
+            ("lidar", extensions["robocar_lidar"]),
+            # After the drive, which reads its heading.
+            ("IMU", extensions["robocar_imu"]),
+            ("forward camera", extensions["robocar_camera"]),
+            (
+                "head camera",
+                extensions["robocar_head_camera"] if extensions["robocar_head_camera"] is not extensions["robocar_camera"] else None,
+            ),
+            # Last, once nothing uses it: HailoRT crashes the process at exit if
+            # its session is left for the interpreter to tear down.
+            ("detector", extensions["robocar_detector"]),
+        ]
+        for name, part in steps:
+            if part is None:
+                continue
+            logger.info("Closing the %s", name)
+            try:
+                part.close()
+            except Exception:
+                logger.exception("Closing the %s failed", name)
+        watchdog.cancel()
+        logger.info("Shut down")
 
     def stop_on_signal(signum: int, frame: object) -> None:
         raise SystemExit(128 + signum)

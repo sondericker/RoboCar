@@ -29,7 +29,7 @@ from robocar.explore_plan import (
 from robocar.mapping import AUTO_STEP_CM, MappingController, fuse_pose
 from robocar.pictures import CameraMotionEstimate, assess_picture, estimate_camera_yaw_change
 from robocar.places import CAMERA_HORIZONTAL_FOV_DEGREES
-from robocar.ranging import SCAN_ANGLES
+from robocar.ranging import LIDAR_SCAN_ANGLES
 from robocar.store import MappingStore
 from robocar.exploration import CoverageGrid, Frontier, Waypoint
 from robocar.localization import RegistrationResult, compose, relative, wrap_degrees
@@ -68,8 +68,9 @@ class RecordingDriver(SimulatedDriver):
 def fast_sweeps(test: unittest.TestCase) -> None:
     for name, value in (
         ("SCAN_FIRST_SETTLE_SECONDS", 0.01),
-        ("SCAN_STEP_SETTLE_SECONDS", 0.002),
-        ("SCAN_SAMPLE_INTERVAL_SECONDS", 0.001),
+        ("LIDAR_STEP_SETTLE_SECONDS", 0.0005),
+        ("LIDAR_SAMPLE_INTERVAL_SECONDS", 0.0005),
+        ("LIDAR_FAN_SETTLE_SECONDS", 0.0),
     ("CAMERA_SETTLE_SECONDS", 0.0),
     ):
         patcher = patch(f"robocar.mapping.{name}", value)
@@ -215,6 +216,7 @@ class MappingTests(unittest.TestCase):
             pan_tilt,
             range_sensor,
             MappingStore(Path(":memory:")),
+            lidar=range_sensor,
         )
         mapping._run_id = "slip-run"
         odometry = iter([(0.0, 0.0, 0.0), (0.0, 0.0, 12.0), (-6.27, 29.82, 12.0)])
@@ -280,7 +282,7 @@ class MappingTests(unittest.TestCase):
         range_sensor = RangeSensorController(None, physical=False)
         store = MappingStore(Path(":memory:"))
         camera = ImageSequenceCamera()
-        mapping = MappingController(camera, drive, pan_tilt, range_sensor, store)
+        mapping = MappingController(camera, drive, pan_tilt, range_sensor, store, lidar=range_sensor)
         mapping._run_id = "visual-run"
         odometry = iter([(0.0, 0.0, 0.0), (0.0, 0.0, 12.0)])
         try:
@@ -306,7 +308,7 @@ class MappingTests(unittest.TestCase):
             pan_tilt = PanTiltController(pan_tilt_driver, physical=False)
             range_sensor = RangeSensorController(FakeRangeSensor(), physical=True, sample_interval=0.02)
             store = MappingStore(Path(directory) / "mapping.sqlite3")
-            mapping = MappingController(FakeCamera(), drive, pan_tilt, range_sensor, store)
+            mapping = MappingController(FakeCamera(), drive, pan_tilt, range_sensor, store, lidar=range_sensor)
             try:
                 mapping.start()
                 deadline = time.monotonic() + 5
@@ -322,7 +324,7 @@ class MappingTests(unittest.TestCase):
                 observation = mapping.observations()[0]
                 self.assertEqual(
                     [item["angle_deg"] for item in observation["scan"]],
-                    list(range(57, -61, -3)),  # pan 33 (left) to 150 (right)
+                    [float(angle) for angle in range(60, -61, -1)],  # pan 30 (left) to 150 (right), every degree
                 )
                 self.assertTrue(all(item["distance_cm"] == 80 for item in observation["scan"]))
                 self.assertEqual(pan_tilt_driver.pan, 90)
@@ -345,9 +347,10 @@ class MappingTests(unittest.TestCase):
                 pan_tilt,
                 range_sensor,
                 MappingStore(Path(directory) / "mapping.sqlite3"),
+                lidar=range_sensor,
             )
             try:
-                mapping.start_autonomous(attended=True)
+                mapping.start_autonomous(attended=True, strategy="frontier")
                 deadline = time.monotonic() + 7
                 while mapping.status()["move_count"] == 0 and time.monotonic() < deadline:
                     time.sleep(0.02)
@@ -374,6 +377,7 @@ class MappingTests(unittest.TestCase):
                 pan_tilt,
                 range_sensor,
                 MappingStore(Path(directory) / "mapping.sqlite3"),
+                lidar=range_sensor,
             )
             try:
                 started_at = time.monotonic()
@@ -408,6 +412,7 @@ class MappingTests(unittest.TestCase):
                 pan_tilt,
                 range_sensor,
                 MappingStore(Path(directory) / "mapping.sqlite3"),
+                lidar=range_sensor,
             )
             blocked_scan = [
                 {"angle_deg": angle, "distance_cm": 15.0, "samples": 3, "error": None}
@@ -415,7 +420,7 @@ class MappingTests(unittest.TestCase):
             ]
             try:
                 with patch.object(mapping, "_capture_observation", return_value=blocked_scan):
-                    mapping.start_autonomous(attended=True)
+                    mapping.start_autonomous(attended=True, strategy="frontier")
                     deadline = time.monotonic() + 3
                     while mapping.status()["enabled"] and time.monotonic() < deadline:
                         time.sleep(0.02)
@@ -445,14 +450,15 @@ class MappingTests(unittest.TestCase):
                 pan_tilt,
                 range_sensor,
                 MappingStore(Path(directory) / "mapping.sqlite3"),
+                lidar=range_sensor,
             )
             try:
-                mapping.start_autonomous(attended=True)
+                mapping.start_autonomous(attended=True, strategy="frontier")
                 deadline = time.monotonic() + 5
                 while mapping.status()["enabled"] and time.monotonic() < deadline:
                     time.sleep(0.02)
                 self.assertEqual(mapping.status()["state"], "error")
-                self.assertIn("No valid ultrasonic readings", mapping.status()["error"])
+                self.assertIn("No valid range readings", mapping.status()["error"])
                 self.assertEqual(driver.command, (0, 0, 0, 0))
             finally:
                 mapping.close()
@@ -482,9 +488,10 @@ class MappingTests(unittest.TestCase):
                 pan_tilt,
                 range_sensor,
                 MappingStore(Path(directory) / "mapping.sqlite3"),
+                lidar=range_sensor,
             )
             try:
-                mapping.start_autonomous(attended=True)
+                mapping.start_autonomous(attended=True, strategy="frontier")
                 deadline = time.monotonic() + 5
                 while not any(command[0] != command[2] for command in driver.commands) and time.monotonic() < deadline:
                     time.sleep(0.02)
@@ -516,12 +523,13 @@ class MappingTests(unittest.TestCase):
             pan_tilt,
             range_sensor,
             MappingStore(Path(":memory:")),
+            lidar=range_sensor,
         )
         try:
             with self.assertRaises(ValueError):
                 mapping.start_autonomous(attended=False)
             with self.assertRaises(RuntimeError):
-                mapping.start_autonomous(attended=True)
+                mapping.start_autonomous(attended=True, strategy="frontier")
         finally:
             mapping.close()
             drive.close()
@@ -542,16 +550,16 @@ class MappingTests(unittest.TestCase):
         pan_driver = RecordingPanTilt()
         pan_tilt = PanTiltController(pan_driver, physical=False)
         range_sensor = RangeSensorController(FakeRangeSensor(), physical=True, sample_interval=0.5)
-        mapping = MappingController(FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")))
+        mapping = MappingController(FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")), lidar=range_sensor)
         try:
             pan_driver.history.clear()
             scan, _ = mapping._sweep(90, 90, (54, 126))
             sweep = pan_driver.history[1:-1]
             self.assertEqual(pan_driver.history[0], 30)
             self.assertEqual(sweep, sorted(sweep))
-            self.assertEqual(sweep, list(SCAN_ANGLES))
+            self.assertEqual(sweep, list(LIDAR_SCAN_ANGLES))
             self.assertEqual(pan_driver.history[-1], 90)
-            self.assertEqual(len(scan), len(SCAN_ANGLES))
+            self.assertEqual(len(scan), len(LIDAR_SCAN_ANGLES))
         finally:
             mapping.close()
             drive.close()
@@ -842,10 +850,10 @@ class LocalizedTests(unittest.TestCase):
 
         class RoomSensor(FakeRangeSensor):
             def get_distance(self) -> float | None:
-                return room.distance(drive.odometry(), 90 - pan_driver.pan)
+                return room.lidar_distance(drive.odometry(), 90 - pan_driver.pan)
 
         range_sensor = RangeSensorController(RoomSensor(), physical=True, sample_interval=0.5)
-        mapping = MappingController(FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")))
+        mapping = MappingController(FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")), lidar=range_sensor)
         for resource in (range_sensor, pan_tilt, drive, mapping):
             self.addCleanup(resource.close)
         mapping._run_id = "where"
@@ -874,10 +882,10 @@ class LocalizedTests(unittest.TestCase):
 
         class RoomSensor(FakeRangeSensor):
             def get_distance(self) -> float | None:
-                return room.distance(compose(offset, drive.odometry()), 90 - pan_driver.pan)
+                return room.lidar_distance(compose(offset, drive.odometry()), 90 - pan_driver.pan)
 
         range_sensor = RangeSensorController(RoomSensor(), physical=True, sample_interval=0.5)
-        mapping = MappingController(FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")))
+        mapping = MappingController(FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")), lidar=range_sensor)
         for resource in (range_sensor, pan_tilt, drive, mapping):
             self.addCleanup(resource.close)
         return mapping, drive, pan_driver
@@ -899,7 +907,9 @@ class LocalizedTests(unittest.TestCase):
         rejected = lambda echoes, pose, covariance, surface_map: RegistrationResult(
             tuple(pose), covariance, False, 0, 0.0, (0.0, 0.0, 0.0), "test: walls too cluttered"
         )
-        with patch("robocar.mapping.register_scan", side_effect=rejected):
+        with patch("robocar.mapping.register_scan", side_effect=rejected), patch.object(
+            mapping, "_match_to_grid", return_value=None
+        ):
             mapping._capture_observation(mode="hunt")
         here = mapping.localized()
         self.assertTrue(here["known"], here)
@@ -989,11 +999,11 @@ class FixedCameraTests(unittest.TestCase):
 
         class RoomSensor(FakeRangeSensor):
             def get_distance(self) -> float | None:
-                return room.distance(drive.odometry(), 90 - pan_driver.pan)
+                return room.lidar_distance(drive.odometry(), 90 - pan_driver.pan)
 
         range_sensor = RangeSensorController(RoomSensor(), physical=True, sample_interval=0.5)
         mapping = MappingController(
-            FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")), camera_on_head=False
+            FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")), camera_on_head=False, lidar=range_sensor
         )
         for resource in (range_sensor, pan_tilt, drive, mapping):
             self.addCleanup(resource.close)
@@ -1044,11 +1054,11 @@ class ForwardCameraTests(unittest.TestCase):
 
         class RoomSensor(FakeRangeSensor):
             def get_distance(self) -> float | None:
-                return room.distance(drive.odometry(), 90 - pan_driver.pan)
+                return room.lidar_distance(drive.odometry(), 90 - pan_driver.pan)
 
         range_sensor = RangeSensorController(RoomSensor(), physical=True, sample_interval=0.5)
         mapping = MappingController(
-            FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")), hunt_camera=forward
+            FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")), hunt_camera=forward, lidar=range_sensor
         )
         for resource in (range_sensor, pan_tilt, drive, mapping):
             self.addCleanup(resource.close)
@@ -1194,7 +1204,7 @@ class SlippingRoomTests(unittest.TestCase):
 
         class RoomSensor(FakeRangeSensor):
             def get_distance(self) -> float | None:
-                return room.distance(true_pose(), 90 - pan_driver.pan)
+                return room.lidar_distance(true_pose(), 90 - pan_driver.pan)
 
         range_sensor = RangeSensorController(RoomSensor(), physical=True, sample_interval=0.5)
         mapping = MappingController(
@@ -1203,6 +1213,7 @@ class SlippingRoomTests(unittest.TestCase):
             pan_tilt,
             range_sensor,
             MappingStore(Path(":memory:")),
+            lidar=range_sensor,
         )
         mapping._run_id = "slipping-room"
         try:
@@ -1251,10 +1262,10 @@ class SlippingRoomTests(unittest.TestCase):
 
                 class RoomSensor(FakeRangeSensor):
                     def get_distance(self, true_pose=true_pose, pan_driver=pan_driver) -> float | None:
-                        return room.distance(true_pose(), 90 - pan_driver.pan)
+                        return room.lidar_distance(true_pose(), 90 - pan_driver.pan)
 
                 range_sensor = RangeSensorController(RoomSensor(), physical=True, sample_interval=0.5)
-                mapping = MappingController(FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(database))
+                mapping = MappingController(FakeCamera(), drive, pan_tilt, range_sensor, MappingStore(database), lidar=range_sensor)
                 try:
                     mapping._run_id = run_id
                     mapping._continue_map(run_id)
@@ -1317,7 +1328,7 @@ class ExposureTests(unittest.TestCase):
         drive = DriveController(SimulatedDriver(), max_duty=1000, command_timeout=1, physical=False)
         pan_tilt = PanTiltController(SimulatedPanTilt(), physical=False)
         range_sensor = RangeSensorController(None, physical=False)
-        mapping = MappingController(camera, drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")))
+        mapping = MappingController(camera, drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")), lidar=range_sensor)
         self.addCleanup(range_sensor.close)
         self.addCleanup(pan_tilt.close)
         self.addCleanup(drive.close)
@@ -1392,7 +1403,7 @@ class SteadinessTests(unittest.TestCase):
         drive = DriveController(SimulatedDriver(), max_duty=1000, command_timeout=1, physical=False)
         pan_tilt = PanTiltController(SimulatedPanTilt(), physical=False)
         range_sensor = RangeSensorController(None, physical=False)
-        mapping = MappingController(camera, drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")))
+        mapping = MappingController(camera, drive, pan_tilt, range_sensor, MappingStore(Path(":memory:")), lidar=range_sensor)
         for resource in (range_sensor, pan_tilt, drive, mapping):
             self.addCleanup(resource.close)
         return mapping

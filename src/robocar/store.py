@@ -17,6 +17,7 @@ from typing import Sequence
 import numpy as np
 
 from robocar.places import Keyframe
+from robocar.ranging import with_current_angles
 
 # Mapping pauses rather than fill the disk.
 MINIMUM_FREE_BYTES = 256 * 1024 * 1024
@@ -204,7 +205,7 @@ class MappingStore:
         return {
             "id": int(row[0]),
             "captured_at": row[1],
-            "scan": json.loads(row[2]),
+            "scan": with_current_angles(json.loads(row[2])),
             "run_id": row[3],
             "mode": row[4],
             "pose_x_cm": row[5],

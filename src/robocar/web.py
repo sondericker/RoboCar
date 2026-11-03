@@ -1,6 +1,7 @@
 import logging
 import math
 import time
+from pathlib import Path
 
 from flask import Flask, Response, jsonify, render_template, request
 
@@ -12,13 +13,16 @@ from robocar.drive import (
     DriveInhibitedError,
     FreenoveDriver,
     FreenovePanTilt,
+    HARDWARE_PAN_SCALE,
     PAN_LIMITS,
     TILT_LIMITS,
     PanTiltInhibitedError,
+    set_pan_scale,
     PanTiltController,
     SimulatedDriver,
     SimulatedPanTilt,
 )
+from robocar.imu import IMU_SEARCH_BUSES, MPU6500, ImuController
 from robocar.mapping import MappingController
 from robocar.store import MappingStore
 from robocar.power import BoardADC, PiPower, PowerMonitor, board_version
@@ -93,29 +97,77 @@ def _open_lidar(config: Config) -> RangeSensorController | None:
     return RangeSensorController(driver, True, sample_interval=0.1, name="Lidar")
 
 
+def _open_imu(config: Config) -> ImuController | None:
+    """The gyro, if there is one: None when it is turned off, or in auto mode
+    when none answers (turns are then judged from the wheels)."""
+    if not config.hardware_enabled or config.imu == "off":
+        return None
+    buses = (config.imu_bus,) if config.imu_bus is not None else IMU_SEARCH_BUSES
+    reasons = []
+    for bus in buses:
+        if not Path(f"/dev/i2c-{bus}").exists():
+            reasons.append(f"no I2C bus {bus}")
+            continue
+        try:
+            driver = MPU6500(bus)
+        except Exception as exc:
+            reasons.append(f"bus {bus}: {type(exc).__name__}: {exc}")
+            continue
+        logger.info("%s gyro found on I2C bus %d at 0x%02x", driver.model, bus, driver.address)
+        return ImuController(driver)
+    reason = "; ".join(reasons) or "no I2C bus to search"
+    if config.imu == "auto":
+        logger.info("No IMU found (%s); turns are judged from the wheels", reason)
+        return None
+    logger.error("IMU unavailable: %s", reason)
+    return ImuController(None, fault=reason)
+
+
 def create_app(config: Config | None = None) -> Flask:
     config = config or Config.from_env()
     drive_fault = pan_tilt_fault = range_fault = None
+    lidar = _open_lidar(config)
+    # The sonar is left off (never opened, so silent) when the lidar does its
+    # job: its 40 kHz pings, sent all the time it is open, are within a
+    # cat's hearing. ROBOCAR_SONAR=on brings it back (glass, mirrors).
+    sonar_wanted = config.sonar == "on" or (config.sonar == "auto" and (lidar is None or not lidar.status()["enabled"]))
     if config.hardware_enabled:
         driver, drive_fault = _open_hardware("Motor board", lambda: FreenoveDriver(config.freenove_server_path))
         pan_tilt_driver, pan_tilt_fault = _open_hardware(
             "Pan/tilt servos", lambda: FreenovePanTilt(config.freenove_server_path)
         )
-        range_sensor_driver, range_fault = _open_hardware(
-            "Ultrasonic sensor", lambda: FreenoveRangeSensor(config.freenove_server_path)
-        )
+        range_sensor_driver = None
+        if sonar_wanted:
+            range_sensor_driver, range_fault = _open_hardware(
+                "Ultrasonic sensor", lambda: FreenoveRangeSensor(config.freenove_server_path)
+            )
+        else:
+            logger.info("Ultrasonic sensor left off: the lidar does the ranging (ROBOCAR_SONAR=on to use it)")
     else:
         driver, pan_tilt_driver, range_sensor_driver = SimulatedDriver(), SimulatedPanTilt(), None
-    drive = DriveController(
-        driver or SimulatedDriver(),
-        config.max_motor_duty,
-        config.command_timeout,
-        config.hardware_enabled,
-        fault=drive_fault,
-    )
+    imu = _open_imu(config)
+    try:
+        drive = DriveController(
+            driver or SimulatedDriver(),
+            config.max_motor_duty,
+            config.command_timeout,
+            config.hardware_enabled,
+            fault=drive_fault,
+            imu=imu,
+        )
+    except OSError as exc:
+        # The board answered when opened but not when first told to stop
+        # (still powering up): run without motors rather than not at all.
+        drive_fault = f"{type(exc).__name__}: {exc}"
+        logger.error("Motor board unavailable: %s", drive_fault)
+        drive = DriveController(
+            SimulatedDriver(), config.max_motor_duty, config.command_timeout, config.hardware_enabled, fault=drive_fault, imu=imu
+        )
     pan_tilt = PanTiltController(pan_tilt_driver or SimulatedPanTilt(), config.hardware_enabled, fault=pan_tilt_fault)
-    range_sensor = RangeSensorController(range_sensor_driver, config.hardware_enabled, fault=range_fault)
-    lidar = _open_lidar(config)
+    if pan_tilt_driver is not None and config.hardware_enabled:
+        # The car's pan servo turns less than told; mapping refines this.
+        set_pan_scale(HARDWARE_PAN_SCALE)
+    range_sensor = RangeSensorController(range_sensor_driver, config.hardware_enabled and sonar_wanted, fault=range_fault)
     adc, adc_fault = (
         _open_hardware("Battery monitor", lambda: BoardADC(board_version(config.freenove_server_path)))
         if config.hardware_enabled
@@ -127,6 +179,7 @@ def create_app(config: Config | None = None) -> Flask:
         lambda: any(abs(float(drive.status()[axis])) > 0.01 for axis in ("throttle", "strafe", "steering")),
         cells=config.battery_cells,
         adc_fault=adc_fault,
+        adc_opener=(lambda: BoardADC(board_version(config.freenove_server_path))) if config.hardware_enabled else None,
     )
     detector = ObjectDetector(
         config.model_path,
@@ -156,6 +209,8 @@ def create_app(config: Config | None = None) -> Flask:
     app.extensions["robocar_detector"] = detector
     app.extensions["robocar_power"] = power
     mapping.battery_level = power.battery_level
+    # The drive keeps the motors' torque up as the battery runs down.
+    drive.set_supply(power.volts_now, config.battery_cells)
 
     def battery_too_low() -> str | None:
         if power.battery_level() == "critical":
@@ -166,6 +221,7 @@ def create_app(config: Config | None = None) -> Flask:
     app.extensions["robocar_pan_tilt"] = pan_tilt
     app.extensions["robocar_range_sensor"] = range_sensor
     app.extensions["robocar_lidar"] = lidar
+    app.extensions["robocar_imu"] = imu
     app.extensions["robocar_mapping"] = mapping
 
     @app.get("/")
@@ -189,6 +245,7 @@ def create_app(config: Config | None = None) -> Flask:
                 "drive": drive.status(),
                 "range": range_sensor.status(),
                 "lidar": lidar.status() if lidar is not None else None,
+                "imu": imu.status() if imu is not None else None,
                 "mapping": mapping.status(),
                 "power": power.status(),
             }
@@ -215,7 +272,7 @@ def create_app(config: Config | None = None) -> Flask:
             return jsonify({"error": "enabled must be a boolean"}), 400
         if payload["enabled"] and not isinstance(payload.get("attended"), bool):
             return jsonify({"error": "attended must be a boolean"}), 400
-        strategy = payload.get("strategy", "frontier")
+        strategy = payload.get("strategy", "room")
         if not isinstance(strategy, str):
             return jsonify({"error": "strategy must be a string"}), 400
         if payload["enabled"] and (reason := battery_too_low()):

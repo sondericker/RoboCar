@@ -26,9 +26,12 @@ CORRIDOR_HALF_WIDTH_CM = 14.0
 LIDAR_OPEN_CM = 300.0
 AUTO_MIN_CLEARANCE_CM = 60.0
 # Forward legs run as far toward the next waypoint as a straight line allows,
-# up to AUTO_LONG_STEP_CM between sweeps, stopping AUTO_WALL_STANDOFF_CM short
-# of whatever the sonar sees ahead.
+# stopping AUTO_WALL_STANDOFF_CM short of whatever is seen ahead and of the
+# map's walls: with the sonar (short, unsure reach) at most AUTO_LONG_STEP_CM
+# between sweeps, with the lidar as far as it saw clear (LIDAR_LONG_STEP_CM
+# at most); the car watches ahead as it goes.
 AUTO_LONG_STEP_CM = 60.0
+LIDAR_LONG_STEP_CM = 300.0
 AUTO_MIN_STEP_CM = 10.0
 # A person or animal the camera sees within AUTO_BLOCKED_CONE_DEGREES of
 # where the car would drive, nearer than this (or at an unknown distance),
@@ -222,6 +225,7 @@ def _plan_explore_step(
     short way toward the next waypoint and drives as far toward it as a
     straight line allows; the sonar sweep has the final say on driving.
     """
+    long_step = LIDAR_LONG_STEP_CM if is_lidar_scan(scan) else AUTO_LONG_STEP_CM
     learner = learner or ExplorationLearner()
     learner.observe(pose, grid.known_count())
     if turns_without_progress == 0:
@@ -281,7 +285,7 @@ def _plan_explore_step(
                 aim = here + direction(axis) * AUTO_CORRIDOR_AIM_CM + direction(axis + 90.0) * centre
                 aim_offset = aim - here
                 bearing = (math.degrees(math.atan2(-aim_offset[0], aim_offset[1])) - float(pose[2]) + 180.0) % 360.0 - 180.0
-                distance_to_waypoint = min(float(np.hypot(*offset)), AUTO_LONG_STEP_CM)
+                distance_to_waypoint = min(float(np.hypot(*offset)), long_step)
                 in_corridor = True
                 break
     target = frontier.target
@@ -303,16 +307,16 @@ def _plan_explore_step(
         then = 0.0
         if degrees == bearing and distance_to_waypoint >= AUTO_MIN_STEP_CM + 10.0 and not hazard_within(hazards, degrees):
             facing = (pose[0], pose[1], float(pose[2]) + degrees)
-            then = min(AUTO_LONG_STEP_CM, distance_to_waypoint, grid.clear_run(facing, AUTO_LONG_STEP_CM))
+            then = min(long_step, distance_to_waypoint, grid.clear_run(facing, long_step))
             if then < AUTO_MIN_STEP_CM:
                 then = 0.0
         reason = f"turning toward {where} ({bearing:+.0f}°)" + (f", then {then:.0f} cm" if then else "")
         learner.last_turn = 0.0 if then else degrees
         return ExploreStep("turn", degrees, reason, target, distance_cm=then)
     # The map has a say too: a wall met at a glancing angle never echoes.
-    mapped_run = grid.clear_run(pose, AUTO_LONG_STEP_CM)
+    mapped_run = grid.clear_run(pose, long_step)
     if ahead_clear and mapped_run >= AUTO_MIN_STEP_CM:
-        leg = min(AUTO_LONG_STEP_CM, distance_to_waypoint, ahead - AUTO_WALL_STANDOFF_CM, mapped_run)
+        leg = min(long_step, distance_to_waypoint, ahead - AUTO_WALL_STANDOFF_CM, mapped_run)
         leg = max(AUTO_MIN_STEP_CM, leg)
         return ExploreStep("forward", reason=f"driving {leg:.0f} cm toward {where}", target=target, distance_cm=leg)
     if ahead_clear and turning_allowed:

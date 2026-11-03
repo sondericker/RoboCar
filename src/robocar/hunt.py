@@ -62,7 +62,7 @@ from typing import Callable, Mapping, Protocol, Sequence
 
 import numpy as np
 
-from robocar.drive import pan_bearing
+from robocar.drive import TurnPower, TurnSteerer, bearing_pan, pan_bearing
 from robocar.exploration import CONFIRMED_ABOVE, CoverageGrid
 from robocar.localization import Pose
 from robocar.semantics import CAMERA_HFOV_DEG
@@ -154,7 +154,12 @@ CONTROL_SECONDS = 0.1
 CRUISE_THROTTLE = 0.36
 APPROACH_THROTTLE = 0.3
 CREEP_THROTTLE = 0.2
-TURN_COMMAND = 0.3
+# Turns on the spot ask for a rate, not a power: the power is found from
+# what the gyro sees (see drive.TurnPower). Turning toward something goes
+# faster the further off it is, within these.
+TURN_RATE_MIN_DPS = 40.0
+TURN_RATE_MAX_DPS = 150.0
+TURN_RATE_PER_DEGREE = 2.5
 STEER_PER_DEGREE = 0.006
 STEER_LIMIT = 0.2
 # Further off the way than this, turn in place first.
@@ -187,6 +192,11 @@ RELOCALIZE_SECONDS = 120.0
 # With the camera fixed facing ahead, looking around is a spin on the spot,
 # watching all the way round.
 SPIN_LOOK_DEGREES = 360.0
+# Looking round turns at this rate (slow enough for the camera to see). A
+# spin that will not turn even at full power gives up, as it does after the
+# time limit.
+SPIN_LOOK_RATE_DPS = 60.0
+SPIN_LOOK_MAX_SECONDS = 12.0
 
 
 @dataclass(frozen=True)
@@ -544,6 +554,10 @@ class HuntEngine:
         session_seconds: float = SESSION_SECONDS,
     ) -> None:
         self.body = body
+        # What power turns the car how fast: the car's own (learned and kept)
+        # when the body has one, else learned during this hunt.
+        power = getattr(body, "turn_power", None)
+        self.turn_power: TurnPower = (power() if callable(power) else None) or TurnPower()
         self.memory = memory
         self.rng = rng or random.Random()
         self.session_seconds = session_seconds
@@ -760,7 +774,7 @@ class HuntEngine:
         if precise and not self.body.camera_pans() and abs(bearing) <= HEAD_RANGE_LIMIT_DEG:
             readings = []
             for offset in RANGE_FAN_DEG:
-                pan = int(round(90 - bearing - offset))
+                pan = int(round(bearing_pan(bearing + offset)))
                 if not 30 <= pan <= 150:
                     continue
                 reading = self.body.ping(pan, precise=True)
@@ -895,20 +909,34 @@ class HuntEngine:
         self.head = 90
         return self._spotted()
 
+    @staticmethod
+    def _turn_rate(degrees_off: float) -> float:
+        """How fast to turn toward something this far off (counterclockwise positive)."""
+        rate = min(TURN_RATE_MAX_DPS, max(TURN_RATE_MIN_DPS, TURN_RATE_PER_DEGREE * abs(degrees_off)))
+        return math.copysign(rate, degrees_off)
+
     def _spin_look(self, degrees: float = SPIN_LOOK_DEGREES) -> bool:
         """Turn on the spot watching the feed; True as soon as the cat shows."""
         side = self.rng.choice((-1, 1))
         start = self.body.odometry()[2]
         last_belief = -math.inf
         self.head = 90
+        steerer = TurnSteerer(self.turn_power)
+        began = self.body.now()
         try:
             while True:
                 self._check(not self.body.stopped())
                 if self._spotted():
                     return True
-                if abs(self.body.odometry()[2] - start) >= degrees:
+                heading = self.body.odometry()[2]
+                if abs(heading - start) >= degrees:
                     return False
                 now = self.body.now()
+                if steerer.stalled_at_max:
+                    self._say(action="can't turn on the spot here (a wheel slipping?); moving on")
+                    return False
+                if now - began >= SPIN_LOOK_MAX_SECONDS:
+                    return False
                 sighting = self.body.sighting()
                 if sighting is not None:
                     self._absorb(sighting)
@@ -921,7 +949,7 @@ class HuntEngine:
                         last_belief = now
                         pose = self.body.pose()
                         self.belief.looked(pose[:2], pose[2] + pan_bearing(sighting.pan))
-                self.body.command(0.0, 0.0, side * TURN_COMMAND)
+                self.body.command(0.0, 0.0, steerer.step(side * SPIN_LOOK_RATE_DPS, heading, now))
                 self._check(self.body.wait(CONTROL_SECONDS))
         finally:
             self.body.halt()
@@ -947,6 +975,7 @@ class HuntEngine:
         refreshed = -math.inf
         last_belief = -math.inf
         best_gap, best_at = math.inf, started
+        steerer = TurnSteerer(self.turn_power)
         try:
             while True:
                 self._check(not self.body.stopped())
@@ -985,8 +1014,9 @@ class HuntEngine:
                     self._check(self.body.wait(1.0))
                     return "person"
                 if abs(error) > TURN_IN_PLACE_DEG:
-                    self.body.command(0.0, 0.0, math.copysign(TURN_COMMAND, error))
+                    self.body.command(0.0, 0.0, steerer.step(self._turn_rate(error), self.body.odometry()[2], now))
                 else:
+                    steerer.reset()
                     ahead = self.body.range_ahead()
                     self.head = 90
                     room = grid.clear_run(pose, SEEK_LEG_CM)
@@ -1025,6 +1055,7 @@ class HuntEngine:
             self._look(90)
         started = self.body.now()
         last_ranged = -math.inf
+        steerer = TurnSteerer(self.turn_power)
         try:
             while True:
                 self._check(not self.body.stopped())
@@ -1062,8 +1093,9 @@ class HuntEngine:
                     # Lost it for a moment: hold still and let the camera find it.
                     self.body.command(0.0, 0.0, 0.0)
                 elif abs(bearing) > 20.0:
-                    self.body.command(0.0, 0.0, math.copysign(TURN_COMMAND, bearing))
+                    self.body.command(0.0, 0.0, steerer.step(self._turn_rate(bearing), self.body.odometry()[2], now))
                 else:
+                    steerer.reset()
                     ahead = self.body.range_ahead()
                     pose = self.body.pose()
                     room = self.body.grid().clear_run(pose, SEEK_LEG_CM)

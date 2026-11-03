@@ -33,9 +33,9 @@ class WebTests(unittest.TestCase):
         self.assertEqual(status["range"]["mode"], "disabled")
         self.assertIsNone(status["range"]["distance_cm"])
         self.assertEqual(status["mapping"]["observation_count"], 0)
-        self.assertIn("Ultrasonic range", dashboard)
+        self.assertIn("Range sensors", dashboard)
         self.assertIn("Mapping &amp; exploration", dashboard)
-        self.assertIn("Start mapping &amp; auto explore", dashboard)
+        self.assertIn(">Map the room<", dashboard)
         self.assertEqual(dashboard.count('id="mapping-toggle"'), 1)
         self.assertIn('id="reset-mapping"', dashboard)
         self.assertIn('class="mapping-section"', dashboard)
@@ -190,9 +190,15 @@ class MissingCarBoardTests(unittest.TestCase):
     """With the car's board switched off or unplugged the dashboard must still run."""
 
     def test_the_service_starts_and_reports_the_motor_board_unavailable(self):
-        app = create_app(
-            Config(mapping_database=Path(":memory:"), hardware_enabled=True, freenove_server_path=Path("/no/such/kit"))
-        )
+        # Hardware mode, but kept off the Pi's real buses: opening the gyro
+        # would reset it under a running service, and a lidar that answers
+        # would leave the sonar off.
+        with patch("robocar.web._open_lidar", return_value=None), patch("robocar.web._open_imu", return_value=None), patch(
+            "robocar.web.connected_models", return_value=[]
+        ):
+            app = create_app(
+                Config(mapping_database=Path(":memory:"), hardware_enabled=True, freenove_server_path=Path("/no/such/kit"))
+            )
         try:
             client = app.test_client()
             status = client.get("/api/status").get_json()

@@ -134,24 +134,121 @@ everything powered off: a sensor connected live once jammed the whole bus
 missing) or `off`. `i2cdetect -y 1` should list `10`, `40` and `48`.
 
 What it changes:
-- **Sweeps:** a reading every degree from 60° left to 60° right (121 in
+- **Sweeps:** a reading every degree of the pan servo from 30 to 150 (121 in
   all, each the median of three frames, about 7 s a sweep), against 40
-  smeared sonar readings before. The sonar's reading is kept alongside each.
+  smeared sonar readings before. The servo turns the head only about 0.85°
+  per degree it is told (measured on the car from turns on the spot, see
+  Gyro), so that is about 51° either side of straight ahead; every reading
+  keeps its pan, and its direction is worked out with the servo's scale.
 - **The map:** each lidar reading is a point on a surface, so walls, chair
   legs and doorways come out sharp. In the simulated two-room house, lidar
   sweeps found 95% of the floor in 20 moves (the sonar about half), and a
   sweep fitted to the map placed the car within about 2 cm and 1° (the
   sonar about 12 cm and 5°). The dashboard draws the lidar's points, one per
   2.5 cm.
-- **Safety:** before driving, the nearer of the lidar and the sonar counts.
-  The sonar's wide beam sees glass and thin things beside the line the
-  lidar passes, and the lidar sees dark fabric that soaks up sound. The way
-  ahead must be clear across the car's width, not just on one line.
+- **Safety:** before driving, the head fans the lidar across the car's width
+  (a reading every 2° from 20° left to 20° right): the way ahead must be
+  clear across the whole width, not just on one line, so a chair leg off to
+  one side still stops it.
 - **The cameras:** an object's distance comes from the lidar readings across
   the middle of its box, not the wall behind it. A "Lidar over the picture"
   panel draws each stop's readings over the camera's view, so you can see at
   a glance that they line up.
 - **The hunt:** see below.
+
+### Ultrasonic
+
+With the lidar working the ultrasonic is not used, and not even switched
+on: its 40 kHz pings, sent all the time it is on, are within a cat's
+hearing (cats hear to about 64 kHz). The lidar does everything it did, and
+better. The one thing it cannot do is see glass or mirrors, which the light
+goes through or bounces off; near those set `ROBOCAR_SONAR=on` to use the
+sonar as well (its reading is then kept with each lidar reading, and the
+nearer of the two counts). `ROBOCAR_SONAR` is `auto` (only without a
+working lidar, the default), `on` or `off`. Without a lidar everything
+works on the sonar as before.
+
+### Gyro
+
+An MPU-6500 family gyro and accelerometer (boards sold as "MPU-9250" are
+often an MPU-6500, with no compass; the compass would not be used anyway,
+as the motors upset it) measures how far the car really turns. It has an
+I²C bus of its own, so a fault on it cannot take down the motor board's:
+wire VCC to 3.3 V (pin 1), GND to pin 9, SDA to GPIO12 (pin 32), SCL to
+GPIO13 (pin 33), NCS to 3.3 V, and leave AD0, EDA, ECL, INT and FSYNC
+unconnected. Then turn those pins into bus 2 and reboot:
+
+```bash
+echo 'dtoverlay=i2c2-pi5,pins_12_13' | sudo tee -a /boot/firmware/config.txt
+sudo reboot
+```
+
+`i2cdetect -y 2` should then list `68`. As with the lidar, connect it only
+with everything powered off. `ROBOCAR_IMU` is `auto` (used when found, the
+default), `on` (shown as a fault when missing) or `off`; `ROBOCAR_IMU_BUS`
+picks the bus (by default 2, 3, 0 and then 1 are searched). It may be
+mounted any way round: up is found from gravity.
+
+What it changes:
+- **The heading** comes from the gyro, measured 100 times a second, rather
+  than from how long the motors ran. Wheel slip, the battery and the floor
+  no longer matter, and a push (say, from the cat) counts too. The gyro's
+  zero is measured again whenever the car sits still for half a second, and
+  the heading is held while it does, so it does not creep while parked.
+  Should the gyro stop answering, the wheels take over until it is back.
+- **Turns** stop when the gyro says they are done, allowing for how far the
+  car coasts once the motors are cut (learned from every turn and kept in
+  `turning.json` beside the map database). Gyro turns cut the motors at
+  once instead of ramping them down (they freewheel, which is gentle), at
+  60% power (80% past 60°): at full power the car spins at hundreds of
+  degrees a second within a quarter second. What is left once the car has
+  stopped, beyond 1.5°, is corrected with up to three gentler turns. A turn
+  that has not got going after 0.6 s is stuck and is given up. The camera
+  checks of each turn piece are skipped, so turning is quicker too.
+- **Localization** trusts the gyro's turn between stops (to about 0.5° plus
+  2%) and no longer takes a camera that disagrees as the wheels slipping.
+  Turn calibration records whether it measured the gyro or the wheels, and
+  only uses ratios measured the same way.
+- **Moves** are measured by the accelerometer. Its samples come through the
+  chip's FIFO with the gyro's, evenly spaced; gravity is followed with the
+  gyro, so the car pitching as it speeds up is not taken for speeding up,
+  and what is left is added up twice. Every move starts and ends at rest,
+  so whatever speed the sum still shows at the end is drift and is taken
+  out. The board's forward direction is learned from the first move
+  forward. A measured move puts the odometry where the car really went
+  (pushing against something it no longer counts as travel), unless the
+  sum drifted badly. In simulation, with the board tilted, offsets, a 4%
+  scale error, roller shake and the car pitching, moves of 7–51 cm came out
+  within about 3 cm. How long a burst must be for a distance is learned
+  from the measured forward bursts too, so stepping keeps improving.
+- **Calibration** needs no wall and no camera with the IMU: turns need none
+  (the gyro measures them), and steps are measured by the accelerometer
+  (the lidar's view of the step is logged beside it when it sees a wall).
+- **The pan servo's scale** is measured from turns on the spot: the gyro
+  says how far the car turned, and the lidar's view should move across the
+  pan by exactly that. It started at the 0.85 measured on 11-02 and keeps
+  being refined; it is kept in `turning.json`, and older sweeps are
+  re-angled with it when the map is rebuilt.
+- **Turning power and motor effort** are found as the car goes, not fixed.
+  Turns ask for a rate (the hunt's look round 60°/s, mapping's turns
+  150–220°/s, corrections 50°/s); a learned model of this car says what
+  power gives it (none below the power at which it breaks away and starts
+  turning), and the gyro corrects it while it turns, raising the power when
+  it does not move. Underneath everything the drive keeps the motors'
+  torque up: the duty is scaled by 7.8 V over the battery's voltage (2
+  cells; up to 1.4x, past `ROBOCAR_MAX_MOTOR_DUTY` if need be, never past
+  the board's full duty), and half a second after any command to move the
+  gyro or accelerometer must see the car moving; if not, the effort goes up
+  by a quarter, again and again up to 2x. What starting took is remembered
+  for the next start. The wheels' own estimate of travel ignores all this
+  extra effort, which only makes up for lost voltage or grip.
+- **Safety:** tipped past 35° or picked up, the motors stop and stay off
+  until the car has been back on its wheels for a second. A knock of more
+  than 2.5 g after a move's first half second (running into something, or
+  being pounced on) ends the move; starting and stopping at full power
+  measured 1.2–1.5 g on the car. The dashboard's Gyro panel shows the
+  heading, turn rate, tilt, how far turns coast, the last move measured
+  and the last bump.
 
 Keep the car's wheels off the ground while first testing physical controls.
 The motor adapter is disabled unless `ROBOCAR_HARDWARE_ENABLED=true`. Dashboard
@@ -354,16 +451,51 @@ panel and as a small one beside the title, plus the Raspberry Pi's own supply.
 - **Readings that fail** are shown as unavailable, with the reason. The
   battery reading needs the car's board powered and hardware enabled.
 
-## Mapping survey and attended auto explore
+## Mapping the room
 
-**Start mapping survey** records checkpoints while you drive manually.
-**Start attended auto explore** enables bounded autonomous motion only when
-physical hardware and a range sensor (lidar or ultrasonic) are enabled, the car is stopped,
-and the operator confirms the room is clear and attended. The car scans while
-stopped, moves in short bursts, then stops and scans again. Autonomous motion
-uses full normalized motor output and the default 4095/4095 motor duty cap.
+**Map the room** (attended) is the one mapping button. It needs physical
+hardware and the lidar working (sweeps are lidar sweeps; the ultrasonic is
+not swept), the car stopped, and you to confirm the room is clear and
+attended.
 
-**Spin & roam explore** is the other way to explore, and suits the lidar:
+It starts with a full circle where it stands. Then, again and again, it
+weighs three ways of carrying on and does the best:
+- **A full circle across the room** (the favourite): drive straight to the
+  farthest open place the last circle showed (in plain view across open
+  floor, room to turn on the spot, new floor to see, not where it has spun
+  before) and turn a full circle there.
+- **A full circle nearby:** the open place a full turn would show the most
+  new floor from, for the driving it takes.
+- **A frontier step:** one sweep and a move toward an unexplored edge, for
+  corridors, doorways and corners too tight to spin in.
+
+Each is worth the new floor it should show per second it should take, times
+a standing preference (across the room 1.6, nearby 1.0, frontier step 0.5)
+and times its track record: how much of what it promised it has really
+brought, learned run after run (with how long circles, sweeps and driving
+really take) and kept in `turning.json`. When even the best would bring
+less than 5% of the best rate this run has managed, the room is mapped. In
+the simulated two-room house it mapped 94–98% of both rooms and the
+corridor from three different starts with 5–8 circles and 21–27 sweeps,
+mostly crossing the room between them, with no bumps.
+
+**Driving across the room** goes as far as the way runs straight, the lidar
+saw clear (less 45 cm) and the map knows is open, in one go, not in fixed
+steps. The car watches all the way and stops at once if anything comes
+within the stand-off ahead (plus its stopping distance), if the gyro sees
+it pushed more than 20° off its line, if it bumps into something, or if it
+stops moving although driving; then it looks again and carries on from
+there. With turns and distances measured it sweeps to stay placed every
+3 m (1.2 m without).
+
+**On the map** the room as known so far is drawn as one closed shape: the
+floor seen to be open, with anything not yet seen taken for wall, and holes
+where things stand. It grows as the car sees more.
+
+The API still takes `strategy` `"frontier"` (frontier steps only) or
+`"spin"` (circles only) for testing; the dashboard uses `"room"`.
+
+**The circles (also on their own, strategy `"spin"`):**
 - **Spin:** where it stands, it sweeps, turns a quarter, sweeps again, and so
   on round the full circle (four sweeps, each 60° either side, so each
   overlaps the last by 30° and can be fitted to it). A quarter the map
@@ -376,6 +508,13 @@ uses full normalized motor output and the default 4095/4095 motor duty cap.
   ping ahead before each one (and a sweep ahead every 1.2 m to stay placed).
   A place it cannot reach is given up, and it never spins twice in the same
   spot.
+- **The full circle:** a station's sweeps, joined by the gyro's turns into
+  one view all round, are fitted to the map as it was before the station.
+  A whole circle fits far more surely than a quarter does, and the result
+  ties the station to the stop before it in the pose graph, which then
+  settles and redraws the map. In simulation, stations put 3–19 cm and up
+  to 6° out were brought back within 5 cm and 1.5° in 10 of 14 tries (the
+  rest did not fit well enough to be trusted, and kept their place).
 - **Done:** it stops by itself when nowhere left would show much new, or
   after 15 minutes or 200 moves.
 
@@ -418,7 +557,8 @@ After each sweep, auto explore decides where to go by **what it could learn ther
 - **Corridors:** between two roughly parallel walls up to 130 cm apart, a
   target along the corridor is reached by following its centre line.
 - **Moving:** turns go the short way, up to 150° in one stop, made as
-  camera-checked pieces of up to 50° with no sweep in between. A turn that
+  pieces of up to 50° with no sweep in between, each checked by the gyro
+  (or, without one, by the camera). A turn that
   only lines up with a waypoint the map shows clear is followed straight away
   by a drive, after a single forward ping, again with no sweep in between.
   Forward legs run up to 60 cm, as far as a straight line toward the
@@ -456,7 +596,8 @@ After each sweep, auto explore decides where to go by **what it could learn ther
   - **Limit:** in the workshop, sweeps from almost the same spot agree on
     only about 40% of their ranges, so fits to a thin map are rarely
     trusted. More mapping runs over the same floor firm the map up.
-- **Camera-measured turns:** before each turn piece the car needs a strip of
+- **Camera-measured turns** (without a gyro; with one, the gyro measures
+  and corrects each turn instead, see Gyro): before each turn piece the car needs a strip of
   pictures every 10° across the pan on the turn side (0–60°). While exploring,
   the first piece's strip is taken during the stop's sonar sweep, which
   passes those angles anyway. Pictures go at the sweep's nearest 3° step, with
@@ -513,8 +654,11 @@ The **What the camera sees** panel shows:
 - the latest turn check against its strip picture;
 - the latest recognized place against the stored picture.
 
-**Calibrate turns & steps** (attended; needs the head camera) measures how far the car really turns
-and moves. Face it toward a flat wall about 1–1.5 m away with room to turn.
+**Calibrate turns & steps** (attended) measures how far the car really turns
+and moves. With the gyro fitted it skips the turns and measures the steps
+with the accelerometer: give it about a metre of clear floor ahead and
+behind, no wall needed. Without the gyro it works as follows (and needs the
+head camera). Face it toward a flat wall about 1–1.5 m away with room to turn.
 It photographs a strip across the pan, then turns 10°, 20° and 30° left and
 right, adjusting each command until the camera says it landed within 2°. Each
 picture gets the same exposure check as a stop's picture. It then uses the
@@ -525,7 +669,9 @@ length until the sonar says each step is right (within 7%), changing it by
 at most 1.6× per try and ignoring readings that jump impossibly far. It refuses to start with anything within 25 cm, and stops stepping
 before the wall is closer than 45 cm. Results are saved beside the map
 database (not cleared by reset), shown on the dashboard, and used for every
-turn and step afterwards; each session keeps refining them.
+turn and step afterwards; each session keeps refining them. With a gyro the
+turn ratios it measures are the gyro's scale (close to 1) rather than the
+wheels', and are kept apart from any measured with the wheels.
 
 Use **Reset mapping database** to permanently delete all saved observations.
 The dashboard asks for confirmation, and reset is unavailable while mapping is
@@ -669,12 +815,14 @@ robocar`.
 
 All under `src/robocar/`:
 - `web.py`, `__main__.py`, `config.py`: the dashboard server and its settings.
-- `drive.py`, `range_sensor.py`, `camera.py`, `power.py`, `detector.py`: the
-  hardware (motors and pan/tilt head, sonar and lidar, cameras, battery, the
-  AI HAT+).
+- `drive.py`, `range_sensor.py`, `imu.py`, `camera.py`, `power.py`,
+  `detector.py`: the hardware (motors and pan/tilt head, sonar and lidar,
+  gyro, cameras, battery, the AI HAT+).
 - `mapping.py`: the controller that runs mapping, exploring, the hunt and
   calibration, and keeps the map. It builds on:
   - `ranging.py` (sonar and lidar together, sweep pacing),
+  - `imu.py` (the gyro and accelerometer: heading, measured moves, tilt and
+    knocks; the drive takes its heading and positions from it),
   - `pictures.py` (judging pictures, turns between views),
   - `explore_plan.py` (the frontier explorer's next move),
   - `exploration.py` (coverage grid, routes, spin stations, scan matching),

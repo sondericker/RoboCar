@@ -13,6 +13,7 @@
     img { display: block; width: 100%; min-height: 200px; background: #080d11; object-fit: contain; }
     [hidden] { display: none !important; }
     .status { margin: .5rem 0; color: #b8d0dc; }
+    #imu-status[data-upset="true"] { color: #ffb4a8; font-weight: 600; }
     .controls { display: grid; grid-template-columns: repeat(3, 1fr); gap: .5rem; max-width: 300px; margin: 1rem auto; }
     button { min-height: 58px; border: 0; border-radius: 8px; background: #247f78; color: white; font-size: 1rem; touch-action: none; }
     button:hover { background: #2a9a90; }
@@ -26,8 +27,6 @@
     .mapping-layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1rem; margin-top: 1rem; }
     .map-view { width: 100%; min-height: 540px; border: 1px solid #334955; border-radius: 8px; background: #101820; }
     #explore-toggle { background: #526b31; }
-    #spin-toggle { background: #2f5f73; }
-    #spin-toggle:hover { background: #3b7690; }
     #explore-toggle:hover { background: #68863d; }
     #reset-mapping { background: #8f3a3e; min-height: 40px; margin-bottom: .75rem; }
     #reset-mapping:hover { background: #b23b42; }
@@ -165,9 +164,8 @@
     </section>
     <section class="mapping-section">
       <h2>Mapping &amp; exploration</h2>
-      <button id="mapping-toggle" type="button" aria-pressed="false">Start mapping &amp; auto explore</button>
-      <button id="spin-toggle" type="button" aria-pressed="false"
-        title="Turn a full circle sweeping, drive to the open place with the most unmapped floor around it, and spin again">Spin &amp; roam explore</button>
+      <button id="mapping-toggle" type="button" aria-pressed="false"
+        title="Turn a full circle sweeping, drive straight across the room to the farthest open place it showed, spin there, and so on; step by step where there is nowhere to spin">Map the room</button>
       <button id="calibrate-motion" type="button">Calibrate turns &amp; steps</button>
       <button id="reset-mapping" type="button">Reset mapping database</button>
       <p class="status"><span class="where" data-known="false" title="Whether the car believes it knows where it is on the map">
@@ -188,8 +186,12 @@
       <div id="vision-panels" class="vision-panels"></div>
     </section>
     <section>
-      <h2>Ultrasonic range</h2>
+      <h2>Range sensors</h2>
       <p id="range-status" class="status" aria-live="polite">Loading range finder status…</p>
+    </section>
+    <section>
+      <h2>Gyro</h2>
+      <p id="imu-status" class="status" aria-live="polite">Loading gyro status…</p>
     </section>
     <section>
       <h2>Power</h2>
@@ -212,7 +214,6 @@
     const cameraImage = document.getElementById("camera-feed");
     const cameraPaused = document.getElementById("camera-paused");
     const mappingToggle = document.getElementById("mapping-toggle");
-    const spinToggle = document.getElementById("spin-toggle");
     const resetMappingButton = document.getElementById("reset-mapping");
     const mapCanvas = document.getElementById("map-view");
     const mapContext = mapCanvas.getContext("2d");
@@ -411,6 +412,25 @@
         mapContext.imageSmoothingEnabled = false;
         mapContext.drawImage(coverageImage, topLeft.x, topLeft.y, bottomRight.x - topLeft.x, bottomRight.y - topLeft.y);
       }
+      // The room as known so far: the open floor closed into a shape, with
+      // anything not yet seen taken for wall, and holes where things stand.
+      if ((map.room || []).length) {
+        const trace = path => path.forEach(([x, y], index) => {
+          const point = toScreen([x, y]);
+          index ? mapContext.lineTo(point.x, point.y) : mapContext.moveTo(point.x, point.y);
+        });
+        mapContext.beginPath();
+        for (const room of map.room) {
+          trace(room.outline); mapContext.closePath();
+          for (const hole of room.holes) { trace(hole); mapContext.closePath(); }
+        }
+        mapContext.fillStyle = "rgba(64, 120, 104, 0.45)";
+        mapContext.fill("evenodd");
+        mapContext.strokeStyle = "rgba(232, 238, 242, 0.95)";
+        mapContext.lineWidth = 2.5;
+        mapContext.lineJoin = "round";
+        mapContext.stroke();
+      }
       // Where spin & roam turned full circles.
       mapContext.strokeStyle = "rgba(120, 190, 230, .8)";
       mapContext.lineWidth = 1.5;
@@ -572,6 +592,7 @@
         (map.cloud_points ? "White dots = lidar points, " : "Dots = raw sonar echoes, ") +
         "solid = confirmed, dashed = seen once, purple = recognized places, " +
         "teal = swept free space, gold = unexplored edges, crosshair = where it is heading, " +
+        ((map.room || []).length ? "green with a white wall line = the room as known so far (unseen counts as wall), " : "") +
         ((map.stations || []).length ? "blue circling arrows = where it spun round, " : "") +
         "violet = objects and rooms the camera recognized.";
     }
@@ -675,7 +696,7 @@
     }
     function localizationSummary(mapping) {
       const last = mapping.localization;
-      const sources = ["wheels"];
+      const sources = [last?.turns_from === "gyro" ? "wheels + gyro" : "wheels"];
       if (last?.visual_used) sources.push(last.side_views ? "camera + side views" : "camera");
       const sensor = last?.sensor || "sonar";
       if (last?.registration?.accepted) sources.push(`${sensor} wall fit (${last.registration.matches} echoes)`);
@@ -690,14 +711,11 @@
         `${mapping.places.places} remembered places${recognized}`;
     }
     function updateMappingControls(mapping) {
-      const spinning = mapping.enabled && mapping.mode === "explore" && mapping.strategy === "spin";
-      mappingToggle.textContent = mapping.enabled && !spinning
-        ? (mapping.mode === "hunt" ? "Stop the hunt" : "Stop mapping & auto explore") : "Start mapping & auto explore";
-      mappingToggle.setAttribute("aria-pressed", String(mapping.enabled && !spinning));
-      mappingToggle.disabled = spinning;
-      spinToggle.textContent = spinning ? "Stop spin & roam" : "Spin & roam explore";
-      spinToggle.setAttribute("aria-pressed", String(spinning));
-      spinToggle.disabled = mapping.enabled && !spinning;
+      const spinning = mapping.enabled && mapping.mode === "explore" && mapping.strategy !== "frontier";
+      const roundTheRoom = mapping.strategy !== "frontier";
+      mappingToggle.textContent = mapping.enabled
+        ? (mapping.mode === "hunt" ? "Stop the hunt" : mapping.mode === "explore" ? "Stop mapping" : "Stop") : "Map the room";
+      mappingToggle.setAttribute("aria-pressed", String(mapping.enabled));
       const calibrating = mapping.enabled && mapping.mode === "calibrate";
       document.getElementById("calibrate-motion").dataset.running = String(calibrating);
       document.getElementById("calibrate-motion").textContent = calibrating ? "Stop calibration" : "Calibrate turns & steps";
@@ -712,19 +730,20 @@
             : mapping.state === "capturing" || mapping.state === "scanning"
             ? "Stopped; capturing camera and range sweep…"
             : mapping.mode === "explore"
-              ? `${spinning ? `Spin & roam (station ${mapping.spin?.stations || 1})` : "Auto explore"}: ${mapping.state}` +
-                `${mapping.plan ? ` (${mapping.plan})` : ""} · ${mapping.move_count} moves · ${localizationSummary(mapping)}`
+              ? `${spinning ? `Mapping the room (spin ${mapping.spin?.stations || 1})` : "Exploring step by step"}: ${mapping.state}` +
+                `${mapping.plan ? ` (${mapping.plan})` : ""} · ${mapping.move_count} moves · ${localizationSummary(mapping)}` +
+                `${spinning ? circleFitText(mapping.spin?.circle_fit) : ""}`
               : "Survey active · drive manually, then stop to record a checkpoint.")
           : mapping.state === "calibrated" ? "Calibration finished and saved."
           : mapping.state === "calibration_failed" ? `Calibration measured nothing usable: ${mapping.plan || ""}`
-          : mapping.state === "explored" ? (mapping.strategy === "spin"
-            ? `Spin & roam finished after ${mapping.spin?.stations || 0} station(s): nowhere left a full turn would show much new.`
-            : "Auto explore finished: no unexplored edges left within reach.")
-          : mapping.state === "blocked" ? "Auto explore stopped: no safe path visible in the forward scan."
-            : mapping.state === "time_limit" ? (mapping.strategy === "spin"
-              ? "Spin & roam stopped at its 15-minute limit." : "Auto explore stopped at its 4-minute limit.")
-              : mapping.state === "move_limit" ? (mapping.strategy === "spin"
-                ? "Spin & roam stopped after 200 moves." : "Auto explore stopped after 60 moves.")
+          : mapping.state === "explored" ? (roundTheRoom
+            ? `Room mapped after ${mapping.spin?.stations || 0} spin(s): nowhere left to spin or explore that would show much new.`
+            : "Exploring finished: no unexplored edges left within reach.")
+          : mapping.state === "blocked" ? "Exploring stopped: no safe path visible in the forward scan."
+            : mapping.state === "time_limit" ? (roundTheRoom
+              ? "Room mapping stopped at its 15-minute limit." : "Exploring stopped at its 4-minute limit.")
+              : mapping.state === "move_limit" ? (roundTheRoom
+                ? "Room mapping stopped after 200 moves." : "Exploring stopped after 60 moves.")
                 : "Mapping is off.";
     }
     async function toggleExplore(button, strategy) {
@@ -745,8 +764,7 @@
         button.disabled = false;
       }
     }
-    mappingToggle.addEventListener("click", () => toggleExplore(mappingToggle, "frontier"));
-    spinToggle.addEventListener("click", () => toggleExplore(spinToggle, "spin"));
+    mappingToggle.addEventListener("click", () => toggleExplore(mappingToggle, "room"));
     const calibrateButton = document.getElementById("calibrate-motion");
     calibrateButton.addEventListener("click", async () => {
       const running = calibrateButton.dataset.running === "true";
@@ -865,7 +883,7 @@
         }
         const range = status.range, lidar = status.lidar;
         const sonarText =
-          !range.enabled ? "Sonar disabled (hardware not enabled)" :
+          !range.enabled ? (lidar && lidar.enabled ? "Sonar off (the lidar does the ranging)" : "Sonar disabled (hardware not enabled)") :
             range.error ? `Sonar: ${range.error}` :
             range.distance_cm === null ? "Sonar: waiting for a reading…" :
             `Sonar: ${range.distance_cm.toFixed(1)} cm`;
@@ -878,12 +896,52 @@
             `Lidar: ${lidar.distance_cm.toFixed(0)} cm · signal ${lidar.signal ?? "?"}` +
               (lidar.temperature_c != null ? ` · ${lidar.temperature_c.toFixed(0)} °C` : "");
         document.getElementById("range-status").textContent = `${lidarText} · ${sonarText}`;
+        updateImu(status.imu, status.drive, status.mapping);
         updatePower(status.power);
         updateWhere(status.mapping.localized);
         updateMappingControls(status.mapping);
       } catch (_) {
         document.getElementById("camera-status").textContent = "Could not read application status";
       }
+    }
+    function circleFitText(fit) {
+      if (!fit) return "";
+      if (fit.used) return ` · last full circle fitted the map: station moved ${fit.moved_cm} cm, ${fit.turned_deg}°`;
+      return ` · last full circle did not fit the map well enough (score ${fit.score ?? "?"})`;
+    }
+    function updateImu(imu, drive, mapping) {
+      const element = document.getElementById("imu-status");
+      let text;
+      if (!imu || imu.mode === "absent") {
+        text = "No gyro fitted: turns are judged from the wheels.";
+      } else if (imu.mode === "unavailable") {
+        text = `Gyro unavailable${imu.fault ? ": " + imu.fault : ""}. Turns are judged from the wheels meanwhile.`;
+      } else if (imu.mode === "settling") {
+        text = `${imu.model || "Gyro"}: measuring its zero, keep the car still for a moment…`;
+      } else {
+        text = `${imu.model}: turned ${imu.heading_deg.toFixed(1)}° since start · ` +
+          (imu.still ? "still" : `turning ${imu.rate_dps.toFixed(0)}°/s`) +
+          ` · tilted ${imu.tilt_deg.toFixed(0)}°`;
+        if (mapping && mapping.coast && mapping.coast.turns) text += ` · coasts ${mapping.coast.at_300_dps_deg}° from 300°/s`;
+        if (mapping && mapping.turn_power && mapping.turn_power.turns)
+          text += ` · turning starts at ${Math.round(mapping.turn_power.breakaway * 100)}% power`;
+      }
+      if (imu && imu.upset) text = "Tipped over or lifted: the motors stay off until it is back on its wheels. " + text;
+      if (mapping && mapping.last_bump) text += ` · last bump ${mapping.last_bump.g} g`;
+      if (drive && (drive.supply_gain !== 1 || drive.learned_boost > 1.01 || drive.effort_boost > 1.01)) {
+        text += ` · motor effort ×${drive.supply_gain.toFixed(2)} for the battery` +
+          (drive.effort_boost > 1.01 ? `, ×${drive.effort_boost.toFixed(2)} to get moving` : "");
+      }
+      const move = mapping && mapping.last_move;
+      if (move) {
+        text += move.ahead_cm == null
+          ? " · last move measured, still learning which way is forward"
+          : ` · last move ${move.ahead_cm} cm ahead, ${move.right_cm} cm right by the accelerometer` +
+            ` (wheels guessed ${move.wheels_cm} cm${move.used ? "" : "; not used"})`;
+      }
+      if (drive && drive.heading_source === "wheels" && imu && imu.mode === "hardware") text += " (wheels in use)";
+      element.textContent = text;
+      element.dataset.upset = String(Boolean(imu && imu.upset));
     }
     function updateWhere(localized) {
       if (!localized) return;

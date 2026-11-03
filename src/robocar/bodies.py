@@ -212,6 +212,10 @@ class CarHuntBody:
     def ranges_precisely(self) -> bool:
         return self._controller._ranging.lidar_ready()
 
+    def turn_power(self):
+        """The car's learned turn power, shared with mapping (and kept)."""
+        return self._controller._turn_power
+
     def range_ahead(self, precise: bool = False) -> float | None:
         """The latest range straight ahead: no waiting once the head faces
         ahead (both sensors keep measuring). The nearer of lidar and sonar,
@@ -284,7 +288,7 @@ class CarHuntBody:
             if precise:
                 pieces = max(1, math.ceil(abs(degrees) / AUTO_TURN_PIECE_DEGREES - 1e-9))
                 return all(controller._turn_and_align(degrees / pieces) for _ in range(pieces))
-            return controller._turn_by(degrees)
+            return controller._turn_by(degrees, correct=False)
 
     def move(self, forward_cm: float, sideways_cm: float, speed: float = 1.0) -> bool:
         distance = math.hypot(forward_cm, sideways_cm)
@@ -368,6 +372,11 @@ class CarCalibrationRig:
 
     def measure_turn(self, strip: dict[int, tuple[bytes, ...]], current: tuple[bytes, ...] | None) -> float | None:
         return self._controller._measure_turn({self._centre - offset: frames for offset, frames in strip.items()}, current, self._centre)
+
+    def last_move_cm(self) -> float | None:
+        with self._controller._lock:
+            move = self._controller._last_move
+        return move.get("ahead_cm") if move else None
 
     def range_ahead(self) -> float | None:
         controller = self._controller

@@ -10,7 +10,10 @@ right, and every forward step is followed by the same burst in reverse so the
 car stays in place.
 
 The result maps turn size and direction to "real degrees per odometry
-degree" and step size to burst duration; turning and exploring use it.
+degree" and step size to burst duration; turning and exploring use it. The
+odometry's turns come from the gyro when there is one, else from the wheels;
+the ratios are kept with which, as they mean different things (a gyro's is
+near 1).
 """
 
 import json
@@ -54,6 +57,8 @@ class Calibration:
     reverse_ratio: float | None = None
     created_at: str | None = None
     log: list[str] = field(default_factory=list)
+    # What measured the odometry's turns: "wheels" or "gyro".
+    turn_source: str = "wheels"
 
     def turn_ratio(self, degrees: float) -> float | None:
         """Interpolated ratio for a turn of this size and direction."""
@@ -108,6 +113,7 @@ class Calibration:
             "reverse_ratio": None if self.reverse_ratio is None else round(self.reverse_ratio, 4),
             "created_at": self.created_at,
             "log": self.log[-80:],
+            "turn_source": self.turn_source,
         }
 
     @classmethod
@@ -122,6 +128,7 @@ class Calibration:
             data.get("reverse_ratio"),
             data.get("created_at"),
             list(data.get("log") or []),
+            str(data.get("turn_source") or "wheels"),
         )
 
 
@@ -165,6 +172,10 @@ class Rig(Protocol):
 
     def range_ahead(self) -> float | None: ...
 
+    def last_move_cm(self) -> float | None:
+        """How far ahead the last burst went by the accelerometer (None: not measured)."""
+        ...
+
     def clearance_all_round(self) -> float | None: ...
 
     def stopped(self) -> bool: ...
@@ -172,8 +183,16 @@ class Rig(Protocol):
     def report(self, message: str) -> None: ...
 
 
-def run_calibration(rig: Rig, previous: Calibration | None, step_seconds_guess: Callable[[float], float]) -> Calibration:
-    calibration = Calibration(created_at=datetime.now(timezone.utc).isoformat())
+def run_calibration(
+    rig: Rig,
+    previous: Calibration | None,
+    step_seconds_guess: Callable[[float], float],
+    turn_source: str = "wheels",
+    feel_steps: bool = False,
+) -> Calibration:
+    """`turn_source` is what measures the odometry's turns now ("wheels" or
+    "gyro"); with `feel_steps` the accelerometer measures the steps."""
+    calibration = Calibration(created_at=datetime.now(timezone.utc).isoformat(), turn_source=turn_source)
 
     def note(message: str) -> None:
         calibration.log.append(message)
@@ -184,10 +203,20 @@ def run_calibration(rig: Rig, previous: Calibration | None, step_seconds_guess: 
     if clearance is None or clearance < 25.0:
         raise RuntimeError("Calibration needs at least 25 cm of space all round the car")
 
-    _calibrate_turns(rig, calibration, previous, note)
+    if turn_source == "gyro":
+        # The gyro measures turns better than the camera can (the camera's
+        # measure leans on the pan servo's angles), so there is nothing to
+        # calibrate: only the steps.
+        note("turns are measured by the gyro; no turn tests needed")
+    else:
+        # Earlier turn ratios are a starting guess only if measured the same way.
+        _calibrate_turns(rig, calibration, previous if previous and previous.turn_source == turn_source else None, note)
     if rig.stopped():
         return calibration
-    _calibrate_steps(rig, calibration, previous, step_seconds_guess, note)
+    if feel_steps:
+        _calibrate_steps_by_feel(rig, calibration, previous, step_seconds_guess, note)
+    else:
+        _calibrate_steps(rig, calibration, previous, step_seconds_guess, note)
     return calibration
 
 
@@ -234,7 +263,7 @@ def _turn_tests(
                 turned = rig.heading_odometry() - before
                 actual = rig.measure_turn(strip, rig.photograph([0]).get(0))
                 if abs(turned) < 1.0:
-                    note(f"{direction} {size:.0f}°: the wheels reported no turn")
+                    note(f"{direction} {size:.0f}°: the {calibration.turn_source} reported no turn")
                     break
                 if actual is None:
                     note(f"{direction} {size:.0f}°: camera could not measure the turn (try more light or texture)")
@@ -242,7 +271,7 @@ def _turn_tests(
                 ratio = actual / turned
                 error = actual - target
                 note(
-                    f"{direction} {size:.0f}° try {attempt}: wheels {abs(turned):.1f}°, "
+                    f"{direction} {size:.0f}° try {attempt}: {calibration.turn_source} {abs(turned):.1f}°, "
                     f"camera {abs(actual):.1f}° (error {error:+.1f}°)"
                 )
                 calibration.turn_ratios.setdefault(direction, {})[size] = ratio
@@ -269,7 +298,7 @@ def _calibrate_steps(
     for size in STEP_SIZES_CM:
         # Every step measured this time is the best guide, then last time's.
         seconds = (
-            _seconds_for(measured, size)
+            seconds_for(measured, size)
             or (previous.step_duration(size) if previous else None)
             or step_seconds_guess(size)
         )
@@ -321,19 +350,7 @@ def _calibrate_steps(
             if abs(moved - size) <= max(STEP_TOLERANCE_MIN_CM, STEP_TOLERANCE_FRACTION * size):
                 break
             tried.append((seconds, moved))
-            low, high = STEP_DURATION_LIMITS_SECONDS
-            last_seconds, last_moved = tried[-1]
-            proposal = last_seconds * size / last_moved
-            if len(tried) > 1:
-                earlier_seconds, earlier_moved = tried[-2]
-                if abs(last_moved - earlier_moved) > 0.5 and abs(last_seconds - earlier_seconds) > 1e-3:
-                    # Travel is roughly linear in burst length but with an offset
-                    # (dead zone, ramps), so fit a line through the last two tries.
-                    slope = (last_moved - earlier_moved) / (last_seconds - earlier_seconds)
-                    if slope > 0:
-                        proposal = last_seconds + (size - last_moved) / slope
-            proposal = min(seconds * STEP_MAX_CHANGE, max(seconds / STEP_MAX_CHANGE, proposal))
-            seconds = min(high, max(low, proposal))
+            seconds = _next_seconds(tried, seconds, size)
             calibration.step_durations[size] = seconds
     if forward_ratios:
         calibration.forward_ratio = statistics.median(forward_ratios)
@@ -343,7 +360,87 @@ def _calibrate_steps(
         note(f"forward travel is {calibration.forward_ratio:.2f}x what the wheels report")
 
 
-def _seconds_for(measured: Sequence[tuple[float, float]], distance_cm: float) -> float | None:
+def _next_seconds(tried: Sequence[tuple[float, float]], seconds: float, size: float) -> float:
+    """The next burst length to try for a step of `size`, from the tries so far."""
+    low, high = STEP_DURATION_LIMITS_SECONDS
+    last_seconds, last_moved = tried[-1]
+    proposal = last_seconds * size / last_moved
+    if len(tried) > 1:
+        earlier_seconds, earlier_moved = tried[-2]
+        if abs(last_moved - earlier_moved) > 0.5 and abs(last_seconds - earlier_seconds) > 1e-3:
+            # Travel is roughly linear in burst length but with an offset
+            # (dead zone, ramps), so fit a line through the last two tries.
+            slope = (last_moved - earlier_moved) / (last_seconds - earlier_seconds)
+            if slope > 0:
+                proposal = last_seconds + (size - last_moved) / slope
+    proposal = min(seconds * STEP_MAX_CHANGE, max(seconds / STEP_MAX_CHANGE, proposal))
+    return min(high, max(low, proposal))
+
+
+def _calibrate_steps_by_feel(
+    rig: Rig,
+    calibration: Calibration,
+    previous: Calibration | None,
+    step_seconds_guess: Callable[[float], float],
+    note: Callable[[str], None],
+) -> None:
+    """Step calibration measured by the accelerometer: no wall needed. Each
+    step forward is followed by the same burst back; anything ahead (the
+    lidar, if it sees something) only has to stay clear, and its measure of
+    the step is logged beside the accelerometer's for comparison."""
+    measured: list[tuple[float, float]] = []
+    taught = False  # the first burst forward also teaches which way the board faces
+    for size in STEP_SIZES_CM:
+        seconds = (
+            seconds_for(measured, size)
+            or (previous.step_duration(size) if previous else None)
+            or step_seconds_guess(size)
+        )
+        tried: list[tuple[float, float]] = []
+        for attempt in range(1, STEP_ATTEMPTS + 1):
+            if rig.stopped():
+                return
+            room = _range(rig)
+            if room is not None and room - size < MINIMUM_WALL_GAP_CM:
+                note(f"something only {room:.0f} cm ahead; stopping step tests to keep {MINIMUM_WALL_GAP_CM:.0f} cm clear")
+                return
+            if not rig.burst(1.0, seconds):
+                return
+            moved = rig.last_move_cm()
+            after = _range(rig) if room is not None else None
+            if not rig.burst(-1.0, seconds):
+                return
+            back = rig.last_move_cm()
+            if moved is None:
+                if not taught:
+                    taught = True
+                    note("first step: learning which way the accelerometer faces")
+                    continue
+                note("the accelerometer could not measure the step; stopping step tests")
+                return
+            taught = True
+            lidar = f"; lidar {room - after:.1f} cm" if room is not None and after is not None else ""
+            note(f"{size:.0f} cm step try {attempt}: {seconds:.3f} s moved {moved:.1f} cm by the accelerometer{lidar}")
+            if moved > 0.5:
+                measured.append((seconds, moved))
+            if back is not None and abs(moved + back) > 2 * STEP_RETURN_TOLERANCE_CM:
+                # Crept: drive back out to where the steps began.
+                gap = moved + back
+                fix = seconds_for(measured, abs(gap)) or seconds * min(1.0, abs(gap) / max(moved, 1.0))
+                if not rig.burst(-1.0 if gap > 0 else 1.0, fix):
+                    return
+            if moved <= 0.5:
+                seconds = min(STEP_DURATION_LIMITS_SECONDS[1], seconds * STEP_MAX_CHANGE)
+                continue
+            calibration.step_durations[size] = seconds
+            if abs(moved - size) <= max(STEP_TOLERANCE_MIN_CM, STEP_TOLERANCE_FRACTION * size):
+                break
+            tried.append((seconds, moved))
+            seconds = _next_seconds(tried, seconds, size)
+            calibration.step_durations[size] = seconds
+
+
+def seconds_for(measured: Sequence[tuple[float, float]], distance_cm: float) -> float | None:
     """Burst length for a distance from a line through every measured step.
 
     Travel is roughly linear in burst length past a dead zone, so the line
@@ -372,7 +469,7 @@ def _return_to(
             break
         low, high = STEP_DURATION_LIMITS_SECONDS
         # A burst too short to clear the dead zone would move nothing.
-        burst = min(high / 2, max(low, _seconds_for(measured, abs(gap)) or seconds * 0.5))
+        burst = min(high / 2, max(low, seconds_for(measured, abs(gap)) or seconds * 0.5))
         if not rig.burst(1.0 if gap > 0 else -1.0, burst):
             break
         reading = _range(rig)

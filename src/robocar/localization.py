@@ -35,6 +35,10 @@ VISUAL_YAW_SIGMA_DEGREES = 1.5
 VISUAL_SINGLE_YAW_SIGMA_DEGREES = 4.0
 VISUAL_BEARING_SIGMA_DEGREES = 8.0
 VISUAL_OVERRIDE_MAX_DEGREES = 30.0
+# A gyro-measured turn: a fixed half degree plus 2% of the turn (its scale
+# is good to a few percent; the drift while parked is held at zero).
+GYRO_YAW_SIGMA_DEGREES = 0.5
+GYRO_YAW_SIGMA_FRACTION = 0.02
 
 
 def wrap_degrees(angle: float) -> float:
@@ -79,12 +83,19 @@ class MotionPrediction:
     bearing_used: bool
 
 
-def predict_motion(odometry_delta: Sequence[float], visual: VisualMotion | None) -> MotionPrediction:
+def predict_motion(odometry_delta: Sequence[float], visual: VisualMotion | None, gyro: bool = False) -> MotionPrediction:
+    """The motion between two stops from the odometry and the camera. With
+    `gyro` the odometry's turn was measured by a gyro rather than guessed
+    from the wheels, so it is trusted far more, and a camera that disagrees
+    with it is taken to be wrong rather than the wheels to have slipped."""
     dx, dy, odometry_yaw = (float(value) for value in odometry_delta)
     distance = math.hypot(dx, dy)
     along_sigma = 1.0 + 0.2 * distance
     lateral_sigma = 1.0 + 0.12 * distance
-    odometry_yaw_sigma = 1.0 + 0.25 * abs(odometry_yaw) + 0.03 * distance
+    if gyro:
+        odometry_yaw_sigma = GYRO_YAW_SIGMA_DEGREES + GYRO_YAW_SIGMA_FRACTION * abs(odometry_yaw)
+    else:
+        odometry_yaw_sigma = 1.0 + 0.25 * abs(odometry_yaw) + 0.03 * distance
 
     yaw, yaw_sigma = odometry_yaw, odometry_yaw_sigma
     visual_used = visual_rejected = bearing_used = False
@@ -102,7 +113,7 @@ def predict_motion(odometry_delta: Sequence[float], visual: VisualMotion | None)
             )
             yaw_sigma = (weight_odometry + weight_visual) ** -0.5
             visual_used = True
-        elif visual.estimates >= 2 and visual.spread_deg <= 3.0 and disagreement <= VISUAL_OVERRIDE_MAX_DEGREES:
+        elif not gyro and visual.estimates >= 2 and visual.spread_deg <= 3.0 and disagreement <= VISUAL_OVERRIDE_MAX_DEGREES:
             # Several camera estimates agree with each other but not with the
             # wheels: the wheels slipped or the car was moved by hand. Far
             # larger disagreements are camera mistakes, not slip.

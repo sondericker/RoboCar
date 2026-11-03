@@ -917,6 +917,23 @@ class PlaceMemory:
             sigma,
         )
 
+    def add_constraint(
+        self, source: int, target: int, delta: Pose, sigma: tuple[float, float, float], kind: str, inliers: int
+    ) -> bool:
+        """Tie two stops of the same session together by a measured offset
+        (a spin station's full circle fitted to the map, say), settle the
+        graph and keep the link; False if it contradicted everything else."""
+        if source not in self.graph.nodes or target not in self.graph.nodes:
+            return False
+        if source not in self.graph.component(target):
+            return False
+        edge = GraphEdge(source, target, tuple(float(value) for value in delta), information_from_sigma(sigma), "loop")
+        self.graph.add_edge(edge)
+        if edge in self._settle(self.graph.component(target)):
+            return False
+        edge.link_id = self._store.save_link(source, target, edge.delta, sigma, kind, inliers)
+        return True
+
     def _move_component_to(self, node: int, place: int, delta: Pose) -> dict[int, Pose]:
         """Rigidly move the node's component so the node sits where the place says.
 

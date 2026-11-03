@@ -132,6 +132,24 @@ def sonar_origin(pose: Sequence[float]) -> np.ndarray:
     return to_world(pose, np.array([0.0, SONAR_FORWARD_OFFSET_CM]))[0]
 
 
+def sweep_seen_from(scan: Sequence[dict[str, object]], pose: Sequence[float], frame: Sequence[float]) -> list[dict[str, object]]:
+    """A sweep taken at `pose`, re-expressed as if taken at `frame`: each
+    reading's point found from where the sensor really was (ahead of the
+    car's centre), then given as a direction and range from the sensor at
+    `frame`. Joins sweeps from one spot at different headings into one."""
+    out = []
+    origin = np.array([0.0, SONAR_FORWARD_OFFSET_CM])
+    frame_rotation = pose_rotation(frame[2])
+    for item in scan:
+        distance = _valid_range(item.get("distance_cm"), LIDAR if item.get("sensor") == "lidar" else SONAR)
+        local = origin + (distance if distance is not None else 100.0) * direction(float(item["angle_deg"]))
+        world = to_world(pose, local)[0]
+        seen = frame_rotation.T @ (world - np.array([frame[0], frame[1]])) - origin
+        angle = math.degrees(math.atan2(-seen[0], seen[1]))
+        out.append({**item, "angle_deg": angle, **({"distance_cm": float(np.hypot(*seen))} if distance is not None else {})})
+    return out
+
+
 def _valid_range(distance: object, model: RangeModel = SONAR) -> float | None:
     if isinstance(distance, bool) or not isinstance(distance, (int, float)):
         return None

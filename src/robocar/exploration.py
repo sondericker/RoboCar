@@ -113,6 +113,20 @@ SPIN_MAX_PATH_CM = 600.0
 SPIN_AWAY_CM = 80.0
 SPIN_MIN_GAIN_CELLS = 60.0
 SPIN_OVERHEAD_CM = 200.0
+# Room mapping crosses the room: the next station is the farthest spinnable
+# place in plain view (its route at most this much longer than the straight
+# line, so the way is open floor just swept), within the sensor's reach less
+# this much, worth at least this share of a station's gain; new floor
+# breaks ties at this many centimetres a cell.
+FAR_ROUTE_SLACK = 1.15
+FAR_ROUTE_SLACK_CM = 20.0
+FAR_REACH_MARGIN_CM = 60.0
+FAR_MIN_GAIN_SHARE = 0.5
+FAR_CM_PER_GAIN_CELL = 0.3
+# The known room drawn on the dashboard leaves out open specks and holes
+# smaller than these (in cells).
+ROOM_MIN_CELLS = 20
+ROOM_MIN_HOLE_CELLS = 4
 # A frontier this much could reveal counts as open space.
 OPEN_GAIN_CELLS = 300.0
 # Walls on both sides closer together than this make a doorway or corridor.
@@ -1320,6 +1334,80 @@ class CoverageGrid:
                 best_score = score
                 best = SpinStation(point, path, gain)
         return best
+
+    def far_station(self, pose: Sequence[float], avoid: Sequence[Sequence[float]] = ()) -> "SpinStation | None":
+        """The farthest place in plain view, across open floor, that is open
+        enough to turn on the spot and would still show new floor: where
+        room mapping drives next after a full circle. None if none."""
+        if not self.log_odds.size:
+            return None
+        distance, _, _ = self.path_lengths(pose)
+        occupied, unknown = self.occupied(), self.unknown()
+        wall_clearance = cv2.distanceTransform((~occupied).astype(np.uint8), cv2.DIST_L2, 5) * self.cell
+        unknown_clearance = cv2.distanceTransform((~unknown).astype(np.uint8), cv2.DIST_L2, 5) * self.cell
+        spacing = max(1, int(round(SPIN_LATTICE_CM / self.cell)))
+        lattice = np.zeros(distance.shape, dtype=bool)
+        lattice[::spacing, ::spacing] = True
+        candidates = (
+            lattice
+            & np.isfinite(distance)
+            & self.free()
+            & (wall_clearance >= SPIN_CLEARANCE_CM)
+            & (unknown_clearance >= ROBOT_RADIUS_CM + 5.0)
+        )
+        reach = max(0.0, self.view_range_cm - FAR_REACH_MARGIN_CM)
+        worth_seeing, blocked = self.worth_seeing(), self._blocked()
+        best: SpinStation | None = None
+        best_score = -math.inf
+        for row, column in np.argwhere(candidates):
+            point = self.centre_of((int(row), int(column)))
+            straight = math.hypot(point[0] - pose[0], point[1] - pose[1])
+            path = float(distance[row, column])
+            if straight > reach or straight < SPIN_AWAY_CM or path > FAR_ROUTE_SLACK * straight + FAR_ROUTE_SLACK_CM:
+                continue
+            if any(math.hypot(point[0] - other[0], point[1] - other[1]) < SPIN_AWAY_CM for other in avoid):
+                continue
+            gain = self.spin_gain(point, worth_seeing, blocked)
+            if gain < FAR_MIN_GAIN_SHARE * SPIN_MIN_GAIN_CELLS:
+                continue
+            score = straight + FAR_CM_PER_GAIN_CELL * gain
+            if score > best_score:
+                best_score = score
+                best = SpinStation(point, path, gain)
+        return best
+
+    def known_room(self, min_cells: int = ROOM_MIN_CELLS) -> list[dict[str, list[list[float]]]]:
+        """The room as known so far: the floor seen to be open, closed into
+        shapes (anything not yet seen counts as wall), each an outline with
+        holes for what stands inside it. Points in centimetres; small
+        specks are left out."""
+        if not self.log_odds.size:
+            return []
+        free = self.free().astype(np.uint8)
+        # Close cell-sized gaps between rays, so the floor is one piece.
+        free = cv2.morphologyEx(free, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        contours, hierarchy = cv2.findContours(free, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        if hierarchy is None:
+            return []
+
+        def points(contour: np.ndarray) -> list[list[float]]:
+            simple = cv2.approxPolyDP(contour, 0.8, True)
+            return [
+                [round(float(self.origin[0] + (column + 0.5) * self.cell), 1), round(float(self.origin[1] + (row + 0.5) * self.cell), 1)]
+                for column, row in simple.reshape(-1, 2)
+            ]
+
+        rooms = []
+        for index, (_, _, child, parent) in enumerate(hierarchy[0]):
+            if parent != -1 or cv2.contourArea(contours[index]) < min_cells:
+                continue
+            holes = []
+            while child != -1:
+                if cv2.contourArea(contours[child]) >= ROOM_MIN_HOLE_CELLS:
+                    holes.append(points(contours[child]))
+                child = hierarchy[0][child][0]
+            rooms.append({"outline": points(contours[index]), "holes": holes})
+        return rooms
 
     def to_image(self) -> np.ndarray:
         """Free dark teal, occupied light, unknown transparent (BGRA, north up)."""

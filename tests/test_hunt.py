@@ -482,5 +482,41 @@ class WebHuntTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/hunt/frame.jpg").data, mapping._hunt_frame)
 
 
+class SpinLookTests(unittest.TestCase):
+    """Looking round on the spot: the gyro says whether the car is really
+    turning, so a turn too weak to move it, or a wheel spinning in place,
+    must not leave it trying for ever."""
+
+    def engine(self, turns_from):
+        floor = FloorPlan()
+        cat = SimCat(floor, (-500.0, 150.0), random.Random(1))
+        body = SimHuntBody(floor, build_map(floor), (0.0, -40.0, 0.0), cat, random.Random(2))
+        drive_for = body._drive_for
+
+        def weak(dt):
+            # Below this power the car does not turn at all.
+            throttle, strafe, steering = body.command_now
+            if abs(steering) < turns_from:
+                body.commanded_seconds += dt
+                return
+            drive_for(dt)
+
+        body._drive_for = weak
+        return HuntEngine(body, HuntMemory(), rng=random.Random(3), session_seconds=60), body
+
+    def test_more_power_when_the_car_does_not_turn(self):
+        engine, body = self.engine(turns_from=0.5)
+        start = body.truth[2]
+        self.assertFalse(engine._spin_look())
+        self.assertGreaterEqual(abs(body.truth[2] - start), 300.0)
+        self.assertLess(body.now(), 15.0)
+
+    def test_it_gives_up_when_it_cannot_turn_at_all(self):
+        engine, body = self.engine(turns_from=5.0)
+        self.assertFalse(engine._spin_look())
+        self.assertLess(body.now(), 8.0)
+        self.assertEqual(body.command_now, (0.0, 0.0, 0.0))
+
+
 if __name__ == "__main__":
     unittest.main()

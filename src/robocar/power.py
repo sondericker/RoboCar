@@ -48,6 +48,8 @@ CRITICAL_CELL_VOLTS = 3.3
 # The motors pull the battery down; readings this soon after driving are not resting.
 RESTING_AFTER_SECONDS = 3.0
 SAMPLE_INTERVAL_SECONDS = 2.0
+# A battery converter missing at start is looked for again this often.
+ADC_RETRY_SECONDS = 10.0
 # Median of this many readings, to ride over noise in the 8-bit converter.
 BATTERY_SAMPLES = 5
 PI_RAILS = ("EXT5V", "3V3_SYS", "1V8_SYS", "1V1_SYS", "VDD_CORE")
@@ -195,8 +197,14 @@ class PowerMonitor:
         cells: int = 2,
         adc_fault: str | None = None,
         interval: float = SAMPLE_INTERVAL_SECONDS,
+        adc_opener: Callable[[], BoardADC] | None = None,
     ) -> None:
+        """With `adc_opener`, a battery converter that could not be opened (the
+        car's board still powering up when the service started) is tried
+        again every ADC_RETRY_SECONDS."""
         self._adc = adc
+        self._adc_opener = adc_opener
+        self._adc_retry_at = time.monotonic() + ADC_RETRY_SECONDS
         self._pi = pi
         self._motors_running = motors_running
         self._cells = cells
@@ -214,6 +222,13 @@ class PowerMonitor:
             self.sample()
             self._closed.wait(self._interval)
 
+    def volts_now(self) -> float | None:
+        """The battery's latest reading (under load or not), None if unknown."""
+        with self._lock:
+            if self._adc is None or self._battery.error is not None:
+                return None
+            return self._battery.volts
+
     def sample(self) -> None:
         now = time.monotonic()
         try:
@@ -222,6 +237,13 @@ class PowerMonitor:
             moving = True  # unsure: do not take the reading as resting
         if moving:
             self._last_motion = now
+        if self._adc is None and self._adc_opener is not None and now >= self._adc_retry_at:
+            self._adc_retry_at = now + ADC_RETRY_SECONDS
+            try:
+                self._adc = self._adc_opener()
+                logger.info("Battery monitor answering now")
+            except Exception as exc:
+                logger.debug("Battery monitor still unavailable: %s", exc)
         if self._adc is not None:
             try:
                 readings = sorted(self._adc.battery_volts() for _ in range(BATTERY_SAMPLES))
